@@ -101,7 +101,7 @@ impl App {
     /// 返回传给当前仓库 `git` 的目录参数：仓库位于 WSL 发行版中时使用发行版内的路径。
     pub(in crate::app) fn git_path_arg(&self, path: &Path) -> String {
         let root = self.git.root.as_deref().unwrap_or(path);
-        winc_editor::wsl::git_arg(root, path)
+        winc_editor::host::arg(root, path)
     }
 
     /// 上下文栏上的项目名：打开的目录就是附属工作树时写它所属的仓库，同一个仓库的工作树之间切换时
@@ -355,7 +355,12 @@ impl App {
             return;
         }
         let name = worktree_name(&worktree);
-        if self.shared.window_with(&worktree.path, self.key).is_some() {
+        if self
+            .link
+            .shared
+            .window_with(&worktree.path, self.link.key)
+            .is_some()
+        {
             self.ask_close_worktree_window(&name, &worktree.path);
             return;
         }
@@ -471,13 +476,13 @@ impl App {
         let Some(i) = i.filter(|&i| i > 0 && self.git.current_worktree() != Some(i)) else {
             return;
         };
-        if self.branch.running.is_some() {
+        if self.git.branch.running.is_some() {
             self.flash(t!("git-op-busy"));
             return;
         }
         let name = worktree_name(&self.git.worktrees[i]);
         // 确认框弹着的时候在另一个窗口里打开了它。
-        if self.shared.window_with(path, self.key).is_some() {
+        if self.link.shared.window_with(path, self.link.key).is_some() {
             self.ask_close_worktree_window(&name, path);
             return;
         }

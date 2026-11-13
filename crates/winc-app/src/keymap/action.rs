@@ -18,6 +18,7 @@ pub enum Action {
     GoBack,
     GoForward,
     Settings,
+    ReleaseNotes,
     KeyboardShortcuts,
     RecordKeys,
 
@@ -25,6 +26,8 @@ pub enum Action {
     NewWindow,
     OpenFile,
     OpenFolder,
+    RemoteConnect,
+    RemoteDisconnect,
     OpenRecent,
     Save,
     SaveAs,
@@ -184,6 +187,7 @@ pub enum Action {
     ToggleDiffLayout,
     GitShowChanges,
     GitShowLog,
+    GitGoToRevision,
     /// 在只读标签中打开 Git 操作的输出。
     GitShowOutput,
     /// 克隆仓库。
@@ -250,6 +254,8 @@ pub enum Module {
     Git,
     /// 终端模块。
     Terminal,
+    /// 远程模块。
+    Remote,
 }
 
 impl Action {
@@ -266,12 +272,15 @@ impl Action {
             GoBack => t!("cmd-go-back"),
             GoForward => t!("cmd-go-forward"),
             Settings => t!("cmd-settings"),
+            ReleaseNotes => t!("cmd-release-notes"),
             KeyboardShortcuts => t!("cmd-keyboard-shortcuts"),
             RecordKeys => t!("cmd-record-keys"),
             NewFile => t!("cmd-new-file"),
             NewWindow => t!("cmd-new-window"),
             OpenFile => t!("cmd-open-file"),
             OpenFolder => t!("cmd-open-folder"),
+            RemoteConnect => t!("cmd-remote-connect"),
+            RemoteDisconnect => t!("cmd-remote-disconnect"),
             OpenRecent => t!("cmd-open-recent"),
             Save => t!("cmd-save"),
             SaveAs => t!("cmd-save-as"),
@@ -420,6 +429,7 @@ impl Action {
             ToggleDiffLayout => t!("cmd-toggle-diff-layout"),
             GitShowChanges => t!("cmd-git-show-changes"),
             GitShowLog => t!("cmd-git-show-log"),
+            GitGoToRevision => t!("cmd-git-go-to-revision"),
             GitShowOutput => t!("cmd-git-show-output"),
             GitClone => t!("cmd-git-clone"),
             GitInit => t!("cmd-git-init"),
@@ -477,12 +487,15 @@ impl Action {
             GoBack => "Go Back",
             GoForward => "Go Forward",
             Settings => "Settings",
+            ReleaseNotes => "Release Notes",
             KeyboardShortcuts => "Keyboard Shortcuts",
             RecordKeys => "Record Keys",
             NewFile => "New File",
             NewWindow => "New Window",
             OpenFile => "Open",
             OpenFolder => "Open Folder",
+            RemoteConnect => "Remote: Connect to SSH Host…",
+            RemoteDisconnect => "Remote: Disconnect",
             OpenRecent => "Open Recent Folder",
             Save => "Save",
             SaveAs => "Save As",
@@ -625,6 +638,7 @@ impl Action {
             ToggleDiffLayout => "Toggle Inline Diff",
             GitShowChanges => "Git: Open Changes",
             GitShowLog => "Git: Show Log",
+            GitGoToRevision => "Git: Go to Hash, Branch or Tag",
             GitShowOutput => "Git: Show Output",
             GitClone => "Git: Clone Repository…",
             GitInit => "Git: Initialize Repository",
@@ -682,14 +696,17 @@ impl Action {
             | GoBack
             | GoForward
             | Settings
+            | ReleaseNotes
             | KeyboardShortcuts
             | RecordKeys
             | InstallShellCommand
             | UninstallShellCommand => Group::General,
-            NewFile | OpenFile | OpenFolder | Save | SaveAs | CloseTab | CloseOtherTabs
-            | CloseAllTabs | ReopenClosed | NextTab | PreviousTab | CloseFolder | CloseWindow
-            | CopyPath | CopyRelativePath | RevealInFinder | CopyActivePath | CopyKeyPath
-            | RevealActiveFile | OpenInTerminal | Quit => Group::File,
+            NewFile | OpenFile | OpenFolder | RemoteConnect | RemoteDisconnect | Save | SaveAs
+            | CloseTab | CloseOtherTabs | CloseAllTabs | ReopenClosed | NextTab | PreviousTab
+            | CloseFolder | CloseWindow | CopyPath | CopyRelativePath | RevealInFinder
+            | CopyActivePath | CopyKeyPath | RevealActiveFile | OpenInTerminal | Quit => {
+                Group::File
+            }
             NewWindow | OpenRecent | CopyReference | CopyAbsoluteReference => Group::File,
             Undo
             | Redo
@@ -795,6 +812,7 @@ impl Action {
             | ToggleDiffLayout
             | GitShowChanges
             | GitShowLog
+            | GitGoToRevision
             | GitShowOutput
             | GitClone
             | GitInit
@@ -902,6 +920,7 @@ impl Action {
         match self {
             Action::GitShowChanges
             | Action::GitShowLog
+            | Action::GitGoToRevision
             | Action::GitShowOutput
             | Action::GitClone
             | Action::GitInit
@@ -940,6 +959,7 @@ impl Action {
             | Action::NextError
             | Action::PreviousError
             | Action::SendToTerminal => Some(Module::Terminal),
+            Action::RemoteConnect | Action::RemoteDisconnect => Some(Module::Remote),
             _ => None,
         }
     }
@@ -998,6 +1018,7 @@ pub const ACTIONS: &[Action] = {
         GoForward,
         ShowCommands,
         Settings,
+        ReleaseNotes,
         KeyboardShortcuts,
         RecordKeys,
         Format,
@@ -1025,6 +1046,8 @@ pub const ACTIONS: &[Action] = {
         NewWindow,
         OpenFile,
         OpenFolder,
+        RemoteConnect,
+        RemoteDisconnect,
         OpenRecent,
         Save,
         SaveAs,
@@ -1143,6 +1166,7 @@ pub const ACTIONS: &[Action] = {
         ShowCommit,
         GitShowChanges,
         GitShowLog,
+        GitGoToRevision,
         GitShowOutput,
         GitClone,
         GitInit,

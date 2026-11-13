@@ -299,7 +299,7 @@ impl Winc {
         let root = slot.app.editor.root().map(Path::to_path_buf);
         let mut folders = folders
             .iter()
-            .filter(|f| f.is_dir() && Some(*f) != root.as_ref())
+            .filter(|f| winc_backend::fs::is_dir(f) && Some(*f) != root.as_ref())
             .peekable();
         if root.is_none()
             && let Some(folder) = folders.next()
@@ -331,11 +331,11 @@ impl Winc {
 
     /// 加入编号为 `key` 的窗口，接上共用的状态；第一个窗口同时是当前窗口。
     pub fn add(&mut self, key: WindowKey, mut app: App) {
-        app.key = Some(key);
-        app.shared = Rc::clone(&self.shared);
+        app.link.key = Some(key);
+        app.link.shared = Rc::clone(&self.shared);
         app.ask_on_quit = Arc::clone(&self.shared.ask_on_quit);
         self.active.get_or_insert(key);
-        let config_rev = app.config_rev;
+        let config_rev = app.store.config_rev;
         self.windows.push(Slot {
             key,
             app,
@@ -407,19 +407,19 @@ impl Winc {
         let changed = self
             .windows
             .iter()
-            .position(|s| s.app.config_rev != s.config_rev);
+            .position(|s| s.app.store.config_rev != s.config_rev);
         let Some(from) = changed else {
             return;
         };
         let config = self.windows[from].app.config.clone();
         // 一并同步配置文件的内容：该窗口写入失败时，未写入的项在之后任一窗口写回时仍算作修改。
-        let saved = self.windows[from].app.saved_config.clone();
+        let saved = self.windows[from].app.store.saved_config.clone();
         for (i, slot) in self.windows.iter_mut().enumerate() {
             if i != from {
-                slot.app.saved_config = saved.clone();
+                slot.app.store.saved_config = saved.clone();
                 slot.app.adopt_config(config.clone());
             }
-            slot.config_rev = slot.app.config_rev;
+            slot.config_rev = slot.app.store.config_rev;
         }
     }
 
@@ -644,11 +644,11 @@ impl Winc {
     fn window_for(&mut self, targets: &[Target]) -> Result<WindowKey, Option<PathBuf>> {
         let folder = targets
             .iter()
-            .find(|t| t.path.is_dir())
+            .find(|t| winc_backend::fs::is_dir(&t.path))
             .map(|t| t.path.clone());
         let file = targets
             .iter()
-            .find(|t| !t.path.is_dir())
+            .find(|t| !winc_backend::fs::is_dir(&t.path))
             .map(|t| t.path.clone());
         let key = match (&folder, &file) {
             (Some(folder), _) => self.shared.window_with(folder, None),
@@ -743,19 +743,19 @@ impl Winc {
         editor.tab_width = config.tab_width.unwrap_or(editor.tab_width);
         let (key, proxy) = self.reserve();
         let mut app = App::new(editor, proxy, Bench::off(), config);
-        app.config_path = template.config_path;
+        app.store.config_path = template.config_path;
         app.state = (template.state_path.as_deref())
             .map(State::load_from)
             .unwrap_or_default();
-        app.commit.set_flat(!app.state.commit_tree);
+        app.git.commit.set_flat(!app.state.commit_tree);
         app.restore_panel_width();
         app.editor.diff_unified = app.config.diff_inline == Some(true);
         app.apply_preview_state();
-        app.state_path = template.state_path;
+        app.store.state_path = template.state_path;
         app.backup.root = template.backup_root;
-        app.cascade = cascade;
-        app.open_fullscreen = fullscreen;
-        app.glyphs_from = glyphs;
+        app.opening.cascade = cascade;
+        app.opening.fullscreen = fullscreen;
+        app.opening.glyphs_from = glyphs;
         self.add(key, app);
         self.active = Some(key);
         let Some(app) = self.by_key(key) else {
@@ -862,6 +862,17 @@ impl ApplicationHandler<Envelope> for Winc {
                 }
         ) {
             self.active = Some(key);
+        }
+        // 光标同一时刻只位于一个窗口上：某个窗口在光标处位于最上层并收到移动时，其余仍认为光标
+        // 在内的窗口按光标离开处理。被遮挡的窗口不一定再收到移动或离开事件。
+        if matches!(event, WindowEvent::CursorMoved { .. })
+            && self.by_key(key).is_some_and(|app| app.under_cursor())
+        {
+            for slot in &mut self.windows {
+                if slot.key != key && slot.app.cursor_inside() {
+                    slot.app.cursor_left();
+                }
+            }
         }
         if let Some(app) = self.by_key(key) {
             app.window_event(event_loop, id, event);

@@ -112,13 +112,25 @@ impl App {
     /// 文件树中点中的那一行先被选中，点在空白处表示根目录。其他位置没有菜单。设置浮层或
     /// 快速打开面板打开时不处理。
     pub(in crate::app) fn context_click(&mut self, x: f32, y: f32) {
-        if self.settings.open || self.form_dialog.is_some() || self.picker.open {
+        if self.settings.open || self.overlays.form_dialog.is_some() || self.overlays.picker.open {
             return;
         }
 
         // 正在输入名字时点击了右键：先提交名字，与点击其他位置时相同。
-        if self.name_input.is_some() && !self.name_input_rect().is_some_and(|r| r.contains(x, y)) {
+        if self.panels.name_input.is_some()
+            && !self.name_input_rect().is_some_and(|r| r.contains(x, y))
+        {
             self.submit_name_input();
+        }
+
+        // 应用绘制标题栏时，顶栏空白处的右键弹出系统的窗口菜单；窗口系统不支持时没有菜单。
+        if self.window.controls && self.over_title_bar(x, y) {
+            if let Some(window) = &self.window.handle {
+                let zoom = f64::from(self.zoom());
+                let at = winit::dpi::LogicalPosition::new(f64::from(x) * zoom, f64::from(y) * zoom);
+                window.show_window_menu(at);
+            }
+            return;
         }
 
         let tab = self
@@ -126,8 +138,8 @@ impl App {
             .and_then(|(index, _)| self.editor.documents.get(index));
         let target = if let Some(doc) = tab {
             MenuTarget::Tab(doc.id)
-        } else if self.sidebar.visible
-            && self.sidebar.view == SidebarView::Files
+        } else if self.panels.sidebar.visible
+            && self.panels.sidebar.view == SidebarView::Files
             && (self.layout.tree.contains(x, y) || self.in_tree_overflow(x, y))
             && self.editor.workspace.is_some()
         {
@@ -183,14 +195,14 @@ impl App {
             return None;
         }
         let index = self.result_row_at(y)?;
-        self.global.select_row(index);
+        self.panels.global.select_row(index);
         self.focus = Focus::Results;
-        self.global.selected.clone()
+        self.panels.global.selected.clone()
     }
 
     /// 右键点在提交视图里的一条储藏上：返回它是第几条储藏。
     fn stash_context_target(&self, x: f32, y: f32) -> Option<usize> {
-        if !self.commit_shown() || self.commit.hits_generation != self.git.generation {
+        if !self.commit_shown() || self.git.commit.hits_generation != self.git.generation {
             return None;
         }
         match hit(&self.hits.commit, x, y)? {
@@ -206,9 +218,9 @@ impl App {
     /// 点击目录或组标题时选中其下的各个文件，返回第一个文件的路径。
     fn commit_context_target(&mut self, x: f32, y: f32) -> Option<PathBuf> {
         // 历史提交的文件列表只能查看：其中的文件不在工作区的状态里，不提供修改工作区的菜单。
-        if !self.sidebar.visible
-            || self.sidebar.view != SidebarView::Commit
-            || self.commit.hits_generation != self.git.generation
+        if !self.panels.sidebar.visible
+            || self.panels.sidebar.view != SidebarView::Commit
+            || self.git.commit.hits_generation != self.git.generation
             || self.log_diff_tree().is_some()
         {
             return None;
@@ -249,8 +261,8 @@ impl App {
         };
         // 点在选区里的文件上时菜单作用于选中的各个文件，否则只选这一个。
         if !self.commit_is_selected(&path) {
-            self.commit.clear_selection();
-            self.commit.selected = Some(path.clone());
+            self.git.commit.clear_selection();
+            self.git.commit.selected = Some(path.clone());
         }
         self.focus = Focus::CommitList;
         Some(path)
@@ -263,7 +275,7 @@ impl App {
     fn editor_context_target(&mut self, x: f32, y: f32) -> Option<DocumentId> {
         let l = self.layout;
         let covered = l.search.contains(x, y)
-            || (self.goto_input.is_some() && self.prompt_bar().contains(x, y))
+            || (self.bars.goto_input.is_some() && self.prompt_bar().contains(x, y))
             || self.over_corner_card(x, y);
         if covered || !l.editor.contains(x, y) {
             return None;
@@ -281,7 +293,7 @@ impl App {
         let id = doc.id;
 
         self.focus = Focus::Editor;
-        self.preedit.clear();
+        self.ime.preedit.clear();
         Some(id)
     }
 
@@ -327,6 +339,9 @@ impl App {
             }
             MenuTarget::SkipOnSave => skip_menu(&self.settings.languages.format),
             MenuTarget::Locale => locale_menu(),
+            MenuTarget::NamedTheme(dark) => (0..crate::theme::themes(*dark).len())
+                .map(|i| MenuEntry::Item(MenuCommand::NamedTheme(*dark, i), true))
+                .collect(),
             MenuTarget::Whitespace => whitespace_menu(),
             MenuTarget::VimClipboard => vim_clipboard_menu(),
             MenuTarget::DefaultShell => default_shell_menu(self.terminal.shells.len()),
@@ -351,6 +366,9 @@ impl App {
                     current,
                     root.is_some(),
                     crate::system::wsl_distributions().len(),
+                    // 每次打开菜单重新读取：用户可能刚修改了 `ssh` 配置。
+                    (self.remote_enabled()).then(crate::app::remote::refresh_hosts),
+                    root.is_some_and(winc_backend::is_remote),
                 ));
                 menu
             }
@@ -426,7 +444,7 @@ impl App {
                     MenuEntry::Separator,
                     MenuEntry::Item(
                         MenuCommand::RevealSource,
-                        self.markdown.menu_source.is_some(),
+                        self.preview.markdown.menu_source.is_some(),
                     ),
                 ]);
                 menu
@@ -436,17 +454,17 @@ impl App {
                     MenuEntry::Item(MenuCommand::Copy, self.markdown_selected_text().is_some()),
                     MenuEntry::Item(MenuCommand::SelectAll, true),
                 ];
-                // docx 的阅读视图由转换得到，没有可以显示的源代码。
+                // docx 的阅读视图由转换得到，阅读标签只有排版后的内容：都没有可以显示的源代码。
                 let has_source = self
                     .editor
                     .active()
-                    .is_some_and(|d| d.unsupported.is_none());
+                    .is_some_and(|d| d.unsupported.is_none() && d.reading.is_none());
                 if has_source {
                     menu.extend([
                         MenuEntry::Separator,
                         MenuEntry::Item(
                             MenuCommand::RevealSource,
-                            self.markdown.menu_source.is_some(),
+                            self.preview.markdown.menu_source.is_some(),
                         ),
                     ]);
                 }
@@ -535,21 +553,22 @@ impl App {
                 document_language_menu(doc.path.is_some())
             }
             MenuTarget::CommitFile(_) if self.commit_multi_selected() => {
-                let any_exists = self.commit_selection().iter().any(|p| p.exists());
+                let any_exists = self.commit_selection().iter().any(winc_backend::fs::exists);
                 commit_selection_menu(any_exists)
             }
-            MenuTarget::CommitFile(path) => {
-                commit_file_menu(path.exists(), self.relative_path(path).is_some())
-            }
+            MenuTarget::CommitFile(path) => commit_file_menu(
+                winc_backend::fs::exists(path),
+                self.relative_path(path).is_some(),
+            ),
             MenuTarget::SearchResult(_, m) => {
-                search_result_menu(m.is_none(), self.global.replace_open)
+                search_result_menu(m.is_none(), self.panels.global.replace_open)
             }
             MenuTarget::CommitMore => self.commit_more_menu(),
             MenuTarget::StashRow(i) => {
-                crate::app::git::branch::stash_ops(*i, self.branch.running.is_some())
+                crate::app::git::branch::stash_ops(*i, self.git.branch.running.is_some())
             }
             MenuTarget::StashList => {
-                let busy = self.branch.running.is_some();
+                let busy = self.git.branch.running.is_some();
                 crate::app::git::branch::stash_menu(&self.git.stashes, busy)
             }
             MenuTarget::CommitButton => self.commit_button_menu(),
@@ -573,15 +592,16 @@ impl App {
                 .map(|&action| MenuEntry::Item(MenuCommand::RebaseAction(action), true))
                 .collect(),
             MenuTarget::FormBase => form_base_menu(&self.git.branches),
-            MenuTarget::LogFile(_, path) => {
-                log_file_menu(path.exists(), self.relative_path(path).is_some())
-            }
+            MenuTarget::LogFile(_, path) => log_file_menu(
+                winc_backend::fs::exists(path),
+                self.relative_path(path).is_some(),
+            ),
             MenuTarget::LogCommit(oid) => {
                 let commit = self.log_commit(oid);
                 let tags: Vec<&str> = (commit.iter().flat_map(|c| &c.refs))
                     .filter_map(crate::app::git::log::menus::tag_name)
                     .collect();
-                let busy = self.branch.running.is_some()
+                let busy = self.git.branch.running.is_some()
                     || self
                         .git
                         .status
@@ -595,7 +615,7 @@ impl App {
                     MenuEntry::Separator,
                 ];
                 menu.extend(
-                    (0..self.log.authors.len())
+                    (0..self.git.log.authors.len())
                         .map(|i| MenuEntry::Item(MenuCommand::LogAuthor(i + 1), true)),
                 );
                 menu
@@ -610,9 +630,9 @@ impl App {
                     i > 0
                         && self.git.current_worktree() != Some(i)
                         && self.git.worktrees.get(i).is_some_and(|w| !w.locked)
-                        && self.branch.running.is_none()
+                        && self.git.branch.running.is_none()
                 });
-                let idle = self.branch.running.is_none();
+                let idle = self.git.branch.running.is_none();
                 let mut menu = vec![
                     MenuEntry::Item(MenuCommand::LocationNewWindow, true),
                     MenuEntry::Item(MenuCommand::LocationReveal, true),
@@ -632,7 +652,7 @@ impl App {
                 &self.git.branches,
                 &self.git.held_branches(),
                 &self.git.stale_branches(),
-                self.branch.running.is_some(),
+                self.git.branch.running.is_some(),
             ),
         };
 
@@ -652,6 +672,7 @@ impl App {
             MenuTarget::CommitButton
                 | MenuTarget::TabList
                 | MenuTarget::Locale
+                | MenuTarget::NamedTheme(_)
                 | MenuTarget::Whitespace
                 | MenuTarget::VimClipboard
                 | MenuTarget::Zoom
@@ -689,7 +710,7 @@ impl App {
             MenuTarget::FormBase => (self.git.branches.clone(), Vec::new()),
             _ => Default::default(),
         };
-        self.context_menu = Some(ContextMenu {
+        self.overlays.context_menu = Some(ContextMenu {
             target,
             entries: entries.clone(),
             branches,
@@ -702,7 +723,7 @@ impl App {
         // 处理悬停、点击和按键，打开期间菜单按钮保持按下的样子。
         if !cfg!(target_os = "macos") || self.window.handle.is_none() {
             let rows = self.popup_rows(&entries, context, &mut 0);
-            if let Some(menu) = &mut self.context_menu {
+            if let Some(menu) = &mut self.overlays.context_menu {
                 let mut popup = PopupMenu::new(rows, at, (at_checked, right_aligned));
                 popup.min_width = min_width;
                 menu.popup = Some(popup);
@@ -849,7 +870,7 @@ impl App {
             }
             MenuCommand::FontDefault
                 if matches!(
-                    &self.context_menu,
+                    &self.overlays.context_menu,
                     Some(ContextMenu {
                         target: MenuTarget::Font(Setting::TerminalFont),
                         ..
@@ -894,7 +915,7 @@ impl App {
                 MenuLabel::plain(self.git.branches.get(i - 1).map_or("", |b| b.name.as_str()))
             }
             MenuCommand::LogAuthor(i @ 1..) => {
-                MenuLabel::plain(self.log.authors.get(i - 1).map_or("", String::as_str))
+                MenuLabel::plain(self.git.log.authors.get(i - 1).map_or("", String::as_str))
             }
             MenuCommand::GitBranch(..)
             | MenuCommand::GitFetch
@@ -912,7 +933,7 @@ impl App {
         let Some(ContextMenu {
             target: MenuTarget::LogCommit(oid),
             ..
-        }) = &self.context_menu
+        }) = &self.overlays.context_menu
         else {
             return MenuLabel::plain(command.label());
         };
@@ -1052,7 +1073,7 @@ impl App {
             _ => None,
         };
         let Some(preset) = preset else {
-            let (task, auto) = match &self.context_menu {
+            let (task, auto) = match &self.overlays.context_menu {
                 Some(ContextMenu {
                     target: MenuTarget::Tool(task, id),
                     ..
@@ -1099,13 +1120,16 @@ impl App {
             return current.is_some_and(|c| self.run.list.get(i) == Some(c));
         }
         if command == MenuCommand::ToggleBlame {
-            return self.editor.active().is_some_and(|d| self.blame.is_on(d.id));
+            return self
+                .editor
+                .active()
+                .is_some_and(|d| self.git.blame.is_on(d.id));
         }
         if command == MenuCommand::CommitAmend {
-            return self.commit.amend;
+            return self.git.commit.amend;
         }
         if command == MenuCommand::CommitTree {
-            return !self.commit.flat();
+            return !self.git.commit.flat();
         }
         if command == MenuCommand::TerminalMaximize {
             return self.terminal.maximized;
@@ -1125,12 +1149,12 @@ impl App {
         if let (MenuCommand::LogAuthor(i), Some(q)) = (command, query) {
             return match i.checked_sub(1) {
                 None => q.author.is_none(),
-                Some(i) => self.log.authors.get(i) == q.author.as_ref(),
+                Some(i) => self.git.log.authors.get(i) == q.author.as_ref(),
             };
         }
 
         // 状态栏的缩进、行尾、编码、语言菜单：当前使用的那一种。
-        let status_doc = match &self.context_menu {
+        let status_doc = match &self.overlays.context_menu {
             Some(ContextMenu {
                 target:
                     MenuTarget::Indent(id)
@@ -1158,7 +1182,7 @@ impl App {
             };
         }
 
-        let tool = match &self.context_menu {
+        let tool = match &self.overlays.context_menu {
             Some(ContextMenu {
                 target: MenuTarget::Tool(task, id),
                 ..
@@ -1180,6 +1204,7 @@ impl App {
                 winc_i18n::LocaleChoice::ALL.get(i)
                     == Some(&self.config.language.unwrap_or_default())
             }
+            MenuCommand::NamedTheme(dark, i) => self.theme_slot(dark) == i,
             MenuCommand::Whitespace(i) => {
                 winc_config::RenderWhitespace::ALL.get(i)
                     == Some(&self.config.render_whitespace.unwrap_or_default())
@@ -1214,7 +1239,7 @@ impl App {
                 let Some(ContextMenu {
                     target: MenuTarget::Font(setting),
                     ..
-                }) = &self.context_menu
+                }) = &self.overlays.context_menu
                 else {
                     return false;
                 };
@@ -1301,11 +1326,11 @@ impl App {
         let icon = self.menu_icon_kind(command)?;
         let (w, h) = icon.size();
         let clip = Rect::new(0.0, 0.0, w, h);
-        let mut renderer = self.renderer.take()?;
+        let mut renderer = self.frame.renderer.take()?;
         let image = renderer.draw_transparent(w, h, |frame| {
             self.draw_menu_icon(frame, icon, (0.0, 0.0), clip);
         });
-        self.renderer = Some(renderer);
+        self.frame.renderer = Some(renderer);
         Some(image)
     }
 
@@ -1361,11 +1386,11 @@ impl App {
         target: MenuTarget,
         at: (f32, f32),
     ) {
-        self.menu_button = Some(button);
+        self.overlays.menu_button = Some(button);
         self.open_context_menu(target, at);
         // 系统菜单关掉以后才返回；窗口内的菜单还开着，关掉时再放开按钮。
         if self.popup().is_none() {
-            self.menu_button = None;
+            self.overlays.menu_button = None;
         }
         self.request_redraw();
     }
@@ -1373,10 +1398,10 @@ impl App {
     /// 立即同步绘制一帧，不等待下一轮事件循环。
     pub(in crate::app) fn paint_now(&mut self) {
         self.relayout();
-        if let Some(mut renderer) = self.renderer.take() {
+        if let Some(mut renderer) = self.frame.renderer.take() {
             self.declare_base(&mut renderer);
             renderer.draw(|frame| view::draw(self, frame));
-            self.renderer = Some(renderer);
+            self.frame.renderer = Some(renderer);
         }
     }
 }

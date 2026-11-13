@@ -19,6 +19,7 @@ pub use output::output_text;
 pub use rebase::{RebaseAction, RebaseCommit, RebasePlan, RebaseStep, rebase_todo};
 pub use remote::{Remote, TagTarget, repository_dir_name};
 pub use sync::{Carried, Synced};
+mod history;
 mod trust;
 mod worktree;
 
@@ -246,6 +247,9 @@ pub struct LogQuery {
     pub author: Option<String>,
     /// 只看改过该文件的提交（文件历史），越过改名继续往前查找。
     pub path: Option<PathBuf>,
+    /// 固定在最前面的提交（完整的提交号），见 [`Git::log_stream`]；「转到提交号、分支或标签」
+    /// 找到的提交不在已列出的提交中时使用。
+    pub pin: Option<String>,
 }
 
 impl LogQuery {
@@ -254,14 +258,20 @@ impl LogQuery {
     /// 这些条件下结果里的父提交大多不在列表里，提交图连不起来；只按分支筛选时提交仍然相连，
     /// 可以画图。
     pub fn graphless(&self) -> bool {
-        !self.text.trim().is_empty() || self.author.is_some() || self.path.is_some()
+        !self.text.trim().is_empty()
+            || self.author.is_some()
+            || self.path.is_some()
+            || self.pin.is_some()
     }
 
-    /// 是否按说明、分支或作者筛选过。
+    /// 是否按说明、分支或作者筛选过，或固定了一个提交。
     ///
     /// 文件历史的文件不算：那本来就是该标签展示的内容。
     pub fn filtered(&self) -> bool {
-        !self.text.trim().is_empty() || self.branch.is_some() || self.author.is_some()
+        !self.text.trim().is_empty()
+            || self.branch.is_some()
+            || self.author.is_some()
+            || self.pin.is_some()
     }
 }
 
@@ -399,6 +409,8 @@ pub struct Status {
     ///
     /// 提交这些文件会将冲突标记一并提交。读取状态时在后台同时读取这些文件。
     pub unresolved: Vec<PathBuf>,
+    /// 仓库的 `.git` 目录；工作树和子模块里是 `.git` 文件所指的目录。读不到时为 `None`。
+    pub git_dir: Option<PathBuf>,
 }
 
 /// 停下来等用户处理冲突的操作。
@@ -436,36 +448,44 @@ impl Operation {
 
     /// 从仓库目录 `git_dir` 里的标记文件看出正在进行的操作。
     fn detect(git_dir: &Path) -> Option<Operation> {
-        if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
-            Some(Operation::Rebase)
-        } else if git_dir.join("MERGE_HEAD").is_file() {
-            Some(Operation::Merge)
-        } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
-            Some(Operation::CherryPick)
-        } else if git_dir.join("REVERT_HEAD").is_file() {
-            Some(Operation::Revert)
-        } else {
-            None
-        }
+        // 各标记的文件信息一次取回：远端的仓库只需一次往返。先列出的优先。
+        let markers = [
+            ("rebase-merge", true, Operation::Rebase),
+            ("rebase-apply", true, Operation::Rebase),
+            ("MERGE_HEAD", false, Operation::Merge),
+            ("CHERRY_PICK_HEAD", false, Operation::CherryPick),
+            ("REVERT_HEAD", false, Operation::Revert),
+        ];
+        let paths = markers.map(|(name, _, _)| git_dir.join(name));
+        let found = winc_backend::fs::metadata_many(&paths);
+        (markers.into_iter().zip(found)).find_map(|((_, dir, operation), metadata)| {
+            let metadata = metadata.ok()?;
+            let present = if dir {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            };
+            present.then_some(operation)
+        })
     }
 }
 
 /// 仓库 `root` 的 `.git` 目录：工作树和子模块里 `.git` 是一个写着 `gitdir: <路径>` 的文件。
 fn git_dir(root: &Path) -> Option<PathBuf> {
     let dot = root.join(".git");
-    if dot.is_dir() {
+    if winc_backend::fs::is_dir(&dot) {
         return Some(dot);
     }
-    let text = std::fs::read_to_string(&dot).ok()?;
+    let text = winc_backend::fs::read_to_string(&dot).ok()?;
     let target = text.trim().strip_prefix("gitdir:")?.trim();
-    Some(crate::wsl::resolve(root, target))
+    Some(crate::host::resolve(root, target))
 }
 
 /// 仓库共用的 `git` 目录：工作树（`git worktree`）的 `.git` 文件指向它自己的目录，hooks、
 /// 各工作树的记录（`worktrees/`）在那里的 `commondir` 所指的目录里。
 fn git_common_dir(root: &Path) -> Option<PathBuf> {
     let dir = git_dir(root)?;
-    match std::fs::read_to_string(dir.join("commondir")) {
+    match winc_backend::fs::read_to_string(dir.join("commondir")) {
         Ok(common) => Some(dir.join(common.trim())),
         Err(_) => Some(dir),
     }
@@ -609,10 +629,19 @@ impl Git {
             "--ignored=matching",
             "--ignore-submodules=dirty",
         ]);
-        let stdout = self.run(&mut command, STATUS_TIMEOUT, cancel)?;
-        let mut status = parse_status(&stdout, root)
+        // 正在进行的操作从 `.git` 里的标记文件看出，与 `git status` 互不依赖：远端的仓库上
+        // 同时进行。
+        let marks = || {
+            let dir = git_dir(root);
+            let operation = dir.as_deref().and_then(Operation::detect);
+            (dir, operation)
+        };
+        let run = || self.run(&mut command, STATUS_TIMEOUT, cancel);
+        let remote = winc_backend::is_remote(root);
+        let ((dir, operation), stdout) = crate::background::both(remote, marks, run);
+        let mut status = parse_status(&stdout?, root)
             .ok_or_else(|| winc_i18n::t!("git-status-unreadable").to_owned())?;
-        status.operation = git_dir(root).and_then(|d| Operation::detect(&d));
+        (status.git_dir, status.operation) = (dir, operation);
         status.unresolved = status
             .entries
             .iter()
@@ -644,7 +673,7 @@ impl Git {
 
     /// 合并的提交信息草稿（`.git/MERGE_MSG`，去掉 `#` 开头的说明行）；不在合并中时为 `None`。
     pub fn merge_message(&self, root: &Path) -> Option<String> {
-        let text = std::fs::read_to_string(git_dir(root)?.join("MERGE_MSG")).ok()?;
+        let text = winc_backend::fs::read_to_string(git_dir(root)?.join("MERGE_MSG")).ok()?;
         let kept: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
         Some(kept.join("\n").trim().to_owned())
     }
@@ -696,7 +725,7 @@ impl Git {
         command.args(["rev-parse", "--git-common-dir"]);
         let stdout = self.run(&mut command, STATUS_TIMEOUT, cancel)?;
         // 在主工作树里是相对路径，相对于运行的目录。
-        Ok(crate::wsl::resolve(
+        Ok(crate::host::resolve(
             root,
             String::from_utf8_lossy(&stdout).trim(),
         ))
@@ -807,6 +836,8 @@ impl Git {
         let Some(askpass) = &self.askpass else {
             return;
         };
+        // 远端的仓库：`git` 在那台主机上运行，它的输入请求由服务进程转回本机，再交给这里的
+        // askpass 程序（见 `process::run`），这些变量本身不发到远端。
         command
             .env("GIT_ASKPASS", &askpass.program)
             .env("SSH_ASKPASS", &askpass.program)
@@ -913,283 +944,6 @@ impl Git {
         .collect()
     }
 
-    /// 返回 `path` 在 `HEAD` 里的内容，见 [`Git::content_at`]。
-    ///
-    /// `HEAD` 里没有该文件（包括还没有提交过）时返回 `Ok(None)`。
-    ///
-    /// # Errors
-    ///
-    /// `git` 运行失败、超时或被取消时返回原因。
-    pub fn head_content(
-        &self,
-        root: &Path,
-        path: &Path,
-        cancel: &Cancel,
-    ) -> Result<Option<Vec<u8>>, String> {
-        self.content_at(root, "HEAD", path, cancel)
-    }
-
-    /// 日志：按 `query` 筛过的提交，孩子在前，按时间排，用 [`LogStream::next`] 一批一批地读。
-    ///
-    /// 不指定分支时是所有分支、远程分支、标签（不含储藏）能走到的提交，文件历史只用当前分支。
-    /// `git log` 进程一直开着，从它停下的地方继续读；重新起进程时要走过跳过的提交，越翻越慢。
-    ///
-    /// # Errors
-    ///
-    /// 文件不在仓库里、`git` 无法启动时返回原因；`git` 报的错在读第一批时返回。
-    pub fn log_stream(&self, root: &Path, query: &LogQuery) -> Result<LogStream, String> {
-        let pinned = self.commit_by_hash(root, query.text.trim());
-        let mut command = self.command(root);
-        command.args(["log", "--date-order", "--decorate=full", "--no-color"]);
-        let text = query.text.trim();
-        if !text.is_empty() || query.author.is_some() {
-            command.args(["--regexp-ignore-case", "--fixed-strings"]);
-        }
-        if !text.is_empty() {
-            command.arg(format!("--grep={text}"));
-        }
-        if let Some(author) = &query.author {
-            command.arg(format!("--author={author}"));
-        }
-        command.arg(LOG_DATE).arg(LOG_FORMAT);
-        if query.path.is_some() {
-            command.arg("--follow");
-        }
-        // 选项都在前面，最后是从哪些提交往回走、看哪个文件。分支名前面加 `--end-of-options`：
-        // 叫 `-x` 的分支也不会被当成选项。
-        match (&query.branch, &query.path) {
-            (Some(branch), _) => {
-                command.arg("--end-of-options").arg(branch);
-            }
-            (None, Some(_)) => {
-                command.arg("HEAD");
-            }
-            (None, None) => {
-                command.args(["--exclude=refs/stash", "--all"]);
-            }
-        }
-        if let Some(path) = &query.path {
-            command.arg("--").arg(slash_path(root, path)?);
-        }
-        let stream = process::Stream::spawn(&mut command).map_err(|e| describe(&e))?;
-        Ok(LogStream {
-            stream,
-            pinned,
-            skip: None,
-        })
-    }
-
-    /// 筛选文字形如提交号（4 位以上的十六进制）且能解析为某个提交时，返回该提交。
-    ///
-    /// 日志筛选同时匹配说明和提交号，使用户粘贴提交号即可定位提交。`git log` 无法按
-    /// 「说明或提交号」筛选，因此该提交单独读取并排在最前面。
-    fn commit_by_hash(&self, root: &Path, text: &str) -> Option<Box<Commit>> {
-        if !(4..=64).contains(&text.len()) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let mut command = self.command(root);
-        command
-            .args([
-                "log",
-                "--no-walk",
-                "--decorate=full",
-                "--no-color",
-                LOG_DATE,
-                LOG_FORMAT,
-            ])
-            .arg("--end-of-options")
-            .arg(format!("{text}^{{commit}}"));
-        let stdout = self
-            .run(&mut command, STATUS_TIMEOUT, &Cancel::default())
-            .ok()?;
-        let commit = parse_log(&String::from_utf8_lossy(&stdout))
-            .into_iter()
-            .next()?;
-        commit
-            .oid
-            .starts_with(&text.to_ascii_lowercase())
-            .then(|| Box::new(commit))
-    }
-
-    /// 储藏列表，最新的在前。
-    ///
-    /// # Errors
-    ///
-    /// `git` 运行失败时返回原因。
-    pub fn stashes(&self, root: &Path, cancel: &Cancel) -> Result<Vec<Stash>, String> {
-        let mut command = self.command(root);
-        // 时间用 `%ci`（提交者的本地时间）的前 16 个字符：`--date` 会把 `%gd` 换成按日期的写法
-        // （`stash@{2026-…}`），不能用来格式化 `%cd`。
-        command.args([
-            "stash",
-            "list",
-            "--format=%gd%x1f%H%x1f%P%x1f%ct%x1f%ci%x1f%gs",
-        ]);
-        let stdout = self.run(&mut command, STATUS_TIMEOUT, cancel)?;
-        Ok(String::from_utf8_lossy(&stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.splitn(6, '\u{1f}');
-                let (name, oid) = (fields.next()?, fields.next()?);
-                let parents = fields
-                    .next()?
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect();
-                let time = fields.next()?.parse().unwrap_or(0);
-                let local = fields.next()?.chars().take(16).collect();
-                Some(Stash {
-                    name: name.to_owned(),
-                    oid: oid.to_owned(),
-                    parents,
-                    time,
-                    local,
-                    message: fields.next()?.to_owned(),
-                })
-            })
-            .collect())
-    }
-
-    /// 对提交号为 `oid` 的储藏执行 `git stash <verb>`，返回 `git` 的结论。
-    ///
-    /// `verb` 是 `apply`、`pop` 或 `drop`。`git stash pop`、`drop` 只接受 `stash@{n}` 形式的名字，
-    /// 编号会随储藏的增删改变，因此执行前按提交号查出当前的名字。
-    ///
-    /// # Errors
-    ///
-    /// 储藏已不存在时返回说明这一点的文案；其余情况同 [`Git::operate`]。
-    pub fn stash(&self, root: &Path, verb: &str, oid: &str) -> Result<String, String> {
-        let stashes = self.stashes(root, &Cancel::default())?;
-        let Some(stash) = stashes.iter().find(|s| s.oid == oid) else {
-            return Err(winc_i18n::t!("git-stash-gone").to_owned());
-        };
-        self.operate(root, &["stash", verb, "--end-of-options", &stash.name])
-    }
-
-    /// 逐行追溯：返回每一行最后是哪次提交改的。
-    ///
-    /// `contents` 是编辑器里该文件当前的内容（含未保存的修改），改过还没提交的行算「未提交」。
-    /// 它整个移交给写标准输入的线程，不再复制，因此行号和编辑器里的行号一一对应。
-    ///
-    /// # Errors
-    ///
-    /// `git` 运行失败（文件没被跟踪、仓库还没有提交）时返回原因。
-    pub fn blame(
-        &self,
-        root: &Path,
-        path: &Path,
-        contents: Vec<u8>,
-        cancel: &Cancel,
-    ) -> Result<Blame, String> {
-        let relative = slash_path(root, path)?;
-        let mut command = self.command(root);
-        command
-            // 不使用 textconv：转换后的行与编辑器中的行不对应，转换命令也来自仓库的配置。
-            .args([
-                "blame",
-                "--no-textconv",
-                "--porcelain",
-                "--contents",
-                "-",
-                "--",
-            ])
-            .arg(relative)
-            .stderr(Stdio::piped());
-        match process::run(&mut command, contents, LOG_TIMEOUT, cancel) {
-            Ok(output) if output.status.success() => {
-                Ok(parse_blame(&String::from_utf8_lossy(&output.stdout)))
-            }
-            Ok(output) => Err(failure(&output.stderr)),
-            Err(e) => Err(describe(&e)),
-        }
-    }
-
-    /// 提交 `oid` 的完整说明。
-    ///
-    /// # Errors
-    ///
-    /// `git` 运行失败时返回原因。
-    pub fn commit_message(
-        &self,
-        root: &Path,
-        oid: &str,
-        cancel: &Cancel,
-    ) -> Result<String, String> {
-        let mut command = self.command(root);
-        command.args(["show", "-s", "--format=%B", "--end-of-options", oid]);
-        let stdout = self.run(&mut command, SHOW_TIMEOUT, cancel)?;
-        Ok(String::from_utf8_lossy(&stdout).trim_end().to_owned())
-    }
-
-    /// 返回提交 `oid` 相对于 `parent`（根提交传 `None`）改动的文件及各文件的增删行数，按路径
-    /// 排序。
-    ///
-    /// # Errors
-    ///
-    /// `git` 运行失败时返回原因。
-    pub fn commit_files(
-        &self,
-        root: &Path,
-        parent: Option<&str>,
-        oid: &str,
-        cancel: &Cancel,
-    ) -> Result<Vec<CommitFile>, String> {
-        // 文件和行数一次取齐：`--raw` 的各条在前，`--numstat` 的各条按同样的顺序跟在后面。
-        let mut command = self.command(root);
-        command.args([
-            "diff-tree",
-            "-r",
-            "-M",
-            "-z",
-            "--no-commit-id",
-            "--raw",
-            "--numstat",
-        ]);
-        // 提交号来自日志，分支名来自仓库：加 `--end-of-options`，以 `-` 开头的参数不会被当作选项。
-        match parent {
-            Some(parent) => command.args(["--end-of-options", parent, oid]),
-            // 根提交和空树比；不写空树的对象号：SHA-1 和 SHA-256 的仓库里该对象号不同。
-            None => command.args(["--root", "--end-of-options", oid]),
-        };
-        let stdout = self.run(&mut command, SHOW_TIMEOUT, cancel)?;
-        let mut files = parse_diff_tree(&stdout, root);
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(files)
-    }
-
-    /// 文件 `path` 在版本 `rev`（提交号、分支名……；空字符串是暂存区）里的内容，套用检出时
-    /// 的转换；该版本里没有该文件时为 `None`。
-    ///
-    /// # Errors
-    ///
-    /// `git` 运行失败（版本不存在、对象损坏、必需的过滤器失败……）、超时或被取消时返回原因。
-    pub fn content_at(
-        &self,
-        root: &Path,
-        rev: &str,
-        path: &Path,
-        cancel: &Cancel,
-    ) -> Result<Option<Vec<u8>>, String> {
-        let relative = slash_path(root, path)?;
-        let mut command = self.command(root);
-        command
-            // `--filters` 套用 `git` 检出时的转换（autocrlf 的换行、LFS、textconv 以外的
-            // 过滤器），取到的内容和检出到工作区的文件相同，才能和工作区逐行比较。
-            .args(["cat-file", "--filters", "--end-of-options"])
-            .arg(joined_arg(&[OsStr::new(rev), OsStr::new(":"), &relative]))
-            // 要按 `git` 的报错认出「没有该文件」，报错不能被翻译成用户的语言。
-            .env("LC_ALL", "C")
-            .stderr(Stdio::piped());
-        match process::run(&mut command, Vec::new(), SHOW_TIMEOUT, cancel) {
-            Ok(output) if output.status.success() => Ok(Some(output.stdout)),
-            Ok(output) if output.status.code() == Some(128) && absent(&output.stderr, rev) => {
-                Ok(None)
-            }
-            Ok(output) => Err(failure(&output.stderr)),
-            Err(e) => Err(describe(&e)),
-        }
-    }
-
     fn command(&self, root: &Path) -> Command {
         let mut command = self.at(root);
         command
@@ -1225,6 +979,14 @@ impl Git {
     /// 环境中的 [`REPOSITORY_ENV`] 不传给 `git`：仓库由 `root` 决定，调用方需要时（例如临时暂存区）
     /// 在返回的命令上另行设置。
     pub(super) fn at(&self, root: &Path) -> Command {
+        // 远端主机上的仓库：以仓库为工作目录运行远端的 `git`，按名字在远端的 `PATH` 中查找
+        // （本机 `git` 的路径和本机 shell 的环境在远端没有意义）。命令经 `process::run` 在该
+        // 目录所在的主机上运行。
+        if winc_backend::is_remote(root) {
+            let mut command = Command::new("git");
+            command.current_dir(root);
+            return command;
+        }
         let mut command = match crate::wsl::locate_here(root) {
             None => {
                 let mut command = self.shell.command(&self.program);
@@ -1263,8 +1025,9 @@ impl Git {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0) {
+            let executable =
+                |m: winc_backend::fs::Metadata| m.unix.is_some_and(|u| u.mode & 0o111 != 0);
+            if winc_backend::fs::metadata(path).is_ok_and(executable) {
                 return Ok("100755");
             }
         }
@@ -1284,6 +1047,11 @@ impl Git {
             Err(e) => Err(describe(&e)),
         }
     }
+}
+
+/// 字符串是否符合完整或缩写提交号的格式。
+pub fn is_commit_hash(text: &str) -> bool {
+    (4..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// 开着的 `git log` 进程，见 [`Git::log_stream`]。
@@ -1348,6 +1116,17 @@ impl LogStream {
 /// 各段按原样的字节拼接，不经有损转换：Unix 上文件名可以不是 UTF-8，替换成 U+FFFD 以后指向的
 /// 是另一个（通常不存在的）文件。
 fn slash_path(root: &Path, path: &Path) -> Result<OsString, String> {
+    // 远端主机上的仓库：按远端的原始字节计算，虚拟路径中为本机所做的换算不能传给远端的 `git`。
+    if let (Some(root), Some(path)) = (winc_backend::locate(root), winc_backend::locate(path)) {
+        let relative = path
+            .relative_to(&root)
+            .ok_or_else(|| winc_i18n::t!("git-file-outside-repository"))?;
+        #[cfg(unix)]
+        return Ok(std::os::unix::ffi::OsStringExt::from_vec(relative.to_vec()));
+        // Windows 的字符串无法表示不是有效 UTF-8 的文件名，这样的文件在远端的 `git` 中找不到。
+        #[cfg(not(unix))]
+        return Ok(String::from_utf8_lossy(relative).into_owned().into());
+    }
     let relative = path
         .strip_prefix(root)
         .map_err(|_| winc_i18n::t!("git-file-outside-repository"))?;
@@ -1418,9 +1197,18 @@ const SCAN_ENTRIES: usize = 4096;
 ///
 /// 只查文件系统，不运行 `git`。
 pub fn find_root(dir: &Path) -> Option<PathBuf> {
-    dir.ancestors()
-        .find(|d| d.join(".git").exists())
-        .map(Path::to_path_buf)
+    // 远端的目录只在那台主机的根目录以内向上查找：再往上就是本机的文件系统。
+    let remote = winc_backend::is_remote(dir);
+    let ancestors: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|d| !remote || winc_backend::is_remote(d))
+        .collect();
+    // 各级的 `.git` 一次查完：远端的目录只需一次往返。
+    let markers: Vec<PathBuf> = ancestors.iter().map(|d| d.join(".git")).collect();
+    let found = winc_backend::fs::metadata_many(&markers);
+    (ancestors.into_iter().zip(found))
+        .find(|(_, metadata)| metadata.is_ok())
+        .map(|(dir, _)| dir.to_path_buf())
 }
 
 /// 返回打开目录 `dir` 时可用的仓库：`dir` 所在的仓库（如果有，排在最前面），之后是第一层子目录里的
@@ -1428,13 +1216,20 @@ pub fn find_root(dir: &Path) -> Option<PathBuf> {
 ///
 /// 只查文件系统，不运行 `git`。目录项很多时只看前一部分（`SCAN_ENTRIES`）。
 pub fn find_repositories(dir: &Path) -> Vec<PathBuf> {
-    let mut children: Vec<PathBuf> = std::fs::read_dir(dir)
+    // 只有目录（和可能指向目录的符号链接）才可能是仓库；各项的 `.git` 一次查完。
+    let candidates: Vec<PathBuf> = winc_backend::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .take(SCAN_ENTRIES)
+        .filter(|entry| entry.kind.is_dir() || entry.kind.is_symlink())
         .map(|entry| entry.path())
-        .filter(|path| path.join(".git").exists())
+        .collect();
+    let markers: Vec<PathBuf> = candidates.iter().map(|path| path.join(".git")).collect();
+    let found = winc_backend::fs::metadata_many(&markers);
+    let mut children: Vec<PathBuf> = (candidates.into_iter().zip(found))
+        .filter(|(_, metadata)| metadata.is_ok())
+        .map(|(path, _)| path)
         .collect();
     children.sort_by_cached_key(|path| {
         path.file_name()
@@ -1458,19 +1253,23 @@ pub fn scan_repositories(dir: &Path, depth: usize, cancel: &Cancel) -> Vec<PathB
                 found.sort();
                 return found;
             }
-            let Ok(entries) = std::fs::read_dir(parent) else {
+            let Ok(entries) = winc_backend::fs::read_dir(parent) else {
                 continue;
             };
+            let mut candidates = Vec::new();
             for entry in entries.flatten().take(budget) {
                 budget -= 1;
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
+                let name = entry.name.to_string_lossy();
                 let skipped = name.starts_with('.') || SCAN_SKIPPED.contains(&name.as_ref());
-                if skipped || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    continue;
+                if !skipped && entry.kind.is_dir() {
+                    candidates.push(entry.path());
                 }
-                let path = entry.path();
-                if path.join(".git").exists() {
+            }
+            // 这一个目录下各项的 `.git` 一次查完。
+            let markers: Vec<PathBuf> = candidates.iter().map(|path| path.join(".git")).collect();
+            let repositories = winc_backend::fs::metadata_many(&markers);
+            for (path, repository) in candidates.into_iter().zip(repositories) {
+                if repository.is_ok() {
                     found.push(path);
                 } else {
                     next.push(path);
