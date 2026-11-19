@@ -8,8 +8,13 @@ use super::*;
 
 /// 系统的打开、保存面板。
 pub enum Panel<'a> {
-    /// 打开：`files` 为 `false` 时只能选目录。
-    Open { files: bool },
+    /// 打开：`files` 为 `false` 时只能选目录；`dir` 是起始目录，`None` 时由系统决定。
+    Open {
+        /// 是否可以选文件。
+        files: bool,
+        /// 起始目录。
+        dir: Option<&'a Path>,
+    },
     /// 保存：默认文件名和起始目录。
     Save {
         /// 默认文件名。
@@ -53,7 +58,10 @@ pub fn show_panel(
 
         // 程序不是 .app 包时，系统按英文显示按钮，因此显式设置当前界面语言的文字。
         match panel {
-            Panel::Open { files } => {
+            Panel::Open { files, dir } => {
+                if let Some(url) = dir.and_then(|dir| file_url(dir, true)) {
+                    let () = msg_send![&*object, setDirectoryURL: &*url];
+                }
                 let () = msg_send![&*object, setCanChooseFiles: files];
                 let () = msg_send![&*object, setCanChooseDirectories: true];
                 let () = msg_send![&*object, setAllowsMultipleSelection: false];
@@ -534,7 +542,7 @@ pub fn key_equivalent(stroke: crate::keymap::Stroke) -> Option<(String, usize)> 
     // 功能键使用 AppKit 定义在 Unicode 私有区的字符（如 `NSUpArrowFunctionKey` 为 U+F700）。
     let key: char = match stroke.key {
         KeyCode::Char(c) => c,
-        KeyCode::Numpad(_) => return None,
+        KeyCode::Numpad(_) | KeyCode::Tap => return None,
         KeyCode::F(n) => char::from_u32(0xF704 + u32::from(n) - 1)?,
         KeyCode::Enter => '\r',
         KeyCode::Backspace => '\u{8}',
@@ -548,6 +556,9 @@ pub fn key_equivalent(stroke: crate::keymap::Stroke) -> Option<(String, usize)> 
         KeyCode::Right => '\u{F703}',
         KeyCode::PageUp => '\u{F72C}',
         KeyCode::PageDown => '\u{F72D}',
+        KeyCode::Home => '\u{F729}',
+        KeyCode::End => '\u{F72B}',
+        KeyCode::Insert => '\u{F727}',
     };
     let mut mods = 0;
     for (bit, mask) in [

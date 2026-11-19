@@ -2,7 +2,7 @@
 //!
 //! 页面的位置由 `PdfPreview::lay_out` 排出；只请求视口内和视口上下各半屏范围内的页（见
 //! `App::request_pdf_pages`），尚未渲染的页显示白色底，渲染失败的页在页面中央显示原因。缩放后
-//! 新尺寸的位图渲染完成之前，先把旧位图缩放显示。左侧是缩略图栏，右下角是工具栏。
+//! 新尺寸的位图渲染完成之前，先把旧位图缩放显示。左侧是缩略图栏，右下角是自动隐藏的工具栏。
 
 use winc_render::{FontKind, Frame, Rect};
 
@@ -25,8 +25,8 @@ const STRIP_MIN_AREA: f32 = 560.0;
 pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let p = app.palette;
     frame.rect(area, p.editor_bg);
-    app.pdf.area = area;
-    let Some(Ok(pages)) = app.pdf.pages.clone() else {
+    app.preview.pdf.area = area;
+    let Some(Ok(pages)) = app.preview.pdf.pages.clone() else {
         return;
     };
     let scale = frame.scale();
@@ -37,7 +37,7 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     // 的宽度排版，只随栏平移，页面的大小不在过渡中反复改变。
     let strip_fits = pages.len() > 1 && area.w >= STRIP_MIN_AREA;
     let open = strip_fits && !app.state.pdf_thumbnails_hidden;
-    let shown = match app.pdf.strip_motion.filter(|_| strip_fits) {
+    let shown = match app.preview.pdf.strip_motion.filter(|_| strip_fits) {
         Some((true, clock)) => clock.between(0.0, STRIP_WIDTH),
         Some((false, clock)) => clock.between(STRIP_WIDTH, 0.0),
         None if open => STRIP_WIDTH,
@@ -46,10 +46,14 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let shown = snap(shown);
     let body = Rect::new(area.x + shown, area.y, area.w - shown, area.h);
     let fixed = if open { STRIP_WIDTH } else { 0.0 };
-    let (rects, ratio) = app.pdf.lay_out(&pages, area.w - fixed);
-    let (scroll, scroll_x, height) = (app.pdf.scroll, app.pdf.scroll_x, app.pdf.height);
+    let (rects, ratio) = app.preview.pdf.lay_out(&pages, area.w - fixed);
+    let (scroll, scroll_x, height) = (
+        app.preview.pdf.scroll,
+        app.preview.pdf.scroll_x,
+        app.preview.pdf.height,
+    );
     // 放大后每页的位图更大，只请求视口内的页；否则视口上下各半屏范围内的页也提前请求。
-    let reach = if app.pdf.zoom > 1.0 {
+    let reach = if app.preview.pdf.zoom > 1.0 {
         0.0
     } else {
         body.h / 2.0
@@ -82,7 +86,7 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         // 页面四周一圈细边框与背景区分，裁剪到正文区域内：滚出顶部的页不画到标签栏上。
         frame.rect_clipped(page.inset(-1.0, -1.0), p.border, 0.0, body);
         frame.rect_clipped(page, winc_render::Color::hex(0xffffff), 0.0, body);
-        match app.pdf.rendered.get(&i) {
+        match app.preview.pdf.rendered.get(&i) {
             Some(pixels) if (pixels.width, pixels.height) == (dw, dh) => {
                 frame.pixels((page.x, page.y), dw, dh, &pixels.rgba, body);
             }
@@ -90,7 +94,7 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
                 frame.pixels_scaled(page, pixels.width, pixels.height, &pixels.rgba, body);
             }
             None => {
-                if let Some(reason) = app.pdf.failed.get(&(i, w)) {
+                if let Some(reason) = app.preview.pdf.failed.get(&(i, w)) {
                     draw_failure(app, frame, page.intersect(body), reason);
                 }
             }
@@ -104,13 +108,8 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         Vec::new()
     };
     app.request_pdf_pages(&wanted, &thumbs);
-    draw_toolbar(
-        app,
-        frame,
-        body,
-        (current, pages.len()),
-        strip_fits.then_some(open),
-    );
+    app.preview.pdf.page = Some((current, pages.len()));
+    draw_toolbar(app, frame, body, strip_fits.then_some(open));
     let owner = app.editor.active().map_or(0, |doc| doc.id.0);
     let bar = crate::view::ScrollArea::Pdf;
     crate::view::draw_scrollbar(app, frame, bar, owner, area, scroll, height);
@@ -143,7 +142,7 @@ fn draw_strip(
             item
         })
         .collect();
-    let pdf = &mut app.pdf;
+    let pdf = &mut app.preview.pdf;
     (pdf.strip, pdf.strip_height) = (visible, y);
     if pdf.current != current
         && let Some(&(top, h)) = items.get(current)
@@ -184,7 +183,7 @@ fn draw_strip(
         frame.rect_clipped(thumb, winc_render::Color::hex(0xffffff), 0.0, visible);
         let ready =
             |px: &&std::sync::Arc<winc_preview::image::Pixels>| px.width == w && px.height == h;
-        if let Some(pixels) = app.pdf.thumbs.get(&i).filter(ready) {
+        if let Some(pixels) = app.preview.pdf.thumbs.get(&i).filter(ready) {
             frame.pixels((thumb.x, thumb.y), w, h, &pixels.rgba, visible);
         }
         let text = (i + 1).to_string();
@@ -240,34 +239,41 @@ const INSET: f32 = 16.0;
 /// 工具栏按钮与工具栏边缘、按钮与分隔线之间的间距（逻辑像素）。
 const TOOL_PAD: f32 = 4.0;
 
-/// 在正文区域 `body` 的右下角画工具栏：缩略图栏的开关、缩小、当前倍数（点击后还原）、放大，
-/// 以及「当前页 / 总页数」；按钮的位置记入 `Hits::pdf_tools`。
+/// 在正文区域 `body` 的右下角画工具栏：缩略图栏的开关、缩小、当前倍数（点击后还原）和放大。
+/// 工具栏按显示状态淡入、淡出，显示时按钮的位置记入 `Hits::pdf_tools`。
 ///
-/// `pages` 是（当前页，总页数），当前页是视口中线所在的页。`strip` 为缩略图栏是否显示，没有
-/// 缩略图栏可用时为 `None`，此时没有开关。
-fn draw_toolbar(
-    app: &mut App,
-    frame: &mut Frame<'_>,
-    body: Rect,
-    (current, total): (usize, usize),
-    strip: Option<bool>,
-) {
-    let p = app.palette;
-    let size = app.fonts.ui_small;
-    let label = format!("{} / {total}", current + 1);
-    let label_w = (frame.measure(FontKind::Ui, size, &label) + TOOL_PAD * 4.0).round();
-    // 各组之间以竖线分隔。
+/// `strip` 为缩略图栏是否显示，没有缩略图栏可用时为 `None`，此时没有开关。
+fn draw_toolbar(app: &mut App, frame: &mut Frame<'_>, body: Rect, strip: Option<bool>) {
+    // 开关与缩放按钮之间以竖线分隔。
     let gap = TOOL_PAD * 2.0 + 1.0;
     let toggle = if strip.is_some() { BUTTON + gap } else { 0.0 };
-    let inner = toggle + BUTTON * 2.0 + PERCENT + gap + label_w;
+    let inner = toggle + BUTTON * 2.0 + PERCENT;
     let (w, h) = (inner + TOOL_PAD * 2.0, BUTTON + TOOL_PAD * 2.0);
     // 位置取整：图标和文字各自对齐到整像素，外框不在整像素上时两者会上下错开。
     let (x, y) = (body.right() - INSET - w, body.bottom() - INSET - h);
     let bar = Rect::new(x.round(), y.round(), w, h);
-    let covered = frame.covered(bar, RADIUS_POPUP);
-    frame.shadow(bar, RADIUS_POPUP, 12.0, 4.0, p.shadow, Some(covered));
-    frame.rect_clipped(bar, p.popup_border, RADIUS_POPUP, body);
-    frame.rect_clipped(bar.inset(1.0, 1.0), p.popup_bg, RADIUS_POPUP - 1.0, body);
+    app.preview.pdf.tools.rect = bar;
+    let opacity = app.preview.pdf.tools.opacity();
+    if opacity > 0.0 {
+        let shown = app.preview.pdf.tools.shown;
+        frame.with_opacity(opacity, |frame| {
+            paint_toolbar(app, frame, (body, bar), strip, shown);
+        });
+    }
+}
+
+/// 画工具栏 `bar` 的内容（见 [`draw_toolbar`]）；`shown` 为假时不记入按钮的位置。
+fn paint_toolbar(
+    app: &mut App,
+    frame: &mut Frame<'_>,
+    (body, bar): (Rect, Rect),
+    strip: Option<bool>,
+    shown: bool,
+) {
+    let p = app.palette;
+    let size = app.fonts.ui_small;
+    let gap = TOOL_PAD * 2.0 + 1.0;
+    crate::view::draw_floating_bar(frame, p, bar, body);
 
     let mut x = bar.x + TOOL_PAD;
     let separator = |frame: &mut Frame<'_>, x: f32| {
@@ -279,19 +285,19 @@ fn draw_toolbar(
         );
         frame.rect_clipped(line, p.separator, 0.0, body);
     };
-    let zoom = app.pdf.zoom;
+    let zoom = app.preview.pdf.zoom;
     let tools = [
         (PdfTool::Thumbnails, BUTTON, strip.is_some()),
         (PdfTool::ZoomOut, BUTTON, true),
         (PdfTool::ZoomReset, PERCENT, true),
         (PdfTool::ZoomIn, BUTTON, true),
     ];
-    for (tool, w, shown) in tools {
-        if !shown {
+    for (tool, w, present) in tools {
+        if !present {
             continue;
         }
         let r = Rect::new(x, bar.y + TOOL_PAD, w, BUTTON);
-        if app.hover == Hover::PdfTool(tool) {
+        if app.pointer.hover == Hover::PdfTool(tool) {
             frame.rect_clipped(r, p.hover, RADIUS_POPUP - TOOL_PAD, body);
         }
         let center = (r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -317,18 +323,13 @@ fn draw_toolbar(
                 frame.text(FontKind::Ui, size, at, baseline, &text, p.text, body);
             }
         }
-        app.hits.pdf_tools.push((r, tool));
+        if shown {
+            app.hits.pdf_tools.push((r, tool));
+        }
         x += w;
         if tool == PdfTool::Thumbnails {
             separator(frame, x);
             x += gap;
         }
     }
-    separator(frame, x);
-    x += gap;
-    let row = Rect::new(x, bar.y + TOOL_PAD, label_w, BUTTON);
-    let tw = frame.measure(FontKind::Ui, size, &label);
-    let baseline = crate::view::ui_baseline(app, row, size);
-    let at = (row.x + (row.w - tw) / 2.0).round();
-    frame.text(FontKind::Ui, size, at, baseline, &label, p.text_muted, body);
 }

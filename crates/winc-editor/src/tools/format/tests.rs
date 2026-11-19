@@ -170,7 +170,7 @@ fn failures_leave_the_text_alone_and_say_why() {
     );
     assert_eq!(
         message(error("quiet", "exit 3")),
-        "「quiet」运行出错（退出码 3）"
+        "「quiet」运行失败（退出码 3）"
     );
 
     // 完整记录：运行的命令、工作目录、退出码，以及原样的标准错误。
@@ -363,7 +363,7 @@ fn plans_explain_why_nothing_can_run() {
     };
     assert_eq!(
         unavailable("makefile"),
-        "Makefile 没有可自动使用的格式化工具，请在设置中指定命令"
+        "Makefile 无可自动使用的格式化工具，请在设置中指定命令"
     );
     let plain = winc_syntax::detect("README");
     assert!(matches!(
@@ -525,7 +525,7 @@ fn fixers_are_only_picked_when_the_project_uses_them() {
     else {
         panic!("Go 没有修复工具的预设");
     };
-    assert_eq!(message, "Go 没有可自动使用的修复工具，请在设置中指定命令");
+    assert_eq!(message, "Go 无可自动使用的修复工具，请在设置中指定命令");
 
     std::fs::write(dir.join("eslint.config.mjs"), "export default [];\n").unwrap();
     let plan = Plan::for_task(
@@ -613,4 +613,29 @@ fn distribution_files_get_linux_install_commands() {
     assert!(!install::fits_this_system("scoop", true));
     assert!(!install::fits_this_system("xcode-select", true));
     assert!(install::fits_this_system("npm", true));
+}
+
+#[test]
+fn tools_found_in_a_wsl_distro_are_remembered_until_forgotten() {
+    let formatter = Formatter::default();
+    // 没有查过：设置页还不知道，等后台查询。
+    assert_eq!(formatter.wsl_asked("Ubuntu", "ruff"), None);
+    formatter.wsl_found("Ubuntu", "ruff", Some(Path::new("/usr/bin/ruff")));
+    formatter.wsl_found("Ubuntu", "black", None);
+    assert_eq!(
+        formatter.wsl_asked("Ubuntu", "ruff"),
+        Some(Some(PathBuf::from("/usr/bin/ruff")))
+    );
+    assert_eq!(formatter.wsl_asked("Ubuntu", "black"), Some(None));
+    // 各发行版分别记录；再次查到时替换。
+    assert_eq!(formatter.wsl_asked("Debian", "ruff"), None);
+    formatter.wsl_found(
+        "Ubuntu",
+        "black",
+        Some(Path::new("/home/me/.local/bin/black")),
+    );
+    assert!(formatter.wsl_asked("Ubuntu", "black").unwrap().is_some());
+    // 重新打开设置时丢弃，新安装的工具得以发现。
+    formatter.forget_wsl();
+    assert_eq!(formatter.wsl_asked("Ubuntu", "ruff"), None);
 }

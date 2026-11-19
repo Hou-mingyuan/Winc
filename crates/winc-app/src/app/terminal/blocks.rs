@@ -289,7 +289,7 @@ impl App {
 
     /// 点了第 `block` 个块的色带：折起或展开它的输出；按住 ⇧ 时选中整块输出，之后可以 ⌘C 复制。
     pub(in crate::app) fn click_terminal_band(&mut self, block: usize) {
-        let shift = self.modifiers.shift_key();
+        let shift = self.pointer.modifiers.shift_key();
         let Some(tab) = self.terminal.tab_mut() else {
             return;
         };
@@ -456,9 +456,9 @@ impl App {
             t.errors = None;
             return;
         };
-        // 打开的目录位于 WSL 发行版中时，命令报告的绝对路径属于同一发行版。
+        // 打开的目录在远端主机上或位于 WSL 发行版中时，命令报告的绝对路径属于那里。
         let local = |path| match &root {
-            Some(root) => winc_editor::wsl::from_terminal(root, path),
+            Some(root) => super::helper::terminal_path(root, path),
             None => path,
         };
         let cwd = if block.cwd.is_empty() {
@@ -495,7 +495,6 @@ impl App {
                 if spots
                     .iter()
                     .any(|s| s.path == path && s.line + 1 == line_no)
-                    || !path.is_file()
                 {
                     continue;
                 }
@@ -509,6 +508,9 @@ impl App {
                 });
             }
         }
+        // 不是文件的位置不算（见 [`App::terminal_target`]）。
+        spots.retain(|spot| self.terminal_target(&spot.path, true) && !self.is_folder(&spot.path));
+        let t = &mut self.terminal;
         if spots.is_empty() {
             t.errors = None;
             self.flash(t!("terminal-no-error-location"));

@@ -17,7 +17,7 @@ of releasing it again. To retry a failed build, rerun the Release workflow on th
 | `.github/workflows/release.yml` | Entry point: prepare, the four platform builds, and the draft |
 | `.github/workflows/release-arch-repo.yml` | Stages the signed Arch repository after a stable release is published |
 | `.github/workflows/release-{prepare,macos,linux,windows}.yml` | Reusable jobs called by `release.yml` |
-| `.github/actions/build-setup/` | Shared toolchain and cache setup; pins the release Rust version |
+| `.github/actions/build-setup/` | Shared source check and toolchain setup; pins the release Rust version |
 | `release/macos/` | `package.sh` (app, dmg, appcast), `verify.sh`, and Apple signing setup |
 | `release/linux/` | `package.sh` (AppImage and deb), pinned packaging tools, desktop entry and AppRun |
 | `release/linux/arch/` | Arch package recipe, repository staging and installer template |
@@ -76,19 +76,24 @@ version (see below). Neither needs a repository Variable.
 | --- | --- |
 | macOS Apple silicon | `macos-arm64.dmg` |
 | macOS Intel | `macos-x64.dmg` |
-| Linux x86_64 | `linux-x64.AppImage`, `linux-x64.deb` |
+| Linux x86_64 | `linux-x64.AppImage`, `linux-x64.deb`, `linux-x64.rpm` |
 | Windows x86_64 | `windows-x64-setup.exe`, `windows-x64.msi`, `windows-x64-portable.zip` |
 
 All packages include the terminal helper. macOS containers use the same final app and retain the
 macOS 11 minimum. Linux packages are built on Ubuntu 24.04; the deb declares glibc 2.39 or newer.
-Debian prerelease versions use `~` so the final release sorts after its betas.
+The rpm wraps the same binaries in a Fedora container: rpmbuild derives the glibc requirement, and
+the window system libraries loaded at run time are required by soname, so it installs on Fedora 40
+or newer, RHEL 10 and openSUSE Tumbleweed. Debian and RPM prerelease versions use `~` so the final
+release sorts after its betas.
 Stable `X.Y.Z` releases also include `winc-<version>-1-x86_64.pkg.tar.zst` built from the same Linux
 binaries. The Arch package uses pacman for updates.
 
 Each release also has four signed appcasts for the in-app updater: `appcast-macos-arm64.xml`,
 `appcast-macos-x86_64.xml`, `appcast-linux.xml`, and `appcast-windows.xml`. They list the dmg, the
-AppImage, and the NSIS and MSI installers, each with its EdDSA signature; the deb and the portable
-zip are downloads only. `SHA256SUMS` covers the assets assembled before publication.
+AppImage, and the NSIS and MSI installers, each with its EdDSA signature; the deb, the rpm and the
+portable zip are downloads only. Installs that cannot update themselves (deb, rpm, the Arch
+package, the portable zip) still read their platform's appcast and only notify: the update button
+opens the downloads page, or suggests `pacman -Syu` for the Arch package. `SHA256SUMS` covers the assets assembled before publication.
 
 ### Update channel (winc.si)
 
@@ -104,6 +109,11 @@ The app reads `<channel URL>/appcast-<platform>.xml`, and each appcast's downloa
 `<channel URL>/<file name>`. To ship a version, deploy its appcasts and the files they list to that
 URL. Appcasts are signed, so winc.si must serve them unchanged. The channel URL is defined once,
 in `channelBase` in `release/common/config.mjs`.
+
+The in-app release notes are not part of a channel. The app reads
+`https://winc.si/releases/notes/<language>.md` (`en.md`, `zh-cn.md`) when the user opens them;
+winc.si generates these files from its changelog. Each release starts with a `## <version> · <date>`
+line, which the app uses to pick the releases to show (`crates/winc-app/src/release_notes.rs`).
 
 Windows NSIS installations are per-user; MSI installations are per-machine and use the fixed
 UpgradeCode `00FDC6A5-D527-59AE-B4A5-E051B25222F3`. Do not change it between releases. Each installer

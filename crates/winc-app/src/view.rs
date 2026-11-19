@@ -16,7 +16,9 @@ use winc_render::{Color, Faux, FontKind, Frame, Rect};
 use crate::app::animation::{Card, dialog_curve, reveal};
 use crate::app::workspace::picker::picker_parts;
 use crate::app::workspace::tab_names::{tab_folder, tab_icon_name};
-use crate::app::{App, DropZone, Hover, MenuButton, ScrollArea, ThumbLook, WORD_HIGHLIGHT_COUNT};
+use crate::app::{
+    App, DropZone, Hover, MenuButton, Parent, ScrollArea, ThumbLook, WORD_HIGHLIGHT_COUNT,
+};
 use crate::field::{FieldView, TextField};
 use crate::icons;
 use crate::keymap::{self, Action};
@@ -24,6 +26,7 @@ use crate::layout::{SearchParts, scrollbar_thumb};
 use crate::theme::*;
 
 mod alert;
+mod controls;
 mod dialog;
 mod diff;
 mod editor;
@@ -59,8 +62,48 @@ pub(crate) fn base(app: &App) -> [(Rect, Color); 3] {
     [
         (l.sidebar, p.sidebar_bg),
         (l.top_bar, p.editor_bg),
-        (l.editor, p.editor_bg),
+        // 拆分后编辑区只是前台窗格的那一块：底色铺满整个卡片。
+        (app.panes.card.unwrap_or(l.editor), p.editor_bg),
     ]
+}
+
+/// 绘制一个窗格：标签栏和编辑区，以及分栏预览、合并的两侧等随标签变化的部分。`front` 为假
+/// 时是前台以外的窗格：合并的冲突只由前台窗格折叠、展开。
+fn draw_pane(app: &mut App, frame: &mut Frame<'_>, front: bool) {
+    draw_top_bar(app, frame);
+    if front {
+        app.sync_merge_panes();
+    }
+    draw_editor(app, frame);
+    editor::draw_split(app, frame);
+    preview::markdown::draw_diagram_view(app, frame);
+    git::merge::draw_side_panes(app, frame);
+}
+
+/// 绘制窗格之间的分隔线；悬停或拖动时加深。
+fn draw_pane_dividers(app: &App, frame: &mut Frame<'_>) {
+    let p = app.palette;
+    for divider in &app.panes.dividers {
+        let active = app.active_pane_divider() == Some(divider.index);
+        let color = if active { p.accent } else { p.border };
+        frame.rect(divider.line, color);
+    }
+}
+
+/// 拖动标签时标出松开后放进的窗格或拆出的那一半，底色同拖入文件的放置目标；拖到另一个窗格的
+/// 标签栏上时画出插入处的竖线。
+fn draw_tab_drop(app: &App, frame: &mut Frame<'_>) {
+    use crate::app::workspace::panes::TabDrop;
+    match app.panes.drop {
+        Some((TabDrop::Into { at: Some(_), .. }, line)) => {
+            frame.rect(line, app.palette.accent);
+        }
+        Some((_, area)) => {
+            let area = area.inset(6.0, 6.0);
+            frame.rect_clipped(area, app.palette.drop_target, RADIUS_ISLAND - 4.0, area);
+        }
+        None => {}
+    }
 }
 
 /// 绘制一帧界面，并重置、重新收集本帧的命中区域（文件树工具栏、项目名等）。
@@ -75,23 +118,24 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     app.hits.clear();
     frame.base(&base(app));
     let layout = app.layout;
-    app.tree.overflow = tree_overflow(app, frame);
+    app.panels.tree.overflow = tree_overflow(app, frame);
+    app.panels.global.overflow = workspace::panel::result_overflow(app, frame);
     app.track_log_tree();
-    let before = app.commit.overflow.map(|o| o.row);
-    app.commit.overflow = git::commit::commit_overflow(app, frame);
+    let before = app.git.commit.overflow.map(|o| o.row);
+    app.git.commit.overflow = git::commit::commit_overflow(app, frame);
     app.track_commit_actions(before);
     // 历史提交的文件列表借用提交视图的列表，同样计算写全名的那一行。
     app.with_log_list(|app| {
-        let before = app.commit.overflow.map(|o| o.row);
-        app.commit.overflow = git::commit::commit_overflow(app, frame);
+        let before = app.git.commit.overflow.map(|o| o.row);
+        app.git.commit.overflow = git::commit::commit_overflow(app, frame);
         app.track_commit_actions(before);
     });
 
     // 鼠标停在名称展开的行上并滚动文件树后，该位置对应的行可能不再展开名称；鼠标位于文件树
     // 范围之外时需要清除悬停状态。
     let (x, y) = app.mouse();
-    if app.tree.overflow.is_none()
-        && matches!(app.hover, Hover::TreeRow(_))
+    if app.panels.tree.overflow.is_none()
+        && matches!(app.pointer.hover, Hover::TreeRow(_))
         && !layout.tree.contains(x, y)
     {
         app.set_hover(Hover::None);
@@ -104,20 +148,24 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     }
     // 本帧没有绘制工具栏（侧栏收起或处于搜索视图）时，收起动画直接结束，不需要额外一帧。
     if app.hits.tree_tools.is_empty() && app.hits.tree_more.is_none() {
-        app.tool_fold.settle();
+        app.motion.tool_fold.settle();
     }
 
-    draw_top_bar(app, frame);
-    draw_sidebar_button(app, frame);
-    app.sync_merge_panes();
-    draw_editor(app, frame);
-    editor::draw_split(app, frame);
-    preview::markdown::draw_diagram_view(app, frame);
-    git::merge::draw_side_panes(app, frame);
+    // 拆分后最后画前台窗格：浮层和各区域记下的位置都是它的。
+    app.draw_panes(|app, front| draw_pane(app, frame, front));
+    draw_pane_dividers(app, frame);
+    draw_tab_drop(app, frame);
+    // 最大化、还原途中面板盖在编辑区上面：编辑区的圆角先修整好，面板再画在上面。
+    let covered = app.terminal.grow.is_some();
+    if covered {
+        round_editor_corners(app, frame);
+    }
     terminal::draw_terminal(app, frame);
+    // 侧栏开关和窗口按钮画在终端之上：面板在右边、最大化且侧栏收起时伸到它们下面。
+    draw_sidebar_button(app, frame);
     draw_window_controls(app, frame);
     draw_status(app, frame);
-    draw_island_corners(app, frame);
+    draw_island_corners(app, frame, !covered);
     // 以下都是浮在内容之上的面板、菜单和提示，底色保持不透明。
     frame.end_wallpaper();
     draw_file_drop(app, frame);
@@ -125,6 +173,8 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     draw_tree_overflow(app, frame);
     git::commit::draw_commit_overflow_closing(app, frame);
     git::commit::draw_commit_overflow(app, frame);
+    workspace::panel::draw_result_overflow_closing(app, frame);
+    workspace::panel::draw_result_overflow(app, frame);
     app.with_log_list(|app| {
         git::commit::draw_commit_overflow_closing(app, frame);
         git::commit::draw_commit_overflow(app, frame);
@@ -136,8 +186,8 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     }
 
     // 位置浮窗显示在名称旁边，有独立的动画（滑出、淡出）。
-    let bar_open = app.goto_input.is_some() && !app.prompt_kind.is_vim();
-    let picker_open = app.picker.open && app.picker.places.is_none();
+    let bar_open = app.bars.goto_input.is_some() && !app.bars.prompt_kind.is_vim();
+    let picker_open = app.overlays.picker.open && app.overlays.picker.places.is_none();
     app.track_card(Card::Bar, bar_open);
     app.track_card(Card::Picker, picker_open);
     // 先绘制正在淡出的卡片：在 ⌘P 面板中按 ⌃G 时，跳转条绘制在淡出的面板之上。
@@ -150,9 +200,9 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     if picker_open {
         let rect = app.layout.picker;
         draw_moving_card(app, frame, Card::Picker, rect, draw_picker);
-    } else if app.picker.open {
+    } else if app.overlays.picker.open {
         draw_picker(app, frame);
-    } else if let Some(ghost) = &app.picker.places_out {
+    } else if let Some(ghost) = &app.overlays.picker.places_out {
         editor::places::draw_ghost(app, frame, ghost);
     }
 
@@ -162,8 +212,7 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     // 合并冲突的卡片排在磁盘冲突卡片下面。
     let top = match &app.hits.conflict_card {
         Some((card, _)) => card.bottom(),
-        None if app.layout.search.h > 0.0 => app.layout.search.bottom(),
-        None => app.layout.editor.y,
+        None => app.overlay_top(),
     } + 8.0;
     let mut hits = std::mem::take(&mut app.hits.merge);
     app.hits.merge_card = git::merge::draw_merge_card(app, frame, top, &mut hits);
@@ -180,9 +229,10 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     }
 
     draw_tree_drag(app, frame);
+    draw_tab_drag(app, frame);
 
     // 新建工作树对话框覆盖整个窗口，打开时同样不绘制悬停提示。
-    let dialog_open = app.form_dialog.is_some();
+    let dialog_open = app.overlays.form_dialog.is_some();
     app.track_card(Card::Dialog, dialog_open);
     dialog::draw_ghost(app, frame);
     if dialog_open {
@@ -204,12 +254,13 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
 
     // 窗口内的菜单、提示框绘制在所有内容之上；打开期间不显示悬停提示。提示框关闭后仍需要
     // 若干帧完成淡出，因此每帧都调用绘制。
-    let modal = app.popup().is_some() || app.alert.is_some();
+    let modal = app.popup().is_some() || app.overlays.alert.is_some();
     draw_modal(app, frame);
     if modal {
         return;
     }
-    draw_tooltip(app, frame);
+    // 鼠标在其他窗格上时，提示按那个窗格的标签和按钮写。
+    app.in_hovered_pane(|app| draw_tooltip(app, frame));
 }
 
 /// 绘制已打开的窗口内菜单和提示框；提示框覆盖在菜单之上。
@@ -221,24 +272,32 @@ fn draw_modal(app: &mut App, frame: &mut Frame<'_>) {
 /// 把侧栏、编辑区（以及终端面板）的四角改为圆角。
 ///
 /// 卡片内容按直角矩形绘制，最后用窗口底色覆盖四角圆弧外侧的部分；之后绘制的浮层不受影响。
-fn draw_island_corners(app: &App, frame: &mut Frame<'_>) {
+/// `editor` 为假时不修整编辑区：终端面板正盖在它上面，它的圆角已在面板之前修整过。
+fn draw_island_corners(app: &App, frame: &mut Frame<'_>, editor: bool) {
     let l = &app.layout;
     let p = app.palette;
 
     if l.sidebar.right() > 0.0 {
         frame.round_corners(l.sidebar, RADIUS_ISLAND, p.frame_bg);
     }
+    if editor {
+        round_editor_corners(app, frame);
+    }
+    if l.terminal.h > 0.0 {
+        frame.round_corners(l.terminal, RADIUS_ISLAND, p.frame_bg);
+    }
+}
 
+/// 修整编辑区卡片（顶栏那一行连同下面的编辑区）的四角，见 [`draw_island_corners`]。
+fn round_editor_corners(app: &App, frame: &mut Frame<'_>) {
+    let l = &app.layout;
     let editor = Rect::new(
         l.top_bar.x,
         l.top_bar.y,
         l.top_bar.w,
         l.editor.bottom() - l.top_bar.y,
     );
-    frame.round_corners(editor, RADIUS_ISLAND, p.frame_bg);
-    if l.terminal.h > 0.0 {
-        frame.round_corners(l.terminal, RADIUS_ISLAND, p.frame_bg);
-    }
+    frame.round_corners(editor, RADIUS_ISLAND, app.palette.frame_bg);
 }
 
 /// 拖动文件经过窗口时，为松手后接收该文件的终端面板或编辑区（含标签栏）绘制放置目标底色。
@@ -248,7 +307,13 @@ fn draw_file_drop(app: &App, frame: &mut Frame<'_>) {
     let l = &app.layout;
     let area = match app.file_hover() {
         Some(DropZone::Terminal) => l.terminal,
-        Some(DropZone::Open) => Rect::new(
+        Some(DropZone::Open(Some(drop))) => {
+            let Some(area) = app.drop_area(drop.pane, drop.edge) else {
+                return;
+            };
+            area
+        }
+        Some(DropZone::Open(None)) => Rect::new(
             l.top_bar.x,
             l.top_bar.y,
             l.top_bar.w,
@@ -269,16 +334,42 @@ fn draw_tree_drag(app: &App, frame: &mut Frame<'_>) {
     let Some(drag) = app.tree_dragging() else {
         return;
     };
-    let p = app.palette;
-    let window = app.layout.window;
-    let (x, y) = app.mouse();
-
     let name = match drag.paths.len() {
         1 => ellipsize(frame, &drag.name, app.fonts.ui, 240.0),
         n => Cow::Owned(t!("workspace-tree-drag-items", count = n)),
     };
+    let (card, icon_x, cy) = draw_drag_card(app, frame, name);
+    let p = app.palette;
+    if drag.kind == EntryKind::Dir {
+        icons::folder(frame, (icon_x, (cy - 6.0).round()), false, p.folder, card);
+    } else {
+        draw_file_icon(frame, p, (icon_x + 1.5, cy), &drag.name, card);
+    }
+}
+
+/// 绘制拖出标签栏的标签跟随鼠标的小卡片，样式同拖动文件树条目时的卡片。
+fn draw_tab_drag(app: &App, frame: &mut Frame<'_>) {
+    let docs = app.tabs_dragged_out();
+    let Some(doc) = docs.first().and_then(|id| app.editor.document(*id)) else {
+        return;
+    };
+    let file = doc.name();
+    let name = match docs.len() {
+        1 => ellipsize(frame, &file, app.fonts.ui, 240.0),
+        n => Cow::Owned(t!("workspace-tree-drag-items", count = n)),
+    };
+    let (card, icon_x, cy) = draw_drag_card(app, frame, name);
+    draw_file_icon(frame, app.palette, (icon_x + 1.5, cy), &file, card);
+}
+
+/// 在鼠标右下方画拖动时的卡片和名称 `name`（按住 `⌥` 时注明复制），返回卡片、图标的横坐标和
+/// 中线。
+fn draw_drag_card(app: &App, frame: &mut Frame<'_>, name: Cow<'_, str>) -> (Rect, f32, f32) {
+    let p = app.palette;
+    let window = app.layout.window;
+    let (x, y) = app.mouse();
     // 按住 ⌥ 松开时执行复制。
-    let name = if app.modifiers.alt_key() {
+    let name = if app.pointer.modifiers.alt_key() {
         Cow::Owned(t!("workspace-tree-drag-copy", name = name.as_ref()))
     } else {
         name
@@ -291,15 +382,10 @@ fn draw_tree_drag(app: &App, frame: &mut Frame<'_>) {
         TREE_ROW,
     );
     draw_card(frame, p, card, RADIUS_ROW, p.popup_bg);
-
     let cy = icon_center_y(app, card, app.fonts.ui);
     let icon_x = card.x + 12.0;
-    if drag.kind == EntryKind::Dir {
-        icons::folder(frame, (icon_x, (cy - 6.0).round()), false, p.folder, card);
-    } else {
-        draw_file_icon(frame, p, (icon_x + 1.5, cy), &drag.name, card);
-    }
     ui_text(frame, app, icon_x + 18.0, card, &name, p.text, card);
+    (card, icon_x, cy)
 }
 
 /// 绘制按钮的悬停提示。
@@ -309,6 +395,7 @@ fn draw_tree_drag(app: &App, frame: &mut Frame<'_>) {
 fn draw_tooltip(app: &App, frame: &mut Frame<'_>) {
     // 停留时间不足时直接返回，不拼接提示文字，也不查找命中框。
     let rested = app
+        .overlays
         .tooltip
         .since
         .is_some_and(|since| since.elapsed() >= TOOLTIP_DELAY);
@@ -317,7 +404,7 @@ fn draw_tooltip(app: &App, frame: &mut Frame<'_>) {
     }
     let (button, label): (Rect, String) = match workspace::panel::tooltip(app) {
         Some(tip) => tip,
-        None => match app.hover {
+        None => match app.pointer.hover {
             Hover::Search(button) => (
                 SearchParts::new(app.layout.search).rect(button),
                 button.label(),
@@ -393,9 +480,28 @@ fn draw_tooltip(app: &App, frame: &mut Frame<'_>) {
                 };
                 (rect, label)
             }
+            // 日志分支面板中截短了的分支名：提示全名。
+            Hover::Log(crate::app::git::log::LogTarget::BranchRow(i))
+                if app.git.log.long_branches.contains(&i) =>
+            {
+                use crate::app::git::log::{BranchRow, LogTarget};
+                let hit = app
+                    .hits
+                    .log
+                    .iter()
+                    .find(|(_, t)| *t == LogTarget::BranchRow(i));
+                let row = app.log_branch_rows().into_iter().nth(i);
+                match (hit, row) {
+                    (Some(&(rect, _)), Some(BranchRow::Branch { index, .. })) => {
+                        let branch = app.git.branches.get(index);
+                        (rect, branch.map_or_else(String::new, |b| b.name.clone()))
+                    }
+                    _ => return,
+                }
+            }
             // 日志详情中目录被截短或文件被改名的条目：显示完整路径。
             Hover::Log(crate::app::git::log::LogTarget::File(i))
-                if app.log.long_files.contains(&i) =>
+                if app.git.log.long_files.contains(&i) =>
             {
                 let hit = app
                     .hits
@@ -408,7 +514,9 @@ fn draw_tooltip(app: &App, frame: &mut Frame<'_>) {
                 }
             }
             // 日志列表中延伸到右端仍放不下的提交说明：提示整句。
-            Hover::Log(crate::app::git::log::LogTarget::Row(i)) if app.log.clipped == Some(i) => {
+            Hover::Log(crate::app::git::log::LogTarget::Row(i))
+                if app.git.log.clipped == Some(i) =>
+            {
                 let hit = app
                     .hits
                     .log
@@ -453,7 +561,7 @@ fn draw_tooltip(app: &App, frame: &mut Frame<'_>) {
     // 单行高 26 逻辑像素，每多一行增加 18。
     const LINE: f32 = 18.0;
     let height = 8.0 + LINE * lines.len() as f32;
-    let rect = if matches!(app.hover, Hover::RulerChange(_)) {
+    let rect = if matches!(app.pointer.hover, Hover::RulerChange(_)) {
         // 概览标尺紧靠窗口右边缘：提示放在标尺左侧、与鼠标同高，不遮挡鼠标所指的标记。
         Rect::new(
             button.x - 8.0 - width,
@@ -470,7 +578,7 @@ fn draw_tooltip(app: &App, frame: &mut Frame<'_>) {
         };
         Rect::new(
             (button.x + (button.w - width) / 2.0)
-                .clamp(4.0, app.layout.window.right() - width - 4.0),
+                .clamp(4.0, (app.layout.window.right() - width - 4.0).max(4.0)),
             y,
             width,
             height,
@@ -528,7 +636,7 @@ fn baseline_in(rect: Rect, ascent: f32, descent: f32) -> f32 {
 /// 关闭按钮、行底色不对齐；按视觉中心居中后，文字、图标和按钮的垂直位置一致。
 fn optical_center(app: &App, size: f32) -> f32 {
     let k = size / app.fonts.ui;
-    (app.ui_metrics.x_height + app.ui_metrics.cap_height) * k / 4.0
+    (app.metrics.ui.x_height + app.metrics.ui.cap_height) * k / 4.0
 }
 
 /// 返回字号为 `size` 的界面文本在 `row` 内垂直居中时的基线 y 坐标（逻辑像素，取整）。
@@ -687,6 +795,9 @@ fn draw_empty_state(
 /// 用于独自放在小框里的快捷键（⌘⇧F）、项目首字母、数字：按大写字母的高度居中（数字与大写字母
 /// 等高）。[`label`] 的视觉中心计入了小写字母的中心，此类文本按其居中会偏高约半个像素。
 /// 在一行内与普通文字并列的文本（状态栏、查找条的计数）仍用 [`label`]，与普通文字共用基线。
+///
+/// 含中日韩文字的文本（「双击」、姓名首字）按 [`label`] 的视觉中心居中：这些字的中心低于大写
+/// 字母的中心，按大写字母高度居中会偏低约 1 像素。
 fn caps_label(
     frame: &mut Frame<'_>,
     app: &App,
@@ -696,8 +807,13 @@ fn caps_label(
     color: Color,
     clip: Rect,
 ) -> f32 {
-    let cap = app.ui_metrics.cap_height * size / app.fonts.ui;
-    let baseline = (rect.y + rect.h / 2.0 + cap / 2.0).round();
+    // U+2E80 起是中日韩部首、假名、表意文字和谚文；快捷键符号（⌘、⇧、→）都在它之前。
+    let baseline = if text.chars().any(|c| c >= '\u{2E80}') {
+        ui_baseline(app, rect, size)
+    } else {
+        let cap = app.metrics.ui.cap_height * size / app.fonts.ui;
+        (rect.y + rect.h / 2.0 + cap / 2.0).round()
+    };
     frame.text(FontKind::Ui, size, x, baseline, text, color, clip)
 }
 
@@ -918,16 +1034,25 @@ fn draw_card(frame: &mut Frame<'_>, p: &Palette, rect: Rect, radius: f32, backgr
     frame.rounded(rect, background, radius);
 }
 
-/// 绘制卡片外侧的阴影与细边框（`rect` 内部不绘制）。
+/// 绘制卡片外侧的阴影与细边框（`rect` 内部不绘制）；细边框画在一圈卡片底色上，不透出下方的
+/// 内容。
 fn draw_card_frame(frame: &mut Frame<'_>, p: &Palette, rect: Rect, radius: f32) {
     let covered = frame.covered(rect, radius);
     frame.shadow(rect, radius, 16.0, 4.0, p.shadow, Some(covered));
-    frame.rect_except(
-        rect.inset(-1.0, -1.0),
-        p.popup_border,
-        radius + 1.0,
-        covered,
-    );
+    let edge = rect.inset(-1.0, -1.0);
+    frame.rect_except(edge, p.popup_bg, radius + 1.0, covered);
+    frame.rect_except(edge, p.popup_border, radius + 1.0, covered);
+}
+
+/// 绘制浮在预览内容上的工具栏或卡片 `rect`（含细边框）：阴影、细边框和底色，裁剪到 `clip`；
+/// 细边框画在卡片底色上，不透出下方的内容。
+fn draw_floating_bar(frame: &mut Frame<'_>, p: &Palette, rect: Rect, clip: Rect) {
+    let covered = frame.covered(rect, RADIUS_POPUP);
+    frame.shadow(rect, RADIUS_POPUP, 12.0, 4.0, p.shadow, Some(covered));
+    frame.rect_clipped(rect, p.popup_bg, RADIUS_POPUP, clip);
+    frame.rect_clipped(rect, p.popup_border, RADIUS_POPUP, clip);
+    let inner = rect.inset(1.0, 1.0);
+    frame.rect_clipped(inner, p.popup_bg, RADIUS_POPUP - 1.0, clip);
 }
 
 /// 卡片阴影超出卡片矩形的范围（逻辑像素）。
@@ -963,7 +1088,8 @@ fn blend_card(
 ///
 /// `draw` 绘制卡片内容，卡片位于 `rect`。淡入期间先绘制并保存卡片快照，再恢复卡片下方
 /// （含阴影范围）的画面，之后整张淡入并放大；其余时间每帧也保存一份快照，关闭后由
-/// [`draw_card_ghost`] 用最后一份快照淡出。
+/// [`draw_card_ghost`] 用最后一份快照淡出。开着换页（[`App::turn_card`]）时，换页之前的快照
+/// 先在原处淡出，新的一页叠在其上淡入。
 fn draw_moving_card(
     app: &mut App,
     frame: &mut Frame<'_>,
@@ -985,6 +1111,16 @@ fn draw_moving_card(
         app.card_fx(card).shot = Some((rect, shot));
         return;
     };
+    // 换页时旧的一页在新的一页之下淡出。
+    let p = app.palette;
+    let scale = frame.scale();
+    if let Some((clock, at, old)) = &app.card_fx(card).turning
+        && !clock.done()
+        && old.covers(*at, scale)
+    {
+        let curve = dialog_curve(false, *clock);
+        blend_card(frame, p, (*at, old), card.radius(), curve);
+    }
     let mut base = app.card_fx(card).base.take().unwrap_or_default();
     frame.snapshot_into(rect.inset(-CARD_SHADOW, -CARD_SHADOW), &mut base);
     draw(app, frame);
@@ -1054,6 +1190,29 @@ fn truncate_end<'a>(frame: &mut Frame<'_>, text: &'a str, size: f32, max: f32) -
 /// 结尾（例如文件扩展名）。
 fn ellipsize<'a>(frame: &mut Frame<'_>, text: &'a str, size: f32, max: f32) -> Cow<'a, str> {
     fit(frame, text, size, max, true)
+}
+
+/// 把最近目录的上级目录 `parent` 截短到 `max`（逻辑像素）宽以内，字号为 `size`。
+///
+/// 另有同名目录时从开头逐级截去，至少保留区分各同名目录的末尾一段（见 [`Parent::keep`]），
+/// 写成 `…/a/src`；这一段也放不下时截去它的末尾。其余情况从中间截短。
+fn fit_parent<'a>(frame: &mut Frame<'_>, parent: &'a Parent, size: f32, max: f32) -> Cow<'a, str> {
+    let text = parent.text.as_str();
+    if frame.measure(FontKind::Ui, size, text) <= max {
+        return Cow::Borrowed(text);
+    }
+    let Some(keep) = parent.keep.filter(|&keep| keep > 0) else {
+        return ellipsize(frame, text, size, max);
+    };
+    let cuts = text.match_indices(['/', '\\']).map(|(i, _)| i);
+    for cut in cuts.take_while(|&cut| cut < keep) {
+        let short = format!("…{}", &text[cut..]);
+        if frame.measure(FontKind::Ui, size, &short) <= max {
+            return Cow::Owned(short);
+        }
+    }
+    let short = format!("…{}", &text[keep - 1..]);
+    Cow::Owned(truncate_end(frame, &short, size, max).into_owned())
 }
 
 /// 把路径 `path` 截短到 `max`（逻辑像素）宽以内，返回截短后的文本。
@@ -1135,6 +1294,17 @@ fn fade(frame: &mut Frame<'_>, rect: Rect, color: Color, opaque_left: bool) {
         let a = if opaque_left { 1.0 - t } else { t };
         let strip = Rect::new(rect.x + i as f32, rect.y, 1.0, rect.h);
         frame.rect(strip, color.alpha(color.a * a * a));
+    }
+}
+
+/// 绘制纵向渐隐：从 `rect` 下端的 `color` 渐变到上端的透明，曲线与 [`fade`] 相同。
+fn fade_up(frame: &mut Frame<'_>, rect: Rect, color: Color) {
+    let steps = rect.h.round().max(1.0) as usize;
+
+    for i in 0..steps {
+        let t = (i as f32 + 0.5) / steps as f32;
+        let strip = Rect::new(rect.x, rect.y + i as f32, rect.w, 1.0);
+        frame.rect(strip, color.alpha(color.a * t * t));
     }
 }
 

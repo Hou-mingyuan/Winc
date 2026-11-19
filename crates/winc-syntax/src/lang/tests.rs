@@ -221,3 +221,41 @@ fn names_and_related_languages() {
     assert!(detect("a.css").is_related(detect("index.html")));
     assert!(!detect("a.rs").is_related(detect("README.md")));
 }
+
+/// 微信小程序的三种文件各是一种语言，分别沿用 HTML、CSS 和 JavaScript 的规则；与网页的语言
+/// 互相查找用法。
+#[test]
+fn detects_wechat_mini_program_files() {
+    let [wxml, wxss, wxs] = ["index.wxml", "app.wxss", "utils.wxs"].map(detect);
+    assert_eq!((wxml.name, wxss.name, wxs.name), ("WXML", "WXSS", "WXS"));
+    assert_eq!(wxml.markup, Markup::Html);
+    assert!(wxss.stylesheet);
+    assert!(wxs.keywords.contains(&"function"));
+    assert!(wxml.is_related(wxs) && wxml.is_related(wxss));
+    assert!(wxs.is_related(detect("a.js")) && wxss.is_related(detect("a.css")));
+    assert!(!wxss.is_related(wxs));
+}
+
+#[test]
+fn log_files_are_detected_with_rotation_suffixes() {
+    for name in [
+        "server.log",
+        "SERVER.LOG",
+        "app.log.1",
+        "app.log.2026-11-16",
+    ] {
+        assert_eq!(detect(name).id, "log", "{name}");
+    }
+    for name in ["notes.1", "log", "catalog", "app.log.gz", "main.rs.1"] {
+        assert_ne!(detect(name).id, "log", "{name}");
+    }
+    assert_eq!(find("log").map(|l| l.name), Some("Log"));
+}
+
+#[test]
+fn every_markdown_extension_is_detected() {
+    // 扩展名与可预览的文件类型一致：能否预览取决于语言。
+    for name in ["a.md", "a.markdown", "a.mdown", "a.mkd", "a.mkdn", "A.MD"] {
+        assert_eq!(detect(name).id, "markdown", "{name}");
+    }
+}

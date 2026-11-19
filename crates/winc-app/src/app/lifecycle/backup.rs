@@ -112,6 +112,37 @@ pub(crate) struct Restored {
     lock: Option<(PathBuf, Option<backup::Lock>)>,
 }
 
+/// 按现场恢复窗格：`opened` 是现场中各标签打开成的文档。
+fn restore_panes(
+    editor: &mut Editor,
+    panes: &winc_config::SessionPanes,
+    opened: &[Option<DocumentId>],
+) {
+    use winc_editor::panes::{PaneId, PaneTabs};
+    let tabs = (panes.panes.iter().enumerate())
+        .map(|(i, pane)| {
+            let mut ids: Vec<DocumentId> = Vec::new();
+            for id in pane
+                .tabs
+                .iter()
+                .filter_map(|&t| opened.get(t).copied().flatten())
+            {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            PaneTabs {
+                id: PaneId(i as u32),
+                tabs: ids,
+                active: pane.active.and_then(|t| opened.get(t).copied().flatten()),
+            }
+        })
+        .collect();
+    let tree = crate::app::workspace::panes::pane_tree(&panes.tree);
+    editor.restore_panes(tree, tabs);
+    editor.focus_pane(PaneId(panes.focused as u32));
+}
+
 /// 按上次的现场恢复标签，并把备份中未保存的内容放回文档。
 ///
 /// 标签按原来的顺序重新打开，激活当时的标签，文件树展开到该文件所在的层级；现场中没有记录
@@ -158,11 +189,16 @@ pub(crate) fn restore_tabs(
     };
 
     let active_tab = session.and_then(|s| s.active);
+    let mut opened = Vec::new();
     for (i, tab) in session.map_or(&[][..], |s| &s.tabs).iter().enumerate() {
         let index = match tab {
             Tab::File(path) => take(&mut saved, |b| b.path.as_deref() == Some(path.as_path()))
                 .and_then(|backup| put_back(editor, backup))
-                .or_else(|| path.is_file().then(|| editor.open_pending(path))),
+                // 远端的文件在界面线程上无法查询：仍然恢复标签，文件不存在时由读取报告。
+                .or_else(|| {
+                    let found = winc_backend::is_remote(path) || winc_backend::fs::is_file(path);
+                    found.then(|| editor.open_pending(path))
+                }),
             Tab::Untitled(name) => take(&mut saved, |b| {
                 b.path.is_none() && b.file.file_name().is_some_and(|n| *n == **name)
             })
@@ -171,15 +207,26 @@ pub(crate) fn restore_tabs(
         if active_tab == Some(i) {
             active = index.map(|i| editor.documents[i].id);
         }
+        opened.push(index.map(|i| editor.documents[i].id));
     }
     for backup in saved {
         put_back(editor, backup);
+    }
+    editor.set_all_locked(session.is_some_and(|session| session.readonly_all));
+    for path in session.iter().flat_map(|session| &session.readonly) {
+        let at = |doc: &&mut Document| doc.path.as_deref() == Some(path.as_path());
+        if let Some(doc) = editor.documents.iter_mut().find(at) {
+            doc.set_locked(true);
+        }
     }
 
     // 当时的当前标签已不存在时，改为最后一个标签（它可能还没读）。
     editor.active = active
         .and_then(|id| editor.index_of(id))
         .or(editor.documents.len().checked_sub(1));
+    if let Some(panes) = session.and_then(|s| s.panes.as_ref()) {
+        restore_panes(editor, panes, &opened);
+    }
     let current = editor.active().and_then(|d| d.path.clone());
     if let (Some(file), Some(workspace)) = (current, &mut editor.workspace) {
         workspace.reveal(&file);
@@ -595,8 +642,13 @@ impl App {
     pub(in crate::app) fn session_tab(&self, doc: &winc_editor::Document) -> Option<Tab> {
         let backed_up = self.backup.written.contains_key(&doc.id);
         match &doc.path {
-            // 发行版暂时无法访问时无法判断文件是否存在，保留标签。
-            Some(path) if backed_up || path.is_file() || !winc_editor::wsl::reachable(path) => {
+            // 发行版暂时无法访问、文件在远端主机上时无法判断文件是否存在，保留标签。
+            Some(path)
+                if backed_up
+                    || winc_backend::is_remote(path)
+                    || winc_backend::fs::is_file(path)
+                    || !winc_editor::wsl::reachable(path) =>
+            {
                 Some(Tab::File(path.clone()))
             }
             Some(_) => None,

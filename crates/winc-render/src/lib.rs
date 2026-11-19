@@ -448,8 +448,9 @@ fn gamma_for(background: Color) -> [u8; 256] {
 impl Renderer {
     /// 创建渲染器，呈现到 `window`。
     ///
-    /// `mono` 和 `ui` 是用户配置的字体，为 `None` 时使用平台默认字体；`terminal` 是终端字体，为
-    /// `None` 时终端使用 `mono`。`weight` 是全部文字的字重。
+    /// `mono` 和 `ui` 是用户配置的字体列表，为空时使用平台默认字体；`terminal` 是终端字体列表，
+    /// 为空时终端使用 `mono`。列表中的第一个字体缺字时依次用后面的字体。`weight` 是全部文字的
+    /// 字重。
     ///
     /// # Errors
     ///
@@ -458,9 +459,9 @@ impl Renderer {
     pub fn new(
         window: Arc<Window>,
         background: Color,
-        mono: Option<&FontSpec>,
-        ui: Option<&FontSpec>,
-        terminal: Option<&FontSpec>,
+        mono: &[FontSpec],
+        ui: &[FontSpec],
+        terminal: &[FontSpec],
         weight: u16,
     ) -> Result<Renderer, String> {
         let fonts = Fonts::load(mono, ui, terminal, weight)?;
@@ -524,7 +525,12 @@ impl Renderer {
                 width: w,
                 height: h,
             }),
-            glyphs: new_glyphs(Fonts::load(mono, ui, None, FONT_WEIGHT_NORMAL)?),
+            glyphs: new_glyphs(Fonts::load(
+                mono.cloned().as_slice(),
+                ui.cloned().as_slice(),
+                &[],
+                FONT_WEIGHT_NORMAL,
+            )?),
             strokes: StrokeCache::new(),
             gamma: gamma_for(background),
             dark: is_dark(background),
@@ -610,9 +616,9 @@ impl Renderer {
     /// 字体文件不存在、无法读取或格式不支持时返回错误描述，此时渲染器保持原字体不变。
     pub fn set_fonts(
         &mut self,
-        mono: Option<&FontSpec>,
-        ui: Option<&FontSpec>,
-        terminal: Option<&FontSpec>,
+        mono: &[FontSpec],
+        ui: &[FontSpec],
+        terminal: &[FontSpec],
         weight: u16,
     ) -> Result<(), String> {
         let fonts = Fonts::load(mono, ui, terminal, weight)?;
@@ -673,6 +679,14 @@ impl Renderer {
         }
     }
 
+    /// 返回上次调用之后取用时内容已被系统收回的呈现缓冲的块数，并清零；仅 macOS 不为 0。
+    pub fn take_reclaimed(&mut self) -> u32 {
+        match &mut self.target {
+            Target::Window(_, presenter) => presenter.take_reclaimed(),
+            Target::Image(_) => 0,
+        }
+    }
+
     /// 设置窗口是否在前台（有焦点且没有被完全遮挡）。
     ///
     /// 转入后台时立即把当前显示的缓冲以外的呈现缓冲标记为可清除。
@@ -706,7 +720,7 @@ impl Renderer {
     /// [`Frame::measure`] 的结果相同；布局在绘制之前据此折行。
     pub fn measure(&self, kind: FontKind, size: f32, text: &str) -> f32 {
         let mut glyphs = self.glyphs.borrow_mut();
-        text.chars().map(|c| glyphs.advance(kind, size, c)).sum()
+        glyphs.measure(kind, Faux::default(), size, text)
     }
 
     /// 返回字体 `kind` 在字号 `size`（逻辑像素）下的度量。

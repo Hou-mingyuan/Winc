@@ -18,34 +18,24 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-/// zsh 的启动脚本：`.zshenv` 把 `ZDOTDIR` 恢复成用户原来的值，`winc.zsh` 安装钩子。
-const ZSH: &[(&str, &str)] = &[
-    ("zsh/.zshenv", include_str!("../../shell/zshenv.zsh")),
-    ("zsh/winc.zsh", include_str!("../../shell/winc.zsh")),
-];
-/// bash 的启动脚本，由 `--rcfile` 读入。
-const BASH: &[(&str, &str)] = &[("bash/winc.bash", include_str!("../../shell/winc.bash"))];
-/// fish 的启动脚本，放在 `vendor_conf.d` 里由 fish 自动读入。
-const FISH: &[(&str, &str)] = &[(
-    "fish/fish/vendor_conf.d/winc.fish",
-    include_str!("../../shell/winc.fish"),
-)];
+use winc_pty::scripts::{BASH, FISH, PYTHON, ZSH};
 
 /// 在 WSL 发行版内启动 shell 并注入集成脚本的脚本。
 #[cfg(any(windows, test))]
-const WSL: &[(&str, &str)] = &[("wsl.sh", include_str!("../../shell/wsl.sh"))];
+const WSL: &[(&str, &str)] = winc_pty::scripts::LAUNCH;
 
 /// 在发行版内运行 `WSL` 脚本的命令，`$0` 是脚本目录的 Windows 路径。
 ///
 /// 命令写成单行，避免换行符经 `wsl.exe` 的命令行传递时发生变化。脚本不可读时（如发行版未挂载
 /// Windows 磁盘）启动不带集成的 shell，终端仍可使用。
 #[cfg(any(windows, test))]
-const WSL_RUN: &str = r#"d=$(wslpath -u "$0" 2>/dev/null) && [ -r "$d/wsl.sh" ] && exec sh "$d/wsl.sh" "$d"; unset WINC_NONCE; exec "${SHELL:-/bin/sh}" -l"#;
+const WSL_RUN: &str = r#"d=$(wslpath -u "$0" 2>/dev/null) && [ -r "$d/wsl.sh" ] && exec sh "$d/wsl.sh" "$d"; unset WINC_NONCE WINC_PYTHON; exec "${SHELL:-/bin/sh}" -l"#;
 
 /// 通过 `WSLENV` 从 Windows 传给发行版的环境变量：集成脚本用到的变量，以及程序据此判断终端能力的
 /// 变量。
 #[cfg(any(windows, test))]
-const WSL_ENV: &[u8] = b"WINC_NONCE:WINC_PROMPT:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION";
+const WSL_ENV: &[u8] =
+    b"WINC_NONCE:WINC_PROMPT:WINC_PYTHON:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION";
 
 /// 环境变量表，每项是（键，值）。
 type Env = Vec<(Vec<u8>, Vec<u8>)>;
@@ -73,7 +63,7 @@ pub fn inject(
         b"fish" => FISH,
         _ => return None,
     };
-    if let Err(error) = write_scripts(dir, scripts) {
+    if let Err(error) = write_scripts(dir, scripts).and_then(|()| write_scripts(dir, PYTHON)) {
         eprintln!(
             "winc-pty: 无法写入 shell 集成脚本（{}）：{error}",
             dir.display()
@@ -122,6 +112,33 @@ pub fn inject(
     Some(nonce)
 }
 
+/// 为经 `ssh` 在远端主机上启动的 shell 准备注入：`args` 的最后一项（在远端运行的命令）里有
+/// [`winc_pty::scripts::REMOTE_NONCE`] 时，把最后一处换成新生成的随机数并返回它。
+///
+/// 脚本已由 winc 经它自己的连接写到远端；命令里没有该记号（没有启用集成、脚本没有写好）时
+/// 不注入，返回 `None`。
+pub fn inject_remote(program: &[u8], args: &mut [Vec<u8>]) -> Option<String> {
+    let name = program
+        .rsplit(|&b| b == b'/' || b == b'\\')
+        .next()
+        .unwrap_or(program);
+    if !name.eq_ignore_ascii_case(b"ssh") && !name.eq_ignore_ascii_case(b"ssh.exe") {
+        return None;
+    }
+    let mark = winc_pty::scripts::REMOTE_NONCE.as_bytes();
+    let command = args.last_mut()?;
+    let at = command.windows(mark.len()).rposition(|part| part == mark)?;
+    let nonce = match nonce() {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            eprintln!("winc-pty: 无法生成 shell 集成的随机数：{error}");
+            return None;
+        }
+    };
+    command.splice(at..at + mark.len(), nonce.bytes());
+    Some(nonce)
+}
+
 /// 为 WSL 发行版的默认 shell 准备注入：写入脚本，并修改 `args`、`env`。
 ///
 /// 返回脚本报告命令行时附带的随机数。`program` 和 `args` 不是进入默认 shell 的 `wsl.exe`，或脚本
@@ -138,7 +155,7 @@ pub fn inject_wsl(
     }
     let text = String::from_utf8_lossy(dir).into_owned();
     let path = Path::new(&text);
-    for scripts in [ZSH, BASH, FISH, WSL] {
+    for scripts in [ZSH, BASH, FISH, PYTHON, WSL] {
         if let Err(error) = write_scripts(path, scripts) {
             eprintln!("winc-pty: 无法写入 shell 集成脚本（{text}）：{error}");
             return None;
@@ -231,12 +248,12 @@ fn random_bytes() -> io::Result<[u8; 16]> {
 
 /// 内容不同的脚本重写一遍。
 ///
-/// 先写入同目录的临时文件再改名，同时启动的 shell 不会读到未写完的脚本。换行符统一为 LF：源码在
-/// Windows 上可能以 CRLF 检出，而这些脚本由 Linux 上的 shell 读取。
+/// 先写入同目录的临时文件再改名，同时启动的 shell 不会读到未写完的脚本。换行符统一为 LF（见
+/// [`winc_pty::scripts::unix_lines`]），与写到远端主机上的相同。
 fn write_scripts(dir: &Path, scripts: &[(&str, &str)]) -> io::Result<()> {
     for (relative, content) in scripts {
         let path = dir.join(relative);
-        let content = content.replace("\r\n", "\n");
+        let content = winc_pty::scripts::unix_lines(content);
         if fs::read(&path).is_ok_and(|old| old == content.as_bytes()) {
             continue;
         }
@@ -244,7 +261,7 @@ fn write_scripts(dir: &Path, scripts: &[(&str, &str)]) -> io::Result<()> {
             fs::create_dir_all(parent)?;
         }
         let temp = path.with_extension(format!("tmp{}", std::process::id()));
-        fs::write(&temp, content)?;
+        fs::write(&temp, content.as_bytes())?;
         fs::rename(&temp, &path)?;
     }
     Ok(())

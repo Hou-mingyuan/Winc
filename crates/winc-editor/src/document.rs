@@ -5,13 +5,12 @@
 //! 换行风格、BOM）和检查外部修改。
 
 use std::borrow::Cow;
-use std::fs;
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use winc_backend::fs::Stamp;
 
 use ropey::Rope;
 use winc_core::edit::{EditKind, Transaction};
@@ -41,6 +40,8 @@ pub(crate) mod disk;
 pub mod editorconfig;
 pub mod encoding;
 mod indentation;
+mod parked;
+pub(crate) use parked::Parked;
 pub(crate) mod large;
 mod preview;
 #[cfg(test)]
@@ -115,8 +116,9 @@ pub struct TableView {
     pub revision: u64,
     /// 显示的是第几张工作表（从 0 起）。
     pub sheet: usize,
-    /// 横向、纵向的滚动位置（逻辑像素）。
-    pub scroll: (f32, f32),
+    /// 横向、纵向的滚动位置（逻辑像素）。纵向用 `f64`：行数很多时总高度超出 `f32` 能精确
+    /// 表示的范围。
+    pub scroll: (f32, f64),
     /// 选中的单元格：起点（按下处，或按住 `⇧` 之前所在的单元格）和当前格，均为（行号，列号）。
     ///
     /// 选区是以两者为对角的区域，打开时选中 A1。
@@ -150,6 +152,17 @@ impl TableView {
     }
 }
 
+/// 阅读标签的内容：由界面在后台取回，取回之前和未能取回时编辑区显示相应的说明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reading {
+    /// 正在取回。
+    Loading,
+    /// 已取回的 Markdown 原文，排版后显示。
+    Ready(Arc<str>),
+    /// 未能取回。
+    Failed,
+}
+
 /// 可预览文件的种类，见 `Document::preview_kind`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewKind {
@@ -159,6 +172,18 @@ pub enum PreviewKind {
     Markdown,
     /// csv、tsv：预览为表格（`Document::table`）。
     Table,
+}
+
+impl PreviewKind {
+    /// 返回语言 `language` 的文本可以预览成哪一种；不能预览的语言返回 `None`。
+    pub fn of(language: &winc_syntax::Language) -> Option<PreviewKind> {
+        match language.id {
+            "svg" => Some(PreviewKind::Svg),
+            "markdown" => Some(PreviewKind::Markdown),
+            "csv" | "tsv" => Some(PreviewKind::Table),
+            _ => None,
+        }
+    }
 }
 
 /// 可预览文件（SVG、Markdown）的显示方式。
@@ -183,6 +208,8 @@ pub enum Unsupported {
     Workbook,
     /// docx 文字文档：编辑区显示转换成 Markdown 后排版的阅读视图，由界面读取和转换。
     Docx,
+    /// EPUB 电子书：与 [`Unsupported::Docx`] 相同，显示转换成 Markdown 后排版的阅读视图。
+    Epub,
     /// PDF（只在能预览 PDF 的平台上，见 `winc_preview::pdf::supported`）：
     /// 编辑区逐页显示，由界面读取和渲染。
     Pdf,
@@ -192,6 +219,13 @@ pub enum Unsupported {
     TooLarge(u64),
     /// 无法读取，例如没有权限或文件不存在；内容是显示给用户的原因。
     Unreadable(String),
+}
+
+impl Unsupported {
+    /// 是否显示转换成 Markdown 后排版的阅读视图（docx、EPUB）。
+    pub fn reads_as_markdown(&self) -> bool {
+        matches!(self, Unsupported::Docx | Unsupported::Epub)
+    }
 }
 
 impl From<OpenError> for Unsupported {
@@ -214,6 +248,7 @@ impl std::fmt::Display for Unsupported {
             Unsupported::Image => f.write_str(t!("editor-unsupported-image")),
             Unsupported::Workbook => f.write_str(t!("editor-unsupported-workbook")),
             Unsupported::Docx => f.write_str(t!("editor-unsupported-docx")),
+            Unsupported::Epub => f.write_str(t!("editor-unsupported-epub")),
             Unsupported::Pdf => f.write_str(t!("editor-unsupported-pdf")),
             Unsupported::Binary(size) => {
                 f.write_str(&t!("editor-unsupported-binary", size = size_text(*size)))
@@ -435,6 +470,10 @@ pub struct Document {
     pub tab_width_override: Option<usize>,
     /// 是否只读：预览图、二进制文件、含无法解码字节的文件都是只读。
     pub readonly: bool,
+    /// 用户是否把文档设为只读：不接受编辑，已有的修改仍可保存。
+    locked: bool,
+    /// 所在的窗口是否把全部文档设为只读（见 [`Editor::set_all_locked`](crate::Editor)）。
+    all_locked: bool,
     /// 无法显示的文件：标签中只显示原因。
     ///
     /// 此时文本为空，文档只读。
@@ -461,6 +500,8 @@ pub struct Document {
     rendered: bool,
     /// 不对应文件的只读标签（格式化工具的输出、安装说明）的标题。
     pub title: Option<String>,
+    /// 阅读标签的内容：编辑区显示排版后的 Markdown，没有可切换的源代码，文本为空。
+    pub reading: Option<Reading>,
     /// 文本每变化一次加 1，搜索结果等缓存据此判断是否失效。
     pub revision: u64,
     /// 滚动位置的首行（行，从 0 起，可以是小数，用于平滑滚动）。
@@ -479,6 +520,8 @@ pub struct Document {
     pub(crate) bookmarks: Bookmarks,
     /// 模态编辑层的标记与修改列表；文本变化时随之移动。
     pub(crate) marks: Marks,
+    /// 其他窗格里这个文档的视图状态；文本变化时随之移动。
+    pub(crate) parked: Parked,
     /// CSV、TSV 按列对齐时每一列的起始位置，按（版本、Tab 宽度）缓存。
     columns: Option<ColumnsCache>,
     /// 上一次测量列宽时的文字和各列宽度；文字变化时只重新测量改动的行。
@@ -501,7 +544,7 @@ pub struct Document {
     /// 文档的文本：`rope`，或按需读取磁盘的大文件。
     pub(crate) text: Content,
     /// 最近一次读写时磁盘文件的修改时间。
-    disk_mtime: Option<SystemTime>,
+    disk_mtime: Option<Stamp>,
     /// 最近一次读写时磁盘文件的大小（字节，含 BOM），用于判断文件是否只在末尾追加了内容。
     disk_len: u64,
     /// 磁盘文件已被其他程序修改，而文档也有未保存的修改：任何一边的内容都不能被静默覆盖。
@@ -523,7 +566,7 @@ struct Loaded {
     /// 检测到的换行风格。
     line_ending: LineEnding,
     /// 读取时文件的修改时间。
-    mtime: Option<SystemTime>,
+    mtime: Option<Stamp>,
     /// 读取时文件的大小（字节）。
     len: u64,
 }
@@ -555,6 +598,8 @@ impl Document {
             indent_override: None,
             tab_width_override: None,
             readonly: false,
+            locked: false,
+            all_locked: false,
             unsupported: None,
             picture: None,
             table: None,
@@ -564,6 +609,7 @@ impl Document {
             split: false,
             rendered: false,
             title: None,
+            reading: None,
             revision: 0,
             scroll_line: 0.0,
             scroll_x: 0.0,
@@ -573,6 +619,7 @@ impl Document {
             folds: Folds::default(),
             bookmarks: Bookmarks::default(),
             marks: Marks::default(),
+            parked: Parked::default(),
             columns: None,
             column_widths: None,
             fold_cache: None,
@@ -624,6 +671,15 @@ impl Document {
         let mut document = Document::from_text(id, text);
         document.title = Some(title.to_owned());
         document.readonly = true;
+        document
+    }
+
+    /// 创建只读、不对应文件的阅读标签，标签上显示 `title`，内容为 `reading`。
+    pub fn reading(id: DocumentId, title: &str, reading: Reading) -> Self {
+        let mut document = Document::from_text(id, "");
+        document.title = Some(title.to_owned());
+        document.readonly = true;
+        document.reading = Some(reading);
         document
     }
 
@@ -813,7 +869,7 @@ impl Document {
     ///
     /// `mtime` 是文件存在时的修改时间（记录在备份中）。有值时文件按已删除处理
     /// （[`Document::deleted_on_disk`]），自动保存不重建该文件，用户手动保存时才重新创建。
-    pub fn missing(id: DocumentId, path: PathBuf, mtime: Option<SystemTime>) -> Self {
+    pub fn missing(id: DocumentId, path: PathBuf, mtime: Option<Stamp>) -> Self {
         let mut document = Document::empty(id);
         document.set_path(path);
         document.disk_mtime = mtime;
@@ -855,8 +911,50 @@ impl Document {
         self.text.is_large()
     }
 
-    /// 返回文档只读的原因（显示给用户）；可以编辑时返回 `None`。
+    /// 用户是否把文档设为只读。
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    /// 用户能否切换文档的只读状态：因自身的状态而只读的文档不能。
+    pub fn can_lock(&self) -> bool {
+        !self.readonly
+    }
+
+    /// 由用户把文档设为只读或恢复为可以编辑。
+    pub fn set_locked(&mut self, locked: bool) {
+        self.locked = locked;
+    }
+
+    /// 所在的窗口是否把全部文档设为只读。
+    pub(crate) fn all_locked(&self) -> bool {
+        self.all_locked
+    }
+
+    /// 随窗口把文档设为只读或恢复；与文档自己的只读（[`set_locked`](Self::set_locked)）各自独立。
+    pub(crate) fn set_all_locked(&mut self, locked: bool) {
+        self.all_locked = locked;
+    }
+
+    /// 返回文档不能编辑的原因（显示给用户）；可以编辑时返回 `None`。
     pub fn readonly_reason(&self) -> Option<&'static str> {
+        let locked = || self.locked.then(|| t!("editor-readonly-locked"));
+        let all = || self.all_locked.then(|| t!("editor-readonly-all"));
+        self.unwritable_reason().or_else(locked).or_else(all)
+    }
+
+    /// 应用不由用户发起的事务（磁盘上的新内容、备份中的内容），不受用户设置的只读限制。
+    pub(crate) fn apply_unlocked(&mut self, transaction: Transaction) {
+        let held = (self.locked, self.all_locked);
+        (self.locked, self.all_locked) = (false, false);
+        self.apply(transaction);
+        (self.locked, self.all_locked) = held;
+    }
+
+    /// 返回文档因自身的状态而只读的原因（显示给用户），此时也不能保存。
+    ///
+    /// 不包括用户设置的只读。
+    pub fn unwritable_reason(&self) -> Option<&'static str> {
         match &self.text {
             _ if !self.readonly => None,
             _ if self.pending => Some(t!("editor-readonly-pending")),
@@ -923,6 +1021,20 @@ impl Document {
                 line,
                 HIGHLIGHT_LOOKBACK,
             )),
+        }
+    }
+
+    /// 返回第 `line` 行（从 0 起）开头的近似高亮状态：从上方 `HIGHLIGHT_LOOKBACK` 行处推算。
+    ///
+    /// 供 [`Self::highlight_state`] 尚未推算到时绘制使用，远距离跳转后不先按普通文本着色；跨度
+    /// 超过回看行数的块注释和多行字符串仍可能着色错误，直到精确的状态推算完成。
+    pub fn approx_highlight_state(&mut self, line: usize) -> LineState {
+        match &self.text {
+            Content::Rope(rope) => self.highlighter.state_near(rope, line, HIGHLIGHT_LOOKBACK),
+            Content::Large(large) => {
+                self.highlighter
+                    .state_near(&**large, line, HIGHLIGHT_LOOKBACK)
+            }
         }
     }
 
@@ -1009,8 +1121,14 @@ impl Document {
     /// 改用状态栏中选择的语言 `language`：重建高亮状态，并使按内容缓存的结果失效，见
     /// [`Document::set_language`]。
     ///
-    /// 文件之后重命名或另存为时，按新的文件名重新识别。
+    /// 文件重命名或另存为之后按新文件名重新识别。
+    /// 预览或分栏中的文档换成预览方式不同的语言时先回到源代码。
     pub fn choose_language(&mut self, language: &'static winc_syntax::Language) {
+        if self.preview_mode() != PreviewMode::Source
+            && PreviewKind::of(language) != self.preview_kind()
+        {
+            self.set_preview_mode(PreviewMode::Source);
+        }
         self.highlighter = Highlighter::new(language);
         // 列对齐、折叠、粘滞滚动的结果取决于语言，而缓存的键只有（版本、Tab 宽度）。重命名改变
         // 扩展名（`a.txt` → `a.csv`）时文本不变，因此递增 `revision` 使缓存失效。
@@ -1035,7 +1153,7 @@ impl Document {
     }
 
     /// 最近一次读写时磁盘文件的修改时间。
-    pub fn disk_mtime(&self) -> Option<SystemTime> {
+    pub fn disk_mtime(&self) -> Option<Stamp> {
         self.disk_mtime
     }
 
@@ -1048,7 +1166,7 @@ impl Document {
     pub fn restore_unsaved(
         &mut self,
         text: &str,
-        mtime: Option<SystemTime>,
+        mtime: Option<Stamp>,
         selection: Selection,
         conflict: bool,
     ) -> Option<bool> {
@@ -1063,7 +1181,7 @@ impl Document {
         if old != text {
             let changes = diff::line_changes(&old, text);
             let before = self.selection;
-            self.apply(Transaction::new(changes, before, before, EditKind::Other));
+            self.apply_unlocked(Transaction::new(changes, before, before, EditKind::Other));
         }
         self.selection = selection.clamped(self.text.end_pos());
 
@@ -1078,7 +1196,7 @@ impl Document {
     ///
     /// 只读文档忽略。
     pub fn apply(&mut self, transaction: Transaction) {
-        if self.readonly {
+        if self.readonly || self.locked || self.all_locked {
             return;
         }
 
@@ -1088,6 +1206,7 @@ impl Document {
             bookmarks: &mut self.bookmarks,
             whole: &mut self.whole,
             marks: &mut self.marks,
+            parked: &mut self.parked,
         });
         self.selection = transaction.after.clamped(self.text.end_pos());
         let extra = transaction.extra_after.clone();

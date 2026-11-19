@@ -16,7 +16,7 @@ common-key-enter = { $platform ->
    *[other] Enter
 }
 common-close = Close
-common-close-dialog-first = A dialog is already open in this window; close it first
+common-close-dialog-first = Close the open dialog first
 
 ## Move to Trash
 
@@ -37,9 +37,16 @@ common-trash-moved-items = { $count ->
         [one] Moved { $count } item to the { common-trash }
        *[other] Moved { $count } items to the { common-trash }
     }
+common-delete-confirm-folder = Permanently delete the folder “{ $name }” and its contents?
+common-delete-confirm-item = Permanently delete “{ $name }”?
+common-delete-confirm-items = Permanently delete these { $count } items?
+common-delete-confirm-detail = This skips the { common-trash } and can’t be undone.
+common-delete-button = Delete Permanently
+common-deleted-item = Deleted: { $name }
+common-deleted-items = Deleted { $count } items
 common-trash-delete-failed = Couldn’t delete “{ $name }”: { $error }
 common-trash-invalid-path = Invalid path
-common-trash-no-file-manager = NSFileManager is unavailable
+common-trash-no-file-manager = The system file service is unavailable
 common-trash-failed = Couldn’t move to the { common-trash }
 common-trash-failed-code = Couldn’t move to the { common-trash } (error { $code })
 common-trash-cancelled = Cancelled; nothing was moved to the { common-trash }
@@ -77,3 +84,12 @@ app-move-trash-failed = Couldn’t move “{ $path }” to the Trash
 app-move-copy-failed = Copying failed ({ $status })
 app-move-relaunch-failed = Couldn’t relaunch Winc: { $error }
 app-move-unknown-location = Couldn’t determine where Winc is
+close-confirm-quit = Quit?
+close-confirm-window = Close this window?
+net-proxy = Couldn’t connect to the proxy server
+net-proxy-auth = The proxy server requires authentication
+net-certificate = Couldn’t verify the server’s certificate
+net-timeout = The connection timed out
+net-network = Couldn’t reach the server
+net-server = The server returned an error
+net-invalid = The response wasn’t valid

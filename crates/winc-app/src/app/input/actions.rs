@@ -3,6 +3,7 @@
 //! 快捷键和命令面板都经由 [`App::run_action`] 执行，每个命令只有一处实现。
 
 use winc_core::transform::Case;
+use winc_editor::panes::Axis;
 use winc_editor::{Command, EntryKind, FoldCommand};
 
 use super::*;
@@ -77,12 +78,13 @@ impl App {
         match action {
             ShowCommands => self.toggle_palette(),
             QuickOpen => {
-                if self.picker.open
+                if self.overlays.picker.open
                     && !self.picker_lists_commands()
                     && !self.picker_lists_symbols()
-                    && !self.picker.folders
-                    && self.picker.vim_list.is_none()
-                    && self.picker.vim_list.is_none()
+                    && !self.overlays.picker.folders
+                    && !self.overlays.picker.languages
+                    && self.overlays.picker.vim_list.is_none()
+                    && self.overlays.picker.remote.is_none()
                 {
                     self.close_picker();
                 } else {
@@ -90,7 +92,9 @@ impl App {
                 }
             }
             // 和 `⌘P` 一样，已经在列符号时再按一次关掉。
-            GoToSymbol if self.picker.open && self.picker_lists_symbols() => self.close_picker(),
+            GoToSymbol if self.overlays.picker.open && self.picker_lists_symbols() => {
+                self.close_picker()
+            }
             GoToSymbol => self.open_symbols(),
             GoToLine => self.open_goto(),
             GoToDefinition => self.go_to_definition(),
@@ -102,6 +106,7 @@ impl App {
             GoBack => self.navigate(false),
             GoForward => self.navigate(true),
             Settings => self.open_settings(),
+            ReleaseNotes => self.open_release_notes(crate::release_notes::Scope::All),
             KeyboardShortcuts => {
                 self.open_settings();
                 self.settings_show_page(SettingsPage::Keys);
@@ -113,6 +118,9 @@ impl App {
             NewWindow => self.new_window(None),
             OpenFile => self.pick(Pick::Open),
             OpenFolder => self.pick(Pick::OpenFolder),
+            AddFolder => self.ask_add_folder(),
+            RemoteConnect => self.open_remote_picker(),
+            RemoteDisconnect => self.remote_disconnect(),
             OpenRecent => self.open_recent_folders(),
             Save => self.save_active(),
             SaveAs => {
@@ -136,6 +144,16 @@ impl App {
                 self.close_tabs(all);
             }
             ReopenClosed => self.reopen_closed(),
+            SplitRight => self.split_editor(Axis::Row),
+            SplitDown => self.split_editor(Axis::Column),
+            MoveToSplitRight => self.move_to_split(Axis::Row),
+            MoveToSplitDown => self.move_to_split(Axis::Column),
+            Unsplit => self.unsplit_editor(),
+            NextPane => self.cycle_pane(true),
+            PreviousPane => self.cycle_pane(false),
+            SplitTerminal => self.split_terminal(),
+            NextTerminalPane => self.cycle_terminal_pane(true),
+            PreviousTerminalPane => self.cycle_terminal_pane(false),
             NextTab => self.cycle_tab(true),
             PreviousTab => self.cycle_tab(false),
             CloseFolder => self.close_folder(),
@@ -160,7 +178,7 @@ impl App {
                     None => self.flash(winc_i18n::t!("cmd-no-file-for-tab")),
                 }
             }
-            Quit => self.request_quit(),
+            Quit => self.ask_quit(),
 
             Undo | Redo | Cut | Copy | Paste if vim_keys.is_some() => {
                 self.vim_feed(vim_keys.unwrap_or_default());
@@ -195,11 +213,25 @@ impl App {
                 }
             }
             SelectAll => editing(self, Command::SelectAll),
+            // 语言没有任何注释写法（纯文本、日志、CSV）：说明一声，不是没反应。
+            ToggleComment
+                if (self.editor.active()).is_some_and(|doc| {
+                    let language = doc.highlighter.language();
+                    language.line_comments.is_empty() && language.block_comments.is_empty()
+                }) =>
+            {
+                let name = self.editor.active().map(|d| d.highlighter.language().name);
+                self.flash(winc_i18n::t!(
+                    "editor-no-comment",
+                    language = name.unwrap_or_default()
+                ));
+            }
             ToggleComment => editing(self, Command::ToggleComment),
             MarkdownBold => self.live_format("**"),
             MarkdownItalic => self.live_format("*"),
             MarkdownCode => self.live_format("`"),
             MarkdownStrikethrough => self.live_format("~~"),
+            MarkdownHighlight => self.live_format("=="),
             DeleteLine => editing(self, Command::DeleteLine),
             DeleteAllLeft => editing(self, Command::DeleteToLineStart),
             IndentLines => editing(self, Command::IndentLines),
@@ -280,7 +312,7 @@ impl App {
             // 日志标签里 `⌘F` 是筛选输入框。
             Find if self.log_active() => {
                 self.focus = Focus::LogFilter;
-                self.log.filter.select_all();
+                self.git.log.filter.select_all();
                 self.request_redraw();
             }
             Find => self.open_search(false),
@@ -294,8 +326,8 @@ impl App {
                 self.word_highlights.clear();
                 self.request_redraw();
             }
-            ReplaceOne if self.find.open => self.replace_current(),
-            ReplaceAll if self.find.open => self.replace_all(),
+            ReplaceOne if self.bars.find.open => self.replace_current(),
+            ReplaceAll if self.bars.find.open => self.replace_all(),
             ReplaceOne | ReplaceAll => return false,
             ToggleCase | ToggleWord | ToggleRegex if panel => {
                 self.press_panel_button(match action {
@@ -304,16 +336,15 @@ impl App {
                     _ => PanelButton::Regex,
                 })
             }
-            ToggleCase | ToggleWord | ToggleRegex if self.find.open => {
-                self.press_search_button(match action {
+            ToggleCase | ToggleWord | ToggleRegex if self.bars.find.open => self
+                .press_search_button(match action {
                     ToggleCase => SearchButton::Case,
                     ToggleWord => SearchButton::Word,
                     _ => SearchButton::Regex,
-                })
-            }
+                }),
             ToggleCase | ToggleWord | ToggleRegex => return false,
             FilterLines => {
-                if !self.find.open {
+                if !self.bars.find.open {
                     self.open_search(false);
                 }
                 self.press_search_button(SearchButton::Filter);
@@ -324,18 +355,19 @@ impl App {
             NextResult => self.next_result(false),
             PreviousResult => self.next_result(true),
 
-            RenameFile | DeleteFile | FindInFolder => {
+            RenameFile | DeleteFile | DeleteFilePermanently | FindInFolder => {
                 let Some(path) = self.shortcut_target() else {
                     return false;
                 };
                 match action {
                     RenameFile => self.start_rename(&path),
+                    FindInFolder => self.find_in_folder(&path),
                     // 文件树里删除选中的各项。
-                    DeleteFile if self.focus == Focus::Tree => {
-                        self.ask_delete_all(self.tree_targets());
+                    _ if self.focus == Focus::Tree => {
+                        let paths = self.tree_targets();
+                        self.ask_delete_all(paths, action == DeleteFilePermanently);
                     }
-                    DeleteFile => self.ask_delete(&path),
-                    _ => self.find_in_folder(&path),
+                    _ => self.ask_delete_all(vec![path], action == DeleteFilePermanently),
                 }
             }
             OpenSelected => self.open_selected(false),
@@ -356,6 +388,8 @@ impl App {
             ToggleStickyScroll => self.settings_toggle(crate::layout::Setting::StickyScroll),
             ToggleVimMode => self.settings_toggle(crate::layout::Setting::VimMode),
             TogglePreview => self.toggle_preview(),
+            ToggleReadOnly => self.toggle_read_only(),
+            ToggleReadOnlyAll => self.set_read_only_all(!self.editor.all_locked()),
             ToggleWordWrap => self.settings_toggle(crate::layout::Setting::WordWrap),
             ToggleLineNumbers => self.settings_toggle(crate::layout::Setting::LineNumbers),
             ToggleStatusBar => self.settings_toggle(crate::layout::Setting::StatusBar),
@@ -390,16 +424,20 @@ impl App {
                 self.settings_toggle(crate::layout::Setting::DiffInline);
             }
             GitShowChanges => self.git_show_changes(),
+            ChangesShowDiff | ChangesOpenSource | ChangesRollback => {
+                return self.run_changes_action(action);
+            }
             GitShowLog => self.git_show_log(),
+            GitGoToRevision => self.open_go_to_revision(),
             GitShowOutput => self.show_git_output(),
             GitClone => self.open_clone_dialog(),
             GitInit => self.git_init(),
-            GitSwitchRepository => self.switch_location(),
-            GitSwitchWorktree => self.switch_location(),
+            GitSwitchRepository => self.switch_location(true),
+            GitSwitchWorktree => self.switch_location(false),
             GitNewWorktree => self.open_worktree_dialog(),
             // 这几个命令要在仓库里：不在时说明，不弹空的选择器、不跑注定失败的 `git`。
             GitSwitchBranch | GitNewBranch | GitStash | GitSync | GitFetch | GitPull
-            | GitPullRebase | GitPush
+            | GitPullRebase | GitPush | GitStageAll | GitUnstageAll | GitStageFile
                 if self.git.root.is_none() =>
             {
                 self.flash(winc_i18n::t!("git-not-a-repository"));
@@ -408,6 +446,9 @@ impl App {
             GitNewBranch => self.open_branch_dialog(None, None),
             GitStash => self.open_stash_prompt(),
             GitSync => self.git_sync(),
+            GitStageAll => self.stage_all(true),
+            GitUnstageAll => self.stage_all(false),
+            GitStageFile => self.stage_current_file(),
             GitFetch | GitPull | GitPullRebase | GitPush => {
                 use crate::app::input::context_menu::MenuCommand;
                 let command = match action {
@@ -419,6 +460,7 @@ impl App {
                 self.run_branch_command(command);
             }
             GitFileHistory => self.git_current_file_history(),
+            GitSelectionHistory => self.git_selection_history(),
             GitBlame => self.toggle_blame(),
             GitRevertChange if self.editor.active().is_some_and(|d| d.diff.is_some()) => {
                 self.revert_diff_hunk_here();
@@ -427,19 +469,29 @@ impl App {
             ShowCommit => self.show_commit(),
             ShowOutline => self.show_outline(),
             ToggleTerminal => self.toggle_terminal(),
+            ToggleTerminalPanel => self.click_terminal_button(),
+            EnableTerminal => self.settings_toggle(crate::layout::Setting::TerminalModule),
             RunConfiguration => self.run_current_config(),
             StopConfiguration => self.stop_current_config(),
             EditRunConfigurations => self.edit_run_configs(),
             ClearTerminal => self.clear_terminal(),
             NewTerminal => self.new_terminal_tab(),
-            CloseTerminal => self.close_terminal_tab(self.terminal.active),
+            CloseTerminal => self.close_terminal_pane(),
             NextTerminal => self.cycle_terminal_tab(true),
             PreviousTerminal => self.cycle_terminal_tab(false),
+            FocusTerminal1 | FocusTerminal2 | FocusTerminal3 | FocusTerminal4 | FocusTerminal5
+            | FocusTerminal6 | FocusTerminal7 | FocusTerminal8 | FocusTerminal9 => {
+                if let Some(index) = action.terminal_index() {
+                    self.focus_terminal_number(index);
+                }
+            }
             // 焦点在查找框里时关闭；否则打开，或者回到开着的查找框。
             FindInTerminal if self.focus == Focus::TerminalFind => self.close_terminal_find(),
             FindInTerminal if self.terminal.tab().is_some() => self.open_terminal_find(),
             FindInTerminal => return false,
             MaximizeTerminal => self.toggle_terminal_maximized(),
+            ScrollTerminalTop => self.scroll_terminal(isize::MAX),
+            ScrollTerminalBottom => self.scroll_terminal(isize::MIN),
             ToggleTerminalPosition => self.toggle_terminal_position(),
             InstallShellCommand => self.install_shell_command(),
             UninstallShellCommand => self.uninstall_shell_command(),
@@ -470,11 +522,39 @@ impl App {
             | Action::MarkdownItalic
             | Action::MarkdownCode
             | Action::MarkdownStrikethrough
+            | Action::MarkdownHighlight
                 if !self.markdown_live() =>
             {
                 return false;
             }
             Action::EditRunConfigurations if self.editor.root().is_none() => return false,
+            // 窗格的命令只在有东西可拆、可换时可用，否则同一个键执行其他命令或交给终端。
+            Action::SplitRight | Action::SplitDown if self.editor.active.is_none() => {
+                return false;
+            }
+            Action::MoveToSplitRight | Action::MoveToSplitDown
+                if self.editor.active.is_none() || self.editor.tab_count() < 2 =>
+            {
+                return false;
+            }
+            Action::Unsplit | Action::NextPane | Action::PreviousPane
+                if !self.editor.panes.is_split() =>
+            {
+                return false;
+            }
+            Action::NextTerminalPane | Action::PreviousTerminalPane
+                if self.terminal.tab().is_none_or(|t| t.pane_count() < 2) =>
+            {
+                return false;
+            }
+            // 只有打开的目录在远端主机上时才有连接可断开。
+            Action::RemoteDisconnect
+                if !self.editor.root().is_some_and(winc_backend::is_remote) =>
+            {
+                return false;
+            }
+            // 模块已经启用时没有要启用的；启用后内置终端的各条命令列出。
+            Action::EnableTerminal if self.terminal_enabled() => return false,
             // Windows 安装包、deb 包已经把 `winc` 放进 `PATH`，没有要安装的。
             Action::InstallShellCommand | Action::UninstallShellCommand
                 if crate::shell_command::placement().is_none() =>
@@ -486,6 +566,7 @@ impl App {
         match action.module() {
             Some(crate::keymap::Module::Git) => self.git_enabled(),
             Some(crate::keymap::Module::Terminal) => self.terminal_enabled(),
+            Some(crate::keymap::Module::Remote) => self.remote_enabled(),
             None => true,
         }
     }
@@ -519,10 +600,10 @@ impl App {
 
     /// 将焦点移到侧栏（`⌘0`）：侧栏已收起时先展开，焦点落在当前显示的视图上。
     fn focus_sidebar(&mut self) {
-        if !self.sidebar.visible {
+        if !self.panels.sidebar.visible {
             self.set_sidebar(true);
         }
-        self.focus = match self.sidebar.view {
+        self.focus = match self.panels.sidebar.view {
             SidebarView::Files => Focus::Tree,
             SidebarView::Search => Focus::GlobalQuery,
             SidebarView::Commit => self.commit_view_focus(),

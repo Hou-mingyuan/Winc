@@ -135,7 +135,7 @@ fn go_c_and_java() {
     );
 
     let c = "#define MAX 3\nstatic int count(const char *s)\n{\n    return strlen(s);\n}\nint x = foo(3);\n";
-    assert_eq!(names("c", c), ["MAX", "count"]);
+    assert_eq!(names("c", c), ["MAX", "count", "x"]);
 
     let java = "public class App {\n    public static void main(String[] args) {\n        while (true) {\n        }\n    }\n}\n";
     assert_eq!(
@@ -247,4 +247,189 @@ class Store {
         names("kt", "@Serializable data class User(val id: Int)\n"),
         ["User"]
     );
+}
+
+/// 微信小程序：WXS 按 JavaScript 列出函数和变量；WXSS 和样式表一样不列出符号。
+#[test]
+fn wechat_mini_program_files() {
+    let wxs = "var format = function (n) {\n  return n;\n};\nfunction pad(n) {}\nmodule.exports = { format: format };\n";
+    assert_eq!(names("wxs", wxs), ["format", "pad"]);
+    assert!(names("wxss", ".title {\n  font-size: 32rpx;\n}\n").is_empty());
+}
+
+/// 列出 `typedef` 别名、`} name_t;`、全局变量和各种写法的函数；不列出成员、局部变量和前置声明。
+#[test]
+fn c_typedefs_globals_and_functions() {
+    let c = "\
+typedef enum
+{
+    STATE_IDLE = 0,
+    STATE_RUN,
+} app_state_t;
+
+typedef struct {
+    uint8_t  buf[64];
+    struct node *next;
+} uart_ctx_t;
+
+static struct {
+    int count;
+} s_stats;
+
+struct node;
+struct node {
+    struct node *next;
+};
+typedef void (*uart_cb_t)(uint8_t);
+typedef unsigned char u8;
+uint32_t g_tick;
+extern volatile uint32_t g_ticks;
+uint8_t *p_buf;
+static const char *names[] = { \"a\" };
+__attribute__((weak)) void SysTick_Handler(void)
+{
+}
+static void
+uart_send(const uint8_t *data, uint16_t size)
+{
+    uart_ctx_t cfg = {0};
+    return;
+}
+void prototype(void);
+";
+    assert_eq!(
+        outline("c", c),
+        [
+            ("app_state_t".into(), "类型", None),
+            ("uart_ctx_t".into(), "类型", None),
+            ("s_stats".into(), "变量", None),
+            ("node".into(), "类型", None),
+            ("uart_cb_t".into(), "类型", None),
+            ("u8".into(), "类型", None),
+            ("g_tick".into(), "变量", None),
+            ("g_ticks".into(), "变量", None),
+            ("p_buf".into(), "变量", None),
+            ("names".into(), "变量", None),
+            ("SysTick_Handler".into(), "函数", None),
+            ("uart_send".into(), "函数", None),
+        ]
+    );
+}
+
+#[test]
+fn cpp_header_members_with_wrapped_signatures_and_inline_bodies() {
+    let text = r"namespace example {
+class Conversion {
+public:
+    void set_destination(int id) { destination = id; }
+    void add(const std::vector<Location>& rows,
+             const std::vector<unsigned>& limits) {
+        record(rows, limits);
+    }
+    const std::pair<int, int>& destination_at(
+            unsigned row)
+            const {
+        return lookup(row);
+    }
+    int count() const
+    {
+        return destination;
+    }
+    void declaration(const std::vector<Location>& rows,
+                     unsigned limit);
+};
+}
+";
+    for extension in ["h", "hpp"] {
+        assert_eq!(
+            outline(extension, text),
+            [
+                ("example".into(), "模块", None),
+                ("Conversion".into(), "类型", None),
+                ("set_destination".into(), "方法", Some("Conversion".into())),
+                ("add".into(), "方法", Some("Conversion".into())),
+                ("destination_at".into(), "方法", Some("Conversion".into())),
+                ("count".into(), "方法", Some("Conversion".into())),
+            ]
+        );
+    }
+    let found = symbols(&Rope::from_str(text), winc_syntax::detect("x.h"));
+    assert_eq!((found[3].line, found[3].col, found[3].depth), (4, 9, 1));
+}
+
+#[test]
+fn cpp_members_with_constructors_comments_defaults_and_trailing_parts() {
+    let text = r#"class Store {
+public:
+    explicit Store(int size,
+                   int limit) : size_(size), limit_{limit} {
+        Guard guard(size,
+                    limit);
+        if (size &&
+            limit) {
+        }
+    }
+    Store(const Store& other,
+          int limit) {
+        copy(other);
+    }
+    Store(Store&&) = delete;
+    Store(int size);
+    ~Store() { release(); }
+    void commented(int first,  // the first; isn't checked
+                   int second /* (unbalanced */) {
+    }
+    void defaulted(const std::string& name = "x;{",
+                   int limit = compute(1)) {
+    }
+    [[nodiscard]] int attributed(int first,
+                                 int second) const {
+    }
+    auto trailing(int first,
+                  int second) -> std::vector<int> {
+    }
+    void guarded(int first,
+                 int second) noexcept(true) override {
+    }
+    void optional(std::vector<int> values = {});
+    int field(1), other(2);
+};
+namespace tools {
+    void indented(int first,
+                  int second) {
+    }
+    helper(int first,
+           int second) {
+    }
+}
+"#;
+    for extension in ["h", "hpp"] {
+        assert_eq!(
+            names(extension, text),
+            [
+                "Store",
+                "Store",
+                "Store",
+                "~Store",
+                "commented",
+                "defaulted",
+                "attributed",
+                "trailing",
+                "guarded",
+                "tools",
+                "indented",
+            ]
+        );
+    }
+    let found = symbols(&Rope::from_str(text), winc_syntax::detect("x.hpp"));
+    assert!(found[1..9].iter().all(|s| s.kind == SymbolKind::Method));
+    assert_eq!((found[1].line, found[1].col), (2, 13));
+    assert_eq!((found[3].line, found[3].col), (16, 4));
+
+    // 超过行数上限的签名不列出。
+    let long = format!(
+        "class A {{\n    void f(int a,{}\n           int b) {{\n    }}\n}};\n",
+        "\n".repeat(20)
+    );
+    assert_eq!(names("hpp", &long), ["A"]);
 }

@@ -1,4 +1,4 @@
-//! 设置卡片的几何：分类、各项设置的行和控件、快捷键一页、步进器、主题缩略图。
+//! 设置卡片的几何：分类、各项设置的行和控件、快捷键一页。
 
 use super::*;
 
@@ -7,8 +7,12 @@ use std::borrow::Cow;
 use winc_i18n::t;
 
 mod about;
+mod controls;
+mod keys;
 
 pub use about::*;
+pub use controls::*;
+pub use keys::*;
 
 /// 设置的一个分类，对应左侧分类栏中的一项和右侧的一页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,20 +86,19 @@ impl SettingsPage {
         let plain = |items: Vec<Setting>| Section { title: None, items };
         match self {
             SettingsPage::Appearance => {
-                let mut sections = vec![
-                    plain(vec![
-                        Setting::Theme,
-                        Setting::Language,
-                        Setting::Zoom,
-                        Setting::UiFont,
-                        Setting::UiSize,
-                        Setting::FontWeight,
-                    ]),
-                    plain(vec![
-                        Setting::StatusBar,
-                        Setting::RestoreWindow,
-                        Setting::Animations,
-                    ]),
+                // 系统标题栏只在其他平台列出：macOS 上标题栏总是和内容融为一体。
+                let mut window = vec![
+                    Setting::StatusBar,
+                    Setting::Animations,
+                    Setting::RestoreWindow,
+                ];
+                if !cfg!(target_os = "macos") {
+                    window.push(Setting::SystemTitleBar);
+                }
+                vec![
+                    plain(vec![Setting::Theme, Setting::Language, Setting::Zoom]),
+                    plain(vec![Setting::UiFont, Setting::UiSize, Setting::FontWeight]),
+                    plain(window),
                     plain(vec![
                         Setting::BackgroundImage,
                         Setting::BackgroundFit,
@@ -109,12 +112,7 @@ impl SettingsPage {
                         title: Some(t!("settings-dark-theme")),
                         items: vec![Setting::DarkTheme],
                     },
-                ];
-                // macOS 上标题栏总是和内容融为一体，没有该项。
-                if !cfg!(target_os = "macos") {
-                    sections.insert(1, plain(vec![Setting::SystemTitleBar]));
-                }
-                sections
+                ]
             }
             SettingsPage::Editor => vec![
                 plain(vec![
@@ -131,42 +129,64 @@ impl SettingsPage {
                     Setting::RenderWhitespace,
                 ]),
                 plain(vec![
+                    Setting::AutoSave,
+                    Setting::HotExit,
+                    Setting::ConfirmClose,
+                    Setting::RestoreFolder,
+                    Setting::DropFolder,
+                    Setting::PreviewOnClick,
+                ]),
+                plain(vec![Setting::Outline, Setting::CompactFolders]),
+                plain(vec![
+                    Setting::RemoteImages,
+                    Setting::TextWidth,
+                    Setting::MarkdownLineNumbers,
+                ]),
+                plain(vec![
                     Setting::VimMode,
                     Setting::VimClipboard,
                     Setting::VimRelativeNumber,
                     Setting::VimYankHighlight,
                 ]),
-                plain(vec![
-                    Setting::AutoSave,
-                    Setting::HotExit,
-                    Setting::RestoreFolder,
-                ]),
-                plain(vec![
-                    Setting::Outline,
-                    Setting::CompactFolders,
-                    Setting::PreviewOnClick,
-                    Setting::RemoteImages,
-                ]),
             ],
             SettingsPage::Terminal => {
-                let mut behavior = vec![
-                    Setting::TerminalCopyOnSelect,
-                    Setting::TerminalConfirmClose,
-                    Setting::TerminalPrompt,
-                    Setting::TerminalShellIntegration,
-                ];
+                let mut behavior =
+                    vec![Setting::TerminalCopyOnSelect, Setting::TerminalConfirmClose];
                 // 其他平台的 Alt 一律视为 Meta，不列出该项。
                 if cfg!(target_os = "macos") {
                     behavior.push(Setting::TerminalOptionAsMeta);
                 }
                 vec![
-                    plain(vec![Setting::TerminalShell, Setting::TerminalPosition]),
-                    plain(vec![Setting::TerminalFont, Setting::TerminalSize]),
+                    plain(vec![
+                        Setting::TerminalShell,
+                        Setting::TerminalPrompt,
+                        Setting::TerminalShellIntegration,
+                        Setting::TerminalApplicationPriority,
+                    ]),
+                    plain(vec![
+                        Setting::TerminalPosition,
+                        Setting::TerminalTabPosition,
+                        Setting::TerminalFont,
+                        Setting::TerminalSize,
+                    ]),
                     plain(behavior),
                 ]
             }
-            SettingsPage::Git => vec![plain(vec![Setting::GitConfirmPush, Setting::DiffInline])],
-            SettingsPage::Modules => vec![plain(vec![Setting::GitModule, Setting::TerminalModule])],
+            SettingsPage::Git => vec![
+                plain(vec![Setting::GitPath, Setting::GitOpenWorktree]),
+                plain(vec![Setting::GitStagingArea, Setting::GitTree]),
+                plain(vec![Setting::DiffInline, Setting::GitInlineBlame]),
+                plain(vec![
+                    Setting::GitConfirmPush,
+                    Setting::GitRememberCredentials,
+                    Setting::GitAutoFetch,
+                ]),
+            ],
+            SettingsPage::Modules => vec![plain(vec![
+                Setting::GitModule,
+                Setting::TerminalModule,
+                Setting::RemoteModule,
+            ])],
             SettingsPage::Format => {
                 let mut sections = vec![
                     plain(vec![
@@ -199,8 +219,13 @@ impl SettingsPage {
             SettingsPage::Keys => Vec::new(),
             SettingsPage::About => vec![
                 plain(vec![Setting::Version]),
-                plain(vec![Setting::Updates, Setting::CheckUpdates]),
                 plain(vec![
+                    Setting::Updates,
+                    Setting::CheckUpdates,
+                    Setting::SystemProxy,
+                ]),
+                plain(vec![
+                    Setting::ReleaseNotes,
                     Setting::Website,
                     Setting::Repository,
                     Setting::Community,
@@ -259,6 +284,8 @@ pub enum Setting {
     AutoSave,
     /// 热退出：退出时不逐个询问是否保存，下次打开时恢复未保存的修改。
     HotExit,
+    /// 关闭窗口或退出前先确认。
+    ConfirmClose,
     /// 启动时打开上次退出时打开的目录和标签。
     RestoreFolder,
     /// 粘滞滚动：滚动时在编辑区顶部钉住当前所在的函数、类和标题。
@@ -303,12 +330,20 @@ pub enum Setting {
     PreviewOnClick,
     /// Markdown 预览联网加载网址的图片。
     RemoteImages,
+    /// Markdown 预览正文的最大宽度（`markdown.textWidth`）。
+    TextWidth,
+    /// Markdown 预览显示行号（`markdown.lineNumbers`）。
+    MarkdownLineNumbers,
     /// 定时检查更新。
     CheckUpdates,
+    /// 联网的命令跟随系统的代理设置（`network.systemProxy`）。
+    SystemProxy,
     /// 「关于」页的版本号，只读。
     Version,
     /// 「关于」页的更新状态和「检查更新」按钮。
     Updates,
+    /// 「关于」页的「更新日志」：在阅读标签中打开，列出各版的更改。
+    ReleaseNotes,
     /// 「关于」页的官网链接。
     Website,
     /// 「关于」页的源代码仓库（GitHub）链接。
@@ -345,6 +380,8 @@ pub enum Setting {
     TerminalShell,
     /// 终端面板的位置：编辑区下方或右侧。
     TerminalPosition,
+    /// 终端标签的位置：顶部或右侧。
+    TerminalTabPosition,
     /// 终端字体。
     TerminalFont,
     /// 终端字号。
@@ -357,14 +394,34 @@ pub enum Setting {
     TerminalPrompt,
     /// 注入 shell 集成，按命令分块。
     TerminalShellIntegration,
+    /// 暂停内容增强的快捷键，保留终端管理和复制、粘贴。
+    TerminalApplicationPriority,
     /// 终端中用作 Meta 键的 ⌥（只在 macOS 上列出）。
     TerminalOptionAsMeta,
     /// Git 模块的开关。
     GitModule,
     /// 发布、推送或同步分支前确认（`git.confirmPush`）。
     GitConfirmPush,
+    /// 允许记住 HTTP(S) 密码（`git.rememberCredentials`）。
+    GitRememberCredentials,
+    /// 光标所在行末尾的追溯提示（`git.inlineBlame`）。
+    GitInlineBlame,
+    /// 定时在后台获取（`git.autoFetch`）。
+    GitAutoFetch,
+    /// 提交视图的更改列表按目录排成树；记在状态文件里，与「⋯」菜单中的是同一个开关。
+    GitTree,
+    /// 提交视图显示暂存区（`git.stagingArea`）；关闭时用勾选决定提交的内容。
+    GitStagingArea,
+    /// 点击工作树时在哪个窗口打开它（`git.openWorktree`）。
+    GitOpenWorktree,
+    /// 把目录拖进已打开目录的窗口时怎样处理（`dropFolder`）。
+    DropFolder,
+    /// `git` 程序的路径（`git.path`）；未设置时在 `PATH` 里查找。
+    GitPath,
     /// 终端模块的开关。
     TerminalModule,
+    /// 远程模块的开关。
+    RemoteModule,
     /// 「快捷键」页顶部的搜索框。
     ///
     /// 该页没有设置项，选中这一项即表示停留在该页。
@@ -427,7 +484,9 @@ impl Setting {
             | Setting::TabWidth
             | Setting::AutoSave
             | Setting::HotExit
+            | Setting::ConfirmClose
             | Setting::RestoreFolder
+            | Setting::DropFolder
             | Setting::CompactFolders
             | Setting::PreviewOnClick
             | Setting::StickyScroll
@@ -441,10 +500,14 @@ impl Setting {
             | Setting::Outline
             | Setting::LineNumbers
             | Setting::RenderWhitespace
-            | Setting::RemoteImages => SettingsPage::Editor,
+            | Setting::RemoteImages
+            | Setting::TextWidth
+            | Setting::MarkdownLineNumbers => SettingsPage::Editor,
             Setting::Version
             | Setting::Updates
             | Setting::CheckUpdates
+            | Setting::SystemProxy
+            | Setting::ReleaseNotes
             | Setting::Website
             | Setting::Repository
             | Setting::Community
@@ -458,15 +521,27 @@ impl Setting {
             | Setting::AddFixLanguage => SettingsPage::Format,
             Setting::TerminalShell
             | Setting::TerminalPosition
+            | Setting::TerminalTabPosition
             | Setting::TerminalFont
             | Setting::TerminalSize
             | Setting::TerminalCopyOnSelect
             | Setting::TerminalConfirmClose
             | Setting::TerminalPrompt
             | Setting::TerminalShellIntegration
+            | Setting::TerminalApplicationPriority
             | Setting::TerminalOptionAsMeta => SettingsPage::Terminal,
-            Setting::GitConfirmPush | Setting::DiffInline => SettingsPage::Git,
-            Setting::GitModule | Setting::TerminalModule => SettingsPage::Modules,
+            Setting::GitStagingArea
+            | Setting::GitOpenWorktree
+            | Setting::GitPath
+            | Setting::GitConfirmPush
+            | Setting::GitRememberCredentials
+            | Setting::GitInlineBlame
+            | Setting::GitAutoFetch
+            | Setting::GitTree
+            | Setting::DiffInline => SettingsPage::Git,
+            Setting::GitModule | Setting::TerminalModule | Setting::RemoteModule => {
+                SettingsPage::Modules
+            }
             Setting::KeySearch => SettingsPage::Keys,
         }
     }
@@ -488,7 +563,9 @@ impl Setting {
             Setting::TabWidth => t!("settings-tab-width"),
             Setting::AutoSave => t!("settings-auto-save"),
             Setting::HotExit => t!("settings-hot-exit"),
+            Setting::ConfirmClose => t!("settings-confirm-close"),
             Setting::RestoreFolder => t!("settings-restore-folder"),
+            Setting::DropFolder => t!("settings-drop-folder"),
             Setting::StickyScroll => t!("settings-sticky-scroll"),
             Setting::VimMode => t!("settings-vim-mode"),
             Setting::VimClipboard => t!("settings-vim-clipboard"),
@@ -510,6 +587,8 @@ impl Setting {
             Setting::CompactFolders => t!("settings-compact-folders"),
             Setting::PreviewOnClick => t!("settings-preview-on-click"),
             Setting::RemoteImages => t!("settings-remote-images"),
+            Setting::TextWidth => t!("settings-text-width"),
+            Setting::MarkdownLineNumbers => t!("settings-markdown-line-numbers"),
             Setting::CheckUpdates => t!("settings-check-updates"),
             Setting::Version => t!("settings-version"),
             Setting::Website => t!("settings-website"),
@@ -517,6 +596,7 @@ impl Setting {
             Setting::Community => "Telegram",
             Setting::License => t!("settings-license"),
             Setting::Updates => t!("settings-updates"),
+            Setting::ReleaseNotes => t!("settings-release-notes"),
             Setting::FormatOnSave => t!("settings-format-on-save"),
             Setting::FixOnSave => t!("settings-fix-on-save"),
             Setting::SkipOnSave => t!("settings-skip-on-save"),
@@ -526,16 +606,27 @@ impl Setting {
             Setting::AddLanguage | Setting::AddFixLanguage => t!("settings-add-language"),
             Setting::TerminalShell => t!("settings-terminal-shell"),
             Setting::TerminalPosition => t!("settings-terminal-position"),
+            Setting::TerminalTabPosition => t!("settings-terminal-tab-position"),
             Setting::TerminalFont => t!("settings-terminal-font"),
             Setting::TerminalSize => t!("settings-terminal-size"),
             Setting::TerminalCopyOnSelect => t!("settings-terminal-copy-on-select"),
             Setting::TerminalConfirmClose => t!("settings-terminal-confirm-close"),
             Setting::TerminalPrompt => t!("settings-terminal-prompt"),
             Setting::TerminalShellIntegration => t!("settings-terminal-shell-integration"),
+            Setting::TerminalApplicationPriority => t!("settings-terminal-application-priority"),
             Setting::TerminalOptionAsMeta => t!("settings-terminal-option-as-meta"),
             Setting::GitModule => "Git",
             Setting::GitConfirmPush => t!("settings-git-confirm-push"),
+            Setting::GitRememberCredentials => t!("settings-git-remember-credentials"),
+            Setting::SystemProxy => t!("settings-system-proxy"),
+            Setting::GitInlineBlame => t!("settings-git-inline-blame"),
+            Setting::GitAutoFetch => t!("settings-git-auto-fetch"),
+            Setting::GitTree => t!("settings-git-tree"),
+            Setting::GitStagingArea => t!("settings-git-staging-area"),
+            Setting::GitOpenWorktree => t!("settings-git-open-worktree"),
+            Setting::GitPath => t!("settings-git-path"),
             Setting::TerminalModule => t!("settings-terminal-module"),
+            Setting::RemoteModule => t!("settings-remote-module"),
             Setting::KeySearch => t!("settings-key-search"),
         }
     }
@@ -556,7 +647,9 @@ impl Setting {
             Setting::SystemTitleBar => Some(t!("settings-system-title-bar-desc")),
             Setting::AutoSave => Some(t!("settings-auto-save-desc")),
             Setting::HotExit => Some(t!("settings-hot-exit-desc")),
+            Setting::ConfirmClose => Some(t!("settings-confirm-close-desc")),
             Setting::RestoreFolder => Some(t!("settings-restore-folder-desc")),
+            Setting::DropFolder => Some(t!("settings-drop-folder-desc")),
             Setting::StickyScroll => Some(t!("settings-sticky-scroll-desc")),
             Setting::VimMode => Some(t!("settings-vim-mode-desc")),
             Setting::VimClipboard => Some(t!("settings-vim-clipboard-desc")),
@@ -575,8 +668,11 @@ impl Setting {
             Setting::RestoreWindow => Some(t!("settings-restore-window-desc")),
             Setting::Animations => Some(t!("settings-animations-desc")),
             Setting::BackgroundImage => Some(t!("settings-background-image-desc")),
+            Setting::BackgroundFit => Some(t!("settings-background-fit-desc")),
             Setting::BackgroundOpacity => Some(t!("settings-background-opacity-desc")),
             Setting::RemoteImages => Some(t!("settings-remote-images-desc")),
+            Setting::TextWidth => Some(t!("settings-text-width-desc")),
+            Setting::MarkdownLineNumbers => Some(t!("settings-markdown-line-numbers-desc")),
             Setting::CheckUpdates => Some(t!("settings-check-updates-desc")),
             // 绘制时换成当前的更新状态（`UpdateState`）。
             Setting::Updates => Some(t!("settings-updates-off")),
@@ -584,7 +680,17 @@ impl Setting {
             Setting::FixOnSave => Some(t!("settings-fix-on-save-desc")),
             Setting::SkipOnSave => Some(t!("settings-skip-on-save-desc")),
             Setting::GitModule => Some(t!("settings-git-module-desc")),
+            Setting::RemoteModule => Some(t!("settings-remote-module-desc")),
             Setting::GitConfirmPush => Some(t!("settings-git-confirm-push-desc")),
+            Setting::GitRememberCredentials => Some(t!("settings-git-remember-credentials-desc")),
+            Setting::SystemProxy => Some(t!("settings-system-proxy-desc")),
+            Setting::GitInlineBlame => Some(t!("settings-git-inline-blame-desc")),
+            Setting::GitAutoFetch => Some(t!("settings-git-auto-fetch-desc")),
+            Setting::GitTree => Some(t!("settings-git-tree-desc")),
+            Setting::GitStagingArea => Some(t!("settings-git-staging-area-desc")),
+            Setting::GitOpenWorktree => Some(t!("settings-git-open-worktree-desc")),
+            Setting::GitPath => Some(t!("settings-git-path-desc")),
+            Setting::TerminalShell => Some(t!("settings-terminal-shell-desc")),
             Setting::TerminalCopyOnSelect => Some(t!("settings-terminal-copy-on-select-desc")),
             Setting::TerminalConfirmClose => Some(t!("settings-terminal-confirm-close-desc")),
             Setting::TerminalPrompt => Some(t!("settings-terminal-prompt-desc")),
@@ -592,6 +698,9 @@ impl Setting {
                 Some(t!("settings-terminal-shell-integration-desc"))
             }
             Setting::TerminalOptionAsMeta => Some(t!("settings-terminal-option-as-meta-desc")),
+            Setting::TerminalApplicationPriority => {
+                Some(t!("settings-terminal-application-priority-desc"))
+            }
             _ => None,
         };
         text.map(Cow::Borrowed)
@@ -610,8 +719,8 @@ impl Setting {
             Setting::Theme => SettingControl::Themes,
             Setting::LightTheme | Setting::DarkTheme => SettingControl::ThemeList,
             Setting::SystemTitleBar
-            | Setting::AutoSave
             | Setting::HotExit
+            | Setting::ConfirmClose
             | Setting::RestoreFolder
             | Setting::CompactFolders
             | Setting::PreviewOnClick
@@ -629,34 +738,51 @@ impl Setting {
             | Setting::RestoreWindow
             | Setting::Animations
             | Setting::RemoteImages
+            | Setting::MarkdownLineNumbers
             | Setting::CheckUpdates
             | Setting::FormatOnSave
             | Setting::FixOnSave
             | Setting::GitModule
             | Setting::GitConfirmPush
+            | Setting::GitRememberCredentials
+            | Setting::SystemProxy
+            | Setting::GitInlineBlame
+            | Setting::GitAutoFetch
+            | Setting::GitTree
+            | Setting::GitStagingArea
             | Setting::TerminalModule
+            | Setting::RemoteModule
             | Setting::TerminalCopyOnSelect
             | Setting::TerminalConfirmClose
             | Setting::TerminalPrompt
-            | Setting::TerminalShellIntegration => SettingControl::Switch,
-            Setting::FormatCommand(_) | Setting::FixCommand(_) | Setting::TerminalShell => {
-                SettingControl::Command
-            }
+            | Setting::TerminalShellIntegration
+            | Setting::TerminalApplicationPriority => SettingControl::Switch,
+            Setting::FormatCommand(_)
+            | Setting::FixCommand(_)
+            | Setting::TerminalShell
+            | Setting::GitPath => SettingControl::Command,
             Setting::SkipOnSave
             | Setting::Language
             | Setting::BackgroundImage
             | Setting::BackgroundFit
+            | Setting::TextWidth
             | Setting::Zoom
             | Setting::RenderWhitespace
             | Setting::VimClipboard
             | Setting::TerminalPosition
-            | Setting::TerminalOptionAsMeta => SettingControl::Choice,
+            | Setting::TerminalTabPosition
+            | Setting::TerminalOptionAsMeta
+            | Setting::DropFolder
+            | Setting::AutoSave
+            | Setting::GitOpenWorktree => SettingControl::Choice,
             Setting::AddLanguage | Setting::AddFixLanguage => SettingControl::Action,
             Setting::KeySearch => SettingControl::Search,
             Setting::Version => SettingControl::Product,
-            Setting::Website | Setting::Repository | Setting::Community | Setting::License => {
-                SettingControl::Link
-            }
+            Setting::ReleaseNotes
+            | Setting::Website
+            | Setting::Repository
+            | Setting::Community
+            | Setting::License => SettingControl::Link,
             Setting::Updates => SettingControl::Button,
         }
     }
@@ -703,6 +829,48 @@ pub fn background_fit_label(choice: winc_config::BackgroundFit) -> &'static str 
         Fit => t!("settings-background-fit-fit"),
         Stretch => t!("settings-background-fit-stretch"),
         Tile => t!("settings-background-fit-tile"),
+    }
+}
+
+/// 返回「Markdown 预览正文宽度」中选项 `choice` 的名字。
+pub fn text_width_label(choice: winc_config::TextWidth) -> &'static str {
+    use winc_config::TextWidth::{Full, Standard, Wide};
+    match choice {
+        Standard => t!("settings-text-width-standard"),
+        Wide => t!("settings-text-width-wide"),
+        Full => t!("settings-text-width-full"),
+    }
+}
+
+/// 返回「自动保存」设置中选项 `choice` 的名字。
+pub fn auto_save_label(choice: winc_config::AutoSave) -> &'static str {
+    use winc_config::AutoSave::{AfterDelay, Off, OnFocusChange};
+
+    match choice {
+        Off => t!("settings-auto-save-off"),
+        OnFocusChange => t!("settings-auto-save-focus"),
+        AfterDelay => t!("settings-auto-save-delay"),
+    }
+}
+
+/// 返回「拖入目录」设置中选项 `choice` 的名字。
+pub fn drop_folder_label(choice: winc_config::FolderDrop) -> &'static str {
+    use winc_config::FolderDrop::{Add, Ask, Open};
+
+    match choice {
+        Ask => t!("settings-git-open-worktree-ask"),
+        Add => t!("settings-drop-folder-add"),
+        Open => t!("settings-drop-folder-open"),
+    }
+}
+
+/// 返回打开工作树的方式 `choice` 在设置中显示的名称。
+pub fn open_worktree_label(choice: winc_config::WorktreeOpen) -> &'static str {
+    use winc_config::WorktreeOpen::{Ask, CurrentWindow, NewWindow};
+    match choice {
+        Ask => t!("settings-git-open-worktree-ask"),
+        NewWindow => t!("settings-git-open-worktree-new"),
+        CurrentWindow => t!("settings-git-open-worktree-current"),
     }
 }
 
@@ -801,6 +969,20 @@ pub enum SettingsPart {
     KeySearch,
     /// 搜索框右端的「录制按键」。
     Record,
+    /// 「快捷键」页「键位方案」一行的值：点击后弹出方案和导入的菜单。
+    Keymap,
+    /// 「快捷键」页列表中的一行，参数是该行的命令：点击后修改该命令的快捷键。
+    KeyRow(keymap::Action),
+    /// 悬停在一行上时出现的「编辑」。
+    KeyEdit(keymap::Action),
+    /// 悬停在改过的一行上时出现的「恢复默认」。
+    KeyReset(keymap::Action),
+    /// 修改快捷键时第几个已有的键上的 ×。
+    KeyRemove(usize),
+    /// 修改快捷键时的「保存」。
+    KeySave,
+    /// 修改快捷键时的「取消」。
+    KeyCancel,
     /// 数值的减号。
     Decrease(Setting),
     /// 数值的加号。
@@ -829,6 +1011,28 @@ pub struct SettingsView<'a> {
     pub editing: Option<Setting>,
     /// 正文的滚动量（像素）。
     pub scroll: f32,
+    /// 卡片相对窗口中央的偏移（逻辑像素），见 [`settings_card`]。
+    pub offset: (f32, f32),
+}
+
+/// 返回设置卡片在窗口 `window` 中的位置：从中央移动 `offset`，四周至少留出 `SETTINGS_MARGIN`。
+pub fn settings_card(window: Rect, (dx, dy): (f32, f32)) -> Rect {
+    let w = SETTINGS_W.min(window.w - SETTINGS_MARGIN * 2.0).max(0.0);
+    let h = SETTINGS_H.min(window.h - SETTINGS_MARGIN * 2.0).max(0.0);
+    // 窗口过小时上下限颠倒，以下限为准，不用 `clamp`。
+    let place = |start: f32, span: f32, size: f32, d: f32| {
+        let centered = start + (span - size) / 2.0 + d;
+        centered
+            .min(start + span - SETTINGS_MARGIN - size)
+            .max(start + SETTINGS_MARGIN)
+            .round()
+    };
+    Rect::new(
+        place(window.x, window.w, w, dx),
+        place(window.y, window.h, h, dy),
+        w,
+        h,
+    )
 }
 
 /// 返回搜索 `query` 时正文列出的各组：各页中名称或说明含有 `query` 的设置项
@@ -936,16 +1140,10 @@ impl SettingsLayout {
             git,
             editing,
             scroll,
+            offset,
         } = view;
         let searching = !query.trim().is_empty();
-        let w = SETTINGS_W.min(window.w - SETTINGS_MARGIN * 2.0).max(0.0);
-        let h = SETTINGS_H.min(window.h - SETTINGS_MARGIN * 2.0).max(0.0);
-        let card = Rect::new(
-            (window.x + (window.w - w) / 2.0).round(),
-            (window.y + (window.h - h) / 2.0).round(),
-            w,
-            h,
-        );
+        let card = settings_card(window, offset);
 
         let nav = Rect::new(card.x, card.y, SETTINGS_NAV_W.min(card.w), card.h);
         // 搜索框与右侧标题行垂直居中对齐，各页列在其下。「终端」一项的高度按显示比例收放，
@@ -1083,6 +1281,11 @@ impl SettingsLayout {
         (self.content_h - self.body.h).max(0.0)
     }
 
+    /// 卡片顶部与标题行同高的一条，横跨两栏：其中没有部件的地方可以拖动卡片。
+    pub fn title_strip(&self) -> Rect {
+        Rect::new(self.card.x, self.card.y, self.card.w, self.header.h)
+    }
+
     /// 返回 `(x, y)` 处可点击的部件；落在控件之外时返回 `None`。
     pub fn part_at(&self, x: f32, y: f32) -> Option<SettingsPart> {
         if self.close.contains(x, y) {
@@ -1140,101 +1343,6 @@ impl SettingsLayout {
     }
 }
 
-/// 「快捷键」页的几何：顶部固定的搜索框（右端是「录制按键」），下方按分组列出命令和键位，可以滚动。
-///
-/// 页面布局相同：组上方是小标题，组内每行一个命令，行与行之间有一条细线。
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct KeysLayout {
-    /// 搜索框。
-    pub search: Rect,
-    /// 搜索框右端的「录制按键」按钮。
-    pub record: Rect,
-    /// 搜索框下方可以滚动的区域。
-    pub list: Rect,
-    /// 各组的标题：标题所在行的位置和标题文字。
-    pub headings: Vec<(Rect, &'static str)>,
-    /// 各组的底色区域。
-    pub groups: Vec<Rect>,
-    /// 组内行与行之间的细线。
-    pub separators: Vec<Rect>,
-    /// 各命令行的位置和对应的键位行。
-    pub rows: Vec<(Rect, &'static keymap::Row)>,
-    /// 内容的总高度（像素），用于计算最大滚动量。
-    pub content_h: f32,
-}
-
-impl KeysLayout {
-    /// 计算「快捷键」页的几何。
-    ///
-    /// `body` 是设置标题下方的区域，`groups` 是筛选后的各组，`scroll` 是列表的滚动量（像素）。
-    pub fn compute(
-        body: Rect,
-        groups: Vec<(keymap::Group, Vec<&'static keymap::Row>)>,
-        scroll: f32,
-    ) -> Self {
-        let x = body.x + SETTINGS_PAD;
-        let w = (body.w - SETTINGS_PAD * 2.0).max(0.0);
-        let (search, record) = Self::header(body);
-        let top = search.bottom() + 12.0;
-        let list = Rect::new(body.x, top, body.w, (body.bottom() - top).max(0.0));
-
-        let mut layout = KeysLayout {
-            search,
-            record,
-            list,
-            ..KeysLayout::default()
-        };
-        let mut y = list.y - scroll;
-        for (i, (group, rows)) in groups
-            .into_iter()
-            .filter(|(_, r)| !r.is_empty())
-            .enumerate()
-        {
-            if i > 0 {
-                y += SETTINGS_GROUP_GAP;
-            }
-            let title = Rect::new(x + SETTINGS_INSET, y, w, SETTINGS_TITLE);
-            layout.headings.push((title, group.title()));
-            y += SETTINGS_TITLE;
-            let block = y;
-            for (n, row) in rows.into_iter().enumerate() {
-                if n > 0 {
-                    let inner = (w - SETTINGS_INSET * 2.0).max(0.0);
-                    layout
-                        .separators
-                        .push(Rect::new(x + SETTINGS_INSET, y, inner, 1.0));
-                }
-                layout.rows.push((Rect::new(x, y, w, KEYS_ROW), row));
-                y += KEYS_ROW;
-            }
-            layout.groups.push(Rect::new(x, block, w, y - block));
-        }
-        layout.content_h = y + scroll - list.y + SETTINGS_BOTTOM;
-        layout
-    }
-
-    /// 返回 `body` 中搜索框和其右端「录制按键」按钮的位置。
-    ///
-    /// 两者固定在页面顶部，与列表内容和滚动无关；悬停、点击只需这两个矩形，不必筛选整张键位表。
-    pub fn header(body: Rect) -> (Rect, Rect) {
-        let x = body.x + SETTINGS_PAD;
-        let w = (body.w - SETTINGS_PAD * 2.0).max(0.0);
-        let search = Rect::new(x, body.y + 4.0, w, KEYS_SEARCH_H);
-        let record = Rect::new(
-            search.right() - 4.0 - KEYS_RECORD,
-            search.y + (search.h - KEYS_RECORD) / 2.0,
-            KEYS_RECORD,
-            KEYS_RECORD,
-        );
-        (search, record)
-    }
-
-    /// 返回列表的最大滚动量（像素）。
-    pub fn max_scroll(&self) -> f32 {
-        (self.content_h - self.list.h).max(0.0)
-    }
-}
-
 /// 返回宽 `width` 的组里一行的高度。
 ///
 /// 格式化命令行在名称下方显示所用的命令，因此总是两行高；有说明的行按说明折成的行数加高
@@ -1254,7 +1362,11 @@ fn row_height(
             let tile = theme_tile_size((row.w - SETTINGS_INSET * 2.0).max(0.0));
             rows * tile.1 + (rows - 1.0) * THEME_GRID_GAP + THEME_GRID_PAD * 2.0
         }
-        SettingControl::Command if setting != Setting::TerminalShell => SETTINGS_ROW_TALL,
+        SettingControl::Command
+            if !matches!(setting, Setting::TerminalShell | Setting::GitPath) =>
+        {
+            SETTINGS_ROW_TALL
+        }
         SettingControl::Product => SETTINGS_PRODUCT_H,
         _ => match setting.description() {
             Some(text) => {
@@ -1293,145 +1405,4 @@ pub fn description_lines<'a>(
         lines.push(&text[start..]);
     }
     lines
-}
-
-/// 返回字体输入框 `control` 右端下拉按钮的位置。
-pub(crate) fn font_menu_button(control: Rect) -> Rect {
-    const WIDTH: f32 = 26.0;
-    Rect::new(control.right() - WIDTH, control.y, WIDTH, control.h)
-}
-
-/// 返回模式分段控件的宽度：各段加上段间距和底槽的内边距。
-fn segmented_width() -> f32 {
-    let n = SETTINGS_SEGMENT_W.len() as f32;
-    let w: f32 = SETTINGS_SEGMENT_W.iter().sum();
-    w + (n - 1.0) * SEGMENT_SPACING + 4.0
-}
-
-/// 返回一行中控件的位置：靠右、垂直居中；主题缩略图占满控件区的高度。
-fn control_rect(setting: Setting, row: Rect, editing: bool) -> Rect {
-    let (w, h) = match setting.control() {
-        // 整行都可点击。
-        SettingControl::Action | SettingControl::Search => return row,
-        // 与「外观」页同一组的模式分段控件同宽。
-        SettingControl::Font => (segmented_width(), SETTINGS_CONTROL_H),
-        SettingControl::Choice if setting == Setting::Language => {
-            (segmented_width(), SETTINGS_CONTROL_H)
-        }
-        SettingControl::Command if editing => (SETTINGS_COMMAND_W, SETTINGS_CONTROL_H),
-        SettingControl::Command | SettingControl::Choice | SettingControl::Link => {
-            (SETTINGS_CHOICE_W, SETTINGS_CONTROL_H)
-        }
-        // 产品信息铺满整行。
-        SettingControl::Product => return row,
-        SettingControl::Button => (SETTINGS_BUTTON_W, SETTINGS_CONTROL_H),
-        SettingControl::Switch => (SETTINGS_SWITCH_W, SETTINGS_SWITCH_H),
-        SettingControl::Stepper => (SETTINGS_STEP_W * 2.0 + SETTINGS_VALUE_W, SETTINGS_CONTROL_H),
-        // 没有名称（组标题就是名称），缩略图排满整行。
-        SettingControl::ThemeList => {
-            return row.inset(SETTINGS_INSET, THEME_GRID_PAD);
-        }
-        SettingControl::Themes => (segmented_width(), SETTINGS_CONTROL_H),
-    };
-    // 控件宽度不超过行宽减去左右内边距，并给左侧名称至少留出 80 像素。
-    let w = w.min((row.w - SETTINGS_INSET * 2.0 - 80.0).max(0.0));
-    // 可见内容的右缘对齐组内分隔线的右端：文字、图标类控件的底色向外多出内边距。
-    let pad = match setting.control() {
-        SettingControl::Choice | SettingControl::Link | SettingControl::Stepper => {
-            SETTINGS_GLYPH_PAD
-        }
-        SettingControl::Font | SettingControl::Command if !editing => SETTINGS_GLYPH_PAD,
-        _ => 0.0,
-    };
-    Rect::new(
-        row.right() - SETTINGS_INSET + pad - w,
-        row.y + (row.h - h) / 2.0,
-        w,
-        h,
-    )
-}
-
-/// 加减控件：左右两个按钮，中间是数值。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StepperParts {
-    /// 左侧的减号按钮。
-    pub minus: Rect,
-    /// 中间显示数值的区域。
-    pub value: Rect,
-    /// 右侧的加号按钮。
-    pub plus: Rect,
-}
-
-impl StepperParts {
-    /// 根据控件的矩形 `control` 计算减号、数值和加号的位置。
-    pub fn new(control: Rect) -> StepperParts {
-        let minus = Rect::new(control.x, control.y, SETTINGS_STEP_W, control.h);
-        let plus = Rect::new(
-            control.right() - SETTINGS_STEP_W,
-            control.y,
-            SETTINGS_STEP_W,
-            control.h,
-        );
-        let value = Rect::new(
-            minus.right(),
-            control.y,
-            (plus.x - minus.right()).max(0.0),
-            control.h,
-        );
-        StepperParts { minus, value, plus }
-    }
-}
-
-/// 主题缩略图每排几张。
-///
-/// 浅色、深色两组用同一个格子，上下两组的缩略图对齐。
-pub const THEME_COLUMNS: usize = 4;
-/// 主题缩略图之间横竖的间距（逻辑像素，经验值）：留出能分清两张缩略图的缝，同时保证一行
-/// 装得下 `THEME_COLUMNS` 张。
-const THEME_GRID_GAP: f32 = 14.0;
-/// 主题缩略图和组上下边的距离（逻辑像素）：与行内控件的 `SETTINGS_INSET` 相仿，组的上沿不贴
-/// 住缩略图。
-const THEME_GRID_PAD: f32 = 14.0;
-/// 缩略图下面一行名称的高度（逻辑像素，含与缩略图之间的空）：够放下一行说明文字。
-const THEME_NAME_H: f32 = 24.0;
-
-/// 宽 `width` 的格子里一张主题缩略图（连同下方的名称）的宽和高；缩略图是 16∶10。
-fn theme_tile_size(width: f32) -> (f32, f32) {
-    let columns = THEME_COLUMNS as f32;
-    let w = ((width - (columns - 1.0) * THEME_GRID_GAP) / columns).floor();
-    (w, (w * 0.625).round() + THEME_NAME_H)
-}
-
-/// 返回主题格子 `control` 里第 `index` 张缩略图（从 0 起，连同下方一行名称）占的区域。
-pub fn theme_tile(control: Rect, index: usize) -> Rect {
-    let (w, h) = theme_tile_size(control.w);
-    let col = (index % THEME_COLUMNS) as f32;
-    let row = (index / THEME_COLUMNS) as f32;
-    Rect::new(
-        control.x + col * (w + THEME_GRID_GAP),
-        control.y + row * (h + THEME_GRID_GAP),
-        w,
-        h,
-    )
-}
-
-/// 返回缩略图本身（不含名称）的区域，位于 `tile` 的上部。
-pub fn theme_thumb(tile: Rect) -> Rect {
-    Rect::new(tile.x, tile.y, tile.w, tile.h - THEME_NAME_H)
-}
-
-/// 返回「模式」分段控件 `control` 里第 `index` 段的区域；底槽四周留 2 像素，相邻两段隔
-/// `SEGMENT_SPACING`。
-///
-/// # Panics
-///
-/// `index` 不小于 3（即超出 `SETTINGS_SEGMENT_W` 的长度）时 panic。
-pub fn theme_segment(control: Rect, index: usize) -> Rect {
-    let before: f32 = SETTINGS_SEGMENT_W[..index].iter().sum();
-    Rect::new(
-        control.x + 2.0 + before + index as f32 * SEGMENT_SPACING,
-        control.y + 2.0,
-        SETTINGS_SEGMENT_W[index],
-        control.h - 4.0,
-    )
 }

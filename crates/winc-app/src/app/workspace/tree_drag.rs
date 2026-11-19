@@ -1,4 +1,5 @@
-//! 在文件树中拖动文件或目录，移入其他目录（按着 `⌥` 松开时复制）。
+//! 在文件树中拖动文件或目录，移入其他目录（按着 `⌥` 松开时复制）；拖出窗口时交给系统的拖放，
+//! 放进其他程序时复制。
 //!
 //! 从系统文件管理器等来源拖入窗口的文件和目录见 `file_drop.rs`。
 
@@ -88,12 +89,13 @@ impl TreeDrag {
 impl App {
     /// 返回正在拖动的文件树项；没有按住，或尚未形成拖动时返回 `None`。
     pub(crate) fn tree_dragging(&self) -> Option<&TreeDrag> {
-        self.tree.drag.as_ref().filter(|d| d.active)
+        self.panels.tree.drag.as_ref().filter(|d| d.active)
     }
 
     /// 是否按住了文件树中的一个文件、尚未形成拖动：此时松开就会打开该文件。
     pub(crate) fn tree_open_pending(&self) -> bool {
-        self.tree
+        self.panels
+            .tree
             .drag
             .as_ref()
             .is_some_and(|d| !d.active && d.kind == EntryKind::File)
@@ -101,9 +103,10 @@ impl App {
 
     /// 处理按住文件树项时的鼠标移动，(`x`, `y`) 为鼠标的窗口坐标（逻辑像素）。
     ///
-    /// 移动距离超过 [`DRAG_THRESHOLD`] 后形成拖动，之后随鼠标位置重新计算放置目标。
+    /// 移动距离超过 [`DRAG_THRESHOLD`] 后形成拖动，之后随鼠标位置重新计算放置目标；拖出窗口时
+    /// 交给系统的拖放（见 [`Self::drag_out`]）。
     pub(in crate::app) fn drag_tree_item(&mut self, x: f32, y: f32) {
-        let Some(drag) = &mut self.tree.drag else {
+        let Some(drag) = &mut self.panels.tree.drag else {
             return;
         };
         if !drag.active {
@@ -115,7 +118,10 @@ impl App {
         }
 
         let paths = drag.paths.clone();
-        let target = self.drop_target(&paths, x, y, self.modifiers.alt_key());
+        if !self.layout.window.contains(x, y) && self.drag_out(&paths) {
+            return;
+        }
+        let target = self.drop_target(&paths, x, y, self.pointer.modifiers.alt_key());
         // 只有鼠标所在行是收起的目录、且该目录正是当前放置目标时才计时；停留的目录改变时重新计时。
         let collapsed = self
             .tree_row_at(y)
@@ -124,7 +130,7 @@ impl App {
             .map(|e| e.path.clone())
             .filter(|path| target.as_ref() == Some(path));
 
-        let Some(drag) = &mut self.tree.drag else {
+        let Some(drag) = &mut self.panels.tree.drag else {
             return;
         };
         drag.target = target;
@@ -139,7 +145,7 @@ impl App {
     /// 未形成拖动时按单击处理：只选中这一行，文件打开，目录展开或收起。已形成拖动时把被拖的
     /// 各项放入目标目录。
     pub(in crate::app) fn release_tree_item(&mut self) {
-        let Some(drag) = self.tree.drag.take() else {
+        let Some(drag) = self.panels.tree.drag.take() else {
             return;
         };
 
@@ -160,30 +166,65 @@ impl App {
             return;
         }
 
-        if self.layout.terminal.contains(self.mouse.0, self.mouse.1) {
+        if self
+            .layout
+            .terminal
+            .contains(self.pointer.mouse.0, self.pointer.mouse.1)
+        {
             // 拖进终端：插入路径，不移动文件。
-            if self.terminal_takes_drop(self.mouse.0, self.mouse.1) {
+            if self.terminal_takes_drop(self.pointer.mouse.0, self.pointer.mouse.1) {
                 for path in &drag.paths {
                     self.drop_path_on_terminal(path);
                 }
             }
-        } else if self.modifiers.alt_key() {
+        } else if self.pointer.modifiers.alt_key() {
             // 按着 `⌥` 松开：复制。松开前才按下 `⌥` 时放置目标没有按复制计算过，这里重新计算。
-            let (x, y) = self.mouse;
+            let (x, y) = self.pointer.mouse;
             if let Some(dir) = self.drop_target(&drag.paths, x, y, true) {
                 self.copy_entries_into(drag.paths, dir);
             }
         } else if let Some(dir) = drag.target {
             self.ask_move(drag.paths, dir);
         }
-        self.set_hover(self.hover_at(self.mouse.0, self.mouse.1));
+        self.refresh_pointer_hover();
         self.request_redraw();
+    }
+
+    /// 把拖出窗口的 `paths` 交给系统的拖放，交出后结束窗口内的拖动；返回是否已交出。
+    ///
+    /// 只交出本机的文件，远程的项留在窗口内。系统只提供复制，拖回 Winc 的窗口时不放下。
+    /// Linux 上不交出。
+    fn drag_out(&mut self, paths: &[PathBuf]) -> bool {
+        if paths.iter().any(|path| winc_backend::is_remote(path)) || !self.start_drag_out(paths) {
+            return false;
+        }
+        self.cancel_tree_drag();
+        true
+    }
+
+    /// 测试中代替系统的拖放，记录拖出的各项。
+    #[cfg(test)]
+    fn start_drag_out(&mut self, paths: &[PathBuf]) -> bool {
+        self.panels.tree.dragged_out = paths.to_vec();
+        true
+    }
+
+    /// 把 `paths` 交给系统的拖放，返回系统是否开始拖放。
+    #[cfg(not(test))]
+    fn start_drag_out(&mut self, paths: &[PathBuf]) -> bool {
+        #[cfg(target_os = "macos")]
+        let start = crate::macos::drag_files;
+        #[cfg(windows)]
+        let start = crate::windows::drag_files;
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let start = |_: &winit::window::Window, _: &[PathBuf]| false;
+        self.window.handle.as_ref().is_some_and(|w| start(w, paths))
     }
 
     /// 取消拖动（按下 Esc 或窗口失去焦点），不移动任何文件。
     pub(in crate::app) fn cancel_tree_drag(&mut self) {
-        if self.tree.drag.take().is_some_and(|d| d.active) {
-            self.set_hover(self.hover_at(self.mouse.0, self.mouse.1));
+        if self.panels.tree.drag.take().is_some_and(|d| d.active) {
+            self.refresh_pointer_hover();
             self.request_redraw();
         }
     }
@@ -203,7 +244,7 @@ impl App {
 
         if ws.rows()[index].kind == EntryKind::Dir {
             // 按着 `⌥` 单击：递归展开或收起。
-            if self.modifiers.alt_key() {
+            if self.pointer.modifiers.alt_key() {
                 self.toggle_dir_recursively(index);
             } else {
                 self.set_dir_expanded(index, None);
@@ -241,13 +282,13 @@ impl App {
                 if let Some(index) = index {
                     self.set_dir_expanded(index, Some(true));
                 }
-                if let Some(drag) = &mut self.tree.drag {
+                if let Some(drag) = &mut self.panels.tree.drag {
                     drag.resting = None;
                 }
             }
         }
 
-        let (x, y) = self.mouse;
+        let (x, y) = self.pointer.mouse;
         let tree = self.layout.tree;
         let push = if !tree.contains(x, y) {
             0.0
@@ -259,13 +300,13 @@ impl App {
             0.0
         };
         let rows = self.editor.workspace.as_ref().map_or(0, |w| w.rows().len());
-        let scroll =
-            (self.tree.scroll + push / EDGE * EDGE_SPEED).clamp(0.0, self.tree_max_scroll(rows));
-        if scroll != self.tree.scroll {
-            self.tree.scroll = scroll;
+        let scroll = (self.panels.tree.scroll + push / EDGE * EDGE_SPEED)
+            .clamp(0.0, self.tree_max_scroll(rows));
+        if scroll != self.panels.tree.scroll {
+            self.panels.tree.scroll = scroll;
             // 文件树滚动后，鼠标下方的行改变，需要重新计算放置目标。
             self.drag_tree_item(x, y);
-            let next = now + self.frame_interval;
+            let next = now + self.frame.frame_interval;
             wake = Some(wake.map_or(next, |w: Instant| w.min(next)));
         }
 
@@ -311,16 +352,20 @@ impl App {
     /// 在后台把 `paths` 中的各项复制进目录 `dir`，完成后选中各个副本（[`App::copied_into_tree`]）。
     ///
     /// 同名时副本改名（见 [`winc_editor::copy_entry`]）。目录可能很大，复制时间与内容大小成正比，
-    /// 因此不在界面线程上执行。某一项复制失败时提示原因，其余各项仍然复制。
+    /// 因此不在界面线程上执行（[`App::spawn_copy`]）。某一项复制失败时提示原因，其余各项仍然复制。
     pub(in crate::app) fn copy_entries_into(&mut self, paths: Vec<PathBuf>, dir: PathBuf) {
-        let Some(root) = self.editor.root().map(Path::to_path_buf) else {
+        let Some(root) = self.folder_root(&dir) else {
             return;
         };
-        let copy = move || {
+        let remote =
+            winc_backend::is_remote(&dir) || paths.iter().any(|path| winc_backend::is_remote(path));
+        let copy = move |copying: &winc_editor::Copying| {
             let (mut copies, mut failures) = (Vec::new(), Vec::new());
             for from in &paths {
-                match winc_editor::copy_entry(&root, from, &dir) {
+                match winc_editor::copy_entry(&root, from, &dir, copying) {
                     Ok(copy) => copies.push(copy),
+                    // 取消之后其余各项不再复制，也不算失败。
+                    Err(_) if copying.is_cancelled() => break,
                     Err(e) => failures.push(t!(
                         "workspace-tree-copy-failed",
                         name = winc_editor::display_name(from),
@@ -330,15 +375,9 @@ impl App {
             }
             (copies, failures)
         };
-        match self.proxy.clone() {
-            Some(proxy) => winc_editor::background::spawn(move || {
-                let (copies, failures) = copy();
-                let _ = proxy.send_event(UserEvent::Copied(copies, failures));
-            }),
-            None => {
-                let (copies, failures) = copy();
-                self.copied_into_tree(copies, failures);
-            }
+        let done = |(copies, failures), copying| UserEvent::Copied(copies, failures, copying);
+        if let Some((copies, failures)) = self.spawn_copy(remote, false, copy, done) {
+            self.copied_into_tree(copies, failures);
         }
     }
 
@@ -356,7 +395,7 @@ impl App {
                 ws.reveal(copy);
             }
             ws.select_paths(&copies);
-            self.tree.motion = None;
+            self.panels.tree.motion = None;
             self.focus = Focus::Tree;
             if let Some(index) = ws.selected {
                 self.scroll_tree_to(index, false);
@@ -420,30 +459,54 @@ impl App {
     ///
     /// 文档的内容和修改状态不变。某一项移动失败时提示原因，其余各项仍然移动。
     pub(in crate::app) fn move_entries(&mut self, paths: &[PathBuf], dir: &Path) {
-        // 先等待后台保存完成，否则保存会在原位置重新写出文件。
-        self.wait_for_saves();
+        // 先等待后台保存完成，否则保存会在原位置重新写出文件。远端的保存与移动按顺序执行。
+        if !winc_backend::is_remote(dir) {
+            self.wait_for_saves();
+        }
+        let Some(root) = self.folder_root(dir) else {
+            return;
+        };
+        // 打开的目录和附加的目录本身不移动。
+        let folders: Vec<PathBuf> = (self.editor.workspace.iter())
+            .flat_map(|ws| ws.folders().map(Path::to_path_buf))
+            .collect();
+        let paths: Vec<PathBuf> = (paths.iter().filter(|p| !folders.contains(p)))
+            .cloned()
+            .collect();
+        let into = dir.to_path_buf();
+        let relocate = move || {
+            let results: Vec<std::io::Result<PathBuf>> = (paths.iter())
+                .map(|from| winc_editor::move_at(&root, from, &into))
+                .collect();
+            (paths, results)
+        };
+        self.file_work(dir, relocate, |app, (paths, results)| {
+            app.entries_moved(&paths, results);
+        });
+    }
+
+    /// 移动完成：更新文件树和已打开文档的路径，选中移过去的各项；`results` 是 `paths` 中各项
+    /// 的结果。
+    fn entries_moved(&mut self, paths: &[PathBuf], results: Vec<std::io::Result<PathBuf>>) {
         let mut moved = Vec::new();
-        for from in paths {
-            let Some(result) = self
-                .editor
-                .workspace
-                .as_mut()
-                .map(|ws| ws.move_into(from, dir))
-            else {
-                return;
-            };
+        for (from, result) in paths.iter().zip(results) {
             match result {
                 Ok(target) => {
+                    if target != *from
+                        && let Some(ws) = &mut self.editor.workspace
+                    {
+                        ws.relocated(from, &target);
+                    }
                     self.paths_moved(from, &target);
                     // 从别的窗口剪切来的：原窗口打开的文件、文件树也要跟着改。
                     let elsewhere = self
                         .editor
                         .workspace
                         .as_ref()
-                        .is_some_and(|ws| !from.starts_with(&ws.root));
+                        .is_some_and(|ws| ws.folder_of(from).is_none());
                     if elsewhere {
                         let request = crate::winc::Request::Moved(from.clone(), target.clone());
-                        self.shared.request(request);
+                        self.link.shared.request(request);
                     }
                     moved.push(target);
                 }
@@ -462,7 +525,7 @@ impl App {
             && let Some(ws) = &mut self.editor.workspace
         {
             ws.select_paths(&moved);
-            self.tree.motion = None;
+            self.panels.tree.motion = None;
             self.focus = Focus::Tree;
             if let Some(index) = ws.selected {
                 self.scroll_tree_to(index, false);

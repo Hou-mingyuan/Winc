@@ -9,7 +9,6 @@
 
 use std::fmt::Write as _;
 
-use winc_core::text;
 use winc_i18n::t;
 use winc_syntax::{LineState, TokenKind, detect, highlight_line};
 
@@ -47,15 +46,15 @@ impl<'a> PlacesView<'a> {
     /// 打开中的浮窗。
     fn live(app: &'a App) -> Option<PlacesView<'a>> {
         Some(PlacesView {
-            places: app.picker.places.as_ref()?,
-            hits: &app.picker.hits,
-            selected: app.picker.selected,
-            hovered: match app.hover {
+            places: app.overlays.picker.places.as_ref()?,
+            hits: &app.overlays.picker.hits,
+            selected: app.overlays.picker.selected,
+            hovered: match app.pointer.hover {
                 Hover::PickerRow(i) => Some(i),
                 _ => None,
             },
-            scroll: app.picker.scroll,
-            filter: app.picker.input.text(),
+            scroll: app.overlays.picker.scroll,
+            filter: app.overlays.picker.input.text(),
             caret: app.focus == Focus::Picker && app.blink.visible,
         })
     }
@@ -80,7 +79,11 @@ impl<'a> PlacesView<'a> {
 /// 三次缓出（最后一段慢慢停稳）。
 pub(in crate::view) fn draw_live(app: &App, frame: &mut Frame<'_>, rect: Rect) -> Option<Rect> {
     let view = PlacesView::live(app)?;
-    let t = app.picker.places_in.map_or(1.0, |clock| clock.linear());
+    let t = app
+        .overlays
+        .picker
+        .places_in
+        .map_or(1.0, |clock| clock.linear());
     let opacity = 1.0 - (1.0 - t).powi(2);
     let rect = slid(rect, app.places_above(), (1.0 - t).powi(3));
     frame.with_opacity(opacity, |frame| draw_places(app, frame, rect, &view))
@@ -309,25 +312,26 @@ fn draw_code(app: &App, frame: &mut Frame<'_>, place: &Place, area: Rect) {
         &mut tokens,
     );
 
-    let cell = app.cell;
+    let cell = app.metrics.cell;
     let fit = (area.w / cell).floor() as usize;
     let skip = match place.marks.first() {
         Some(mark) if mark.end + 2 > fit => (mark.end + 4).saturating_sub(fit).min(mark.start),
         _ => 0,
     };
-    let (ascent, descent) = (app.mono_metrics.ascent, app.mono_metrics.descent);
+    let (ascent, descent) = (app.metrics.mono.ascent, app.metrics.mono.descent);
     let baseline = (area.y + (area.h - (ascent + descent)) / 2.0 + ascent).round();
     let size = app.fonts.code;
 
     // 先排好每个字符的位置（格），再绘制名字的底色，最后绘制字。
     let lead = usize::from(skip > 0);
     let mut cells = lead;
+    let widths = loose_cells(&chars, 4);
     let placed: Vec<(usize, char, usize, usize)> = chars
         .iter()
         .enumerate()
         .skip(skip)
         .map(|(col, &c)| {
-            let width = text::char_cells(c, cells, 4).max(1);
+            let width = widths[col];
             let at = cells;
             cells += width;
             (col, c, at, width)
@@ -364,8 +368,10 @@ fn draw_code(app: &App, frame: &mut Frame<'_>, place: &Place, area: Rect) {
         );
     }
     let mut token = 0;
-    for (col, c, at, width) in placed {
-        if c.is_whitespace() {
+    // emoji 序列随首字符整体绘制；`joined` 之前的字符已经绘制。
+    let mut joined = 0;
+    for (col, c, at, _) in placed {
+        if c.is_whitespace() || col < joined {
             continue;
         }
         while tokens.get(token).is_some_and(|t| t.end <= col) {
@@ -387,7 +393,9 @@ fn draw_code(app: &App, frame: &mut Frame<'_>, place: &Place, area: Rect) {
         } else {
             FontKind::Mono
         };
-        frame.cell_char(font, size, x_of(at), baseline, cell, width, c, color, area);
+        let at = (x_of(at), baseline);
+        let font = (font, size, cell);
+        joined = col + draw_grid_char(frame, font, at, (&chars, col), color, area);
     }
 }
 

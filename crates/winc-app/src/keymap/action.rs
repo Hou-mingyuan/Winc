@@ -18,6 +18,7 @@ pub enum Action {
     GoBack,
     GoForward,
     Settings,
+    ReleaseNotes,
     KeyboardShortcuts,
     RecordKeys,
 
@@ -25,6 +26,10 @@ pub enum Action {
     NewWindow,
     OpenFile,
     OpenFolder,
+    /// 把一个目录加为窗口的附加目录。
+    AddFolder,
+    RemoteConnect,
+    RemoteDisconnect,
     OpenRecent,
     Save,
     SaveAs,
@@ -34,6 +39,13 @@ pub enum Action {
     ReopenClosed,
     NextTab,
     PreviousTab,
+    SplitRight,
+    SplitDown,
+    MoveToSplitRight,
+    MoveToSplitDown,
+    Unsplit,
+    NextPane,
+    PreviousPane,
     CloseFolder,
     CloseWindow,
     CopyPath,
@@ -62,6 +74,8 @@ pub enum Action {
     MarkdownCode,
     /// 可编辑的 Markdown 预览中切换删除线（`~~`）。
     MarkdownStrikethrough,
+    /// 可编辑的 Markdown 预览中切换高亮（`==`）。
+    MarkdownHighlight,
     DeleteLine,
     DeleteAllLeft,
     IndentLines,
@@ -144,6 +158,7 @@ pub enum Action {
 
     RenameFile,
     DeleteFile,
+    DeleteFilePermanently,
     OpenSelected,
     PreviewSelected,
     FindInFolder,
@@ -174,6 +189,10 @@ pub enum Action {
     /// 全部显示或不显示空白符。
     ToggleWhitespace,
     TogglePreview,
+    /// 把当前标签设为只读或恢复为可以编辑。
+    ToggleReadOnly,
+    /// 把窗口里的全部标签设为只读或恢复。
+    ToggleReadOnlyAll,
     NextDifference,
     PreviousDifference,
     /// 差异里的下一个文件。
@@ -183,7 +202,14 @@ pub enum Action {
     /// 切换差异的单栏显示和并排显示。
     ToggleDiffLayout,
     GitShowChanges,
+    /// 更改列表：显示选中文件的差异，焦点移到差异上。
+    ChangesShowDiff,
+    /// 更改列表：在编辑区打开选中的文件。
+    ChangesOpenSource,
+    /// 更改列表：回滚选中的文件（先确认）。
+    ChangesRollback,
     GitShowLog,
+    GitGoToRevision,
     /// 在只读标签中打开 Git 操作的输出。
     GitShowOutput,
     /// 克隆仓库。
@@ -210,11 +236,23 @@ pub enum Action {
     GitSync,
     /// 储藏工作区里的更改（输入说明）。
     GitStash,
+    /// 把全部更改加入暂存区，未跟踪的文件除外。
+    GitStageAll,
+    /// 把暂存区中的全部内容移出暂存区。
+    GitUnstageAll,
+    /// 把当前文件的更改加入暂存区。
+    GitStageFile,
     GitFileHistory,
+    /// 当前文件中选中的几行的历史。
+    GitSelectionHistory,
     GitBlame,
     ShowCommit,
     GitRevertChange,
     ToggleTerminal,
+    /// 显示或隐藏终端面板，与焦点位置无关。
+    ToggleTerminalPanel,
+    /// 启用终端模块；模块关闭时列出，使内置终端可以从命令面板找到。
+    EnableTerminal,
     /// 运行当前选中的配置；运行中时重新运行。
     RunConfiguration,
     /// 停止当前选中的配置。
@@ -226,8 +264,24 @@ pub enum Action {
     CloseTerminal,
     NextTerminal,
     PreviousTerminal,
+    SplitTerminal,
+    NextTerminalPane,
+    PreviousTerminalPane,
+    FocusTerminal1,
+    FocusTerminal2,
+    FocusTerminal3,
+    FocusTerminal4,
+    FocusTerminal5,
+    FocusTerminal6,
+    FocusTerminal7,
+    FocusTerminal8,
+    FocusTerminal9,
     FindInTerminal,
     MaximizeTerminal,
+    /// 把终端翻到回滚缓冲的最上面。
+    ScrollTerminalTop,
+    /// 把终端翻回最新的输出。
+    ScrollTerminalBottom,
     ToggleTerminalPosition,
     InstallShellCommand,
     UninstallShellCommand,
@@ -250,9 +304,31 @@ pub enum Module {
     Git,
     /// 终端模块。
     Terminal,
+    /// 远程模块。
+    Remote,
 }
 
 impl Action {
+    /// 按显示顺序聚焦第 1 至第 9 个终端的命令，供数字键绑定和编号查询共用。
+    pub const TERMINAL_FOCUS: [Self; 9] = [
+        Self::FocusTerminal1,
+        Self::FocusTerminal2,
+        Self::FocusTerminal3,
+        Self::FocusTerminal4,
+        Self::FocusTerminal5,
+        Self::FocusTerminal6,
+        Self::FocusTerminal7,
+        Self::FocusTerminal8,
+        Self::FocusTerminal9,
+    ];
+
+    /// 返回终端聚焦命令的标签下标（从 0 起），其他命令返回 `None`。
+    pub fn terminal_index(self) -> Option<usize> {
+        Self::TERMINAL_FOCUS
+            .iter()
+            .position(|action| *action == self)
+    }
+
     /// 返回命令在当前界面语言中的名称，命令面板、「快捷键」页和菜单都使用它。
     pub fn title(self) -> &'static str {
         use Action::*;
@@ -266,12 +342,16 @@ impl Action {
             GoBack => t!("cmd-go-back"),
             GoForward => t!("cmd-go-forward"),
             Settings => t!("cmd-settings"),
+            ReleaseNotes => t!("cmd-release-notes"),
             KeyboardShortcuts => t!("cmd-keyboard-shortcuts"),
             RecordKeys => t!("cmd-record-keys"),
             NewFile => t!("cmd-new-file"),
             NewWindow => t!("cmd-new-window"),
             OpenFile => t!("cmd-open-file"),
             OpenFolder => t!("cmd-open-folder"),
+            AddFolder => t!("cmd-add-folder"),
+            RemoteConnect => t!("cmd-remote-connect"),
+            RemoteDisconnect => t!("cmd-remote-disconnect"),
             OpenRecent => t!("cmd-open-recent"),
             Save => t!("cmd-save"),
             SaveAs => t!("cmd-save-as"),
@@ -281,6 +361,13 @@ impl Action {
             ReopenClosed => t!("cmd-reopen-closed"),
             NextTab => t!("cmd-next-tab"),
             PreviousTab => t!("cmd-previous-tab"),
+            SplitRight => t!("cmd-split-right"),
+            SplitDown => t!("cmd-split-down"),
+            MoveToSplitRight => t!("cmd-move-to-split-right"),
+            MoveToSplitDown => t!("cmd-move-to-split-down"),
+            Unsplit => t!("cmd-unsplit"),
+            NextPane => t!("cmd-next-pane"),
+            PreviousPane => t!("cmd-previous-pane"),
             CloseFolder => t!("cmd-close-folder"),
             CloseWindow => t!("cmd-close-window"),
             CopyPath => t!("cmd-copy-path"),
@@ -310,6 +397,7 @@ impl Action {
             MarkdownItalic => t!("cmd-markdown-italic"),
             MarkdownCode => t!("cmd-markdown-code"),
             MarkdownStrikethrough => t!("cmd-markdown-strikethrough"),
+            MarkdownHighlight => t!("cmd-markdown-highlight"),
             DeleteLine => t!("cmd-delete-line"),
             DeleteAllLeft => t!("cmd-delete-all-left"),
             IndentLines => t!("cmd-indent-lines"),
@@ -390,6 +478,7 @@ impl Action {
             PreviousResult => t!("cmd-previous-result"),
             RenameFile => t!("cmd-rename-file"),
             DeleteFile => t!("cmd-delete-file"),
+            DeleteFilePermanently => t!("cmd-delete-file-permanently"),
             OpenSelected => t!("cmd-open-selected"),
             PreviewSelected => t!("cmd-preview-selected"),
             FindInFolder => t!("cmd-find-in-folder"),
@@ -419,7 +508,11 @@ impl Action {
             PreviousDiffFile => t!("cmd-previous-diff-file"),
             ToggleDiffLayout => t!("cmd-toggle-diff-layout"),
             GitShowChanges => t!("cmd-git-show-changes"),
+            ChangesShowDiff => t!("cmd-changes-show-diff"),
+            ChangesOpenSource => t!("cmd-changes-open-source"),
+            ChangesRollback => t!("cmd-changes-rollback"),
             GitShowLog => t!("cmd-git-show-log"),
+            GitGoToRevision => t!("cmd-git-go-to-revision"),
             GitShowOutput => t!("cmd-git-show-output"),
             GitClone => t!("cmd-git-clone"),
             GitInit => t!("cmd-git-init"),
@@ -434,11 +527,17 @@ impl Action {
             GitPush => t!("cmd-git-push"),
             GitSync => t!("cmd-git-sync"),
             GitStash => t!("cmd-git-stash"),
+            GitStageAll => t!("cmd-git-stage-all"),
+            GitUnstageAll => t!("cmd-git-unstage-all"),
+            GitStageFile => t!("cmd-git-stage-file"),
             GitFileHistory => t!("cmd-git-file-history"),
+            GitSelectionHistory => t!("cmd-git-selection-history"),
             GitBlame => t!("cmd-git-blame"),
             ShowCommit => t!("cmd-show-commit"),
             GitRevertChange => t!("cmd-git-revert-change"),
             ToggleTerminal => t!("cmd-toggle-terminal"),
+            ToggleTerminalPanel => t!("cmd-toggle-terminal-panel"),
+            EnableTerminal => t!("cmd-enable-terminal"),
             RunConfiguration => t!("cmd-run-configuration"),
             StopConfiguration => t!("cmd-stop-configuration"),
             EditRunConfigurations => t!("cmd-edit-run-configurations"),
@@ -447,8 +546,22 @@ impl Action {
             CloseTerminal => t!("cmd-close-terminal"),
             NextTerminal => t!("cmd-next-terminal"),
             PreviousTerminal => t!("cmd-previous-terminal"),
+            SplitTerminal => t!("cmd-split-terminal"),
+            NextTerminalPane => t!("cmd-next-terminal-pane"),
+            PreviousTerminalPane => t!("cmd-previous-terminal-pane"),
+            FocusTerminal1 => t!("cmd-terminal-1"),
+            FocusTerminal2 => t!("cmd-terminal-2"),
+            FocusTerminal3 => t!("cmd-terminal-3"),
+            FocusTerminal4 => t!("cmd-terminal-4"),
+            FocusTerminal5 => t!("cmd-terminal-5"),
+            FocusTerminal6 => t!("cmd-terminal-6"),
+            FocusTerminal7 => t!("cmd-terminal-7"),
+            FocusTerminal8 => t!("cmd-terminal-8"),
+            FocusTerminal9 => t!("cmd-terminal-9"),
             FindInTerminal => t!("cmd-find-in-terminal"),
             MaximizeTerminal => t!("cmd-maximize-terminal"),
+            ScrollTerminalTop => t!("cmd-scroll-terminal-top"),
+            ScrollTerminalBottom => t!("cmd-scroll-terminal-bottom"),
             ToggleTerminalPosition => t!("cmd-toggle-terminal-position"),
             InstallShellCommand => t!("cmd-install-shell-command"),
             UninstallShellCommand => t!("cmd-uninstall-shell-command"),
@@ -461,7 +574,23 @@ impl Action {
             PreviousError => t!("cmd-previous-error"),
             SendToTerminal => t!("cmd-send-to-terminal"),
             TogglePreview => t!("cmd-toggle-preview"),
+            ToggleReadOnly => t!("cmd-toggle-read-only"),
+            ToggleReadOnlyAll => t!("cmd-toggle-read-only-all"),
         }
+    }
+
+    /// 返回命令在配置文件中的名字：变体名，首字母小写（如 `quickOpen`）。
+    pub fn id(self) -> String {
+        let name = format!("{self:?}");
+        let mut chars = name.chars();
+        chars.next().map_or_else(String::new, |first| {
+            first.to_ascii_lowercase().to_string() + chars.as_str()
+        })
+    }
+
+    /// 按配置文件中的名字 `id` 返回命令；不认识时返回 `None`。
+    pub fn from_id(id: &str) -> Option<Action> {
+        ACTIONS.iter().copied().find(|action| action.id() == id)
     }
 
     /// 返回命令的英文名；在命令面板中输入英文也能搜到该命令。
@@ -477,12 +606,16 @@ impl Action {
             GoBack => "Go Back",
             GoForward => "Go Forward",
             Settings => "Settings",
+            ReleaseNotes => "Release Notes",
             KeyboardShortcuts => "Keyboard Shortcuts",
             RecordKeys => "Record Keys",
             NewFile => "New File",
             NewWindow => "New Window",
             OpenFile => "Open",
             OpenFolder => "Open Folder",
+            AddFolder => "Add Folder to Window",
+            RemoteConnect => "Remote: Connect to SSH Host…",
+            RemoteDisconnect => "Remote: Disconnect",
             OpenRecent => "Open Recent Folder",
             Save => "Save",
             SaveAs => "Save As",
@@ -492,6 +625,13 @@ impl Action {
             ReopenClosed => "Reopen Closed Editor",
             NextTab => "Open Next Editor",
             PreviousTab => "Open Previous Editor",
+            SplitRight => "Split Editor Right",
+            SplitDown => "Split Editor Down",
+            MoveToSplitRight => "Move Editor into Right Split",
+            MoveToSplitDown => "Move Editor into Split Below",
+            Unsplit => "Join All Splits",
+            NextPane => "Focus Next Split",
+            PreviousPane => "Focus Previous Split",
             CloseFolder => "Close Folder",
             CloseWindow => "Close Window",
             CopyPath => "Copy Path",
@@ -515,6 +655,7 @@ impl Action {
             MarkdownItalic => "Markdown: Toggle Italic",
             MarkdownCode => "Markdown: Toggle Inline Code",
             MarkdownStrikethrough => "Markdown: Toggle Strikethrough",
+            MarkdownHighlight => "Markdown: Toggle Highlight",
             DeleteLine => "Delete Line",
             DeleteAllLeft => "Delete All Left",
             IndentLines => "Indent Line",
@@ -595,6 +736,7 @@ impl Action {
             PreviousResult => "Focus Previous Search Result",
             RenameFile => "Rename",
             DeleteFile => "Delete",
+            DeleteFilePermanently => "Delete Permanently",
             OpenSelected => "Open",
             PreviewSelected => "Open and Keep Focus",
             FindInFolder => "Find in Folder",
@@ -624,7 +766,11 @@ impl Action {
             PreviousDiffFile => "Go to Previous File in Diff",
             ToggleDiffLayout => "Toggle Inline Diff",
             GitShowChanges => "Git: Open Changes",
+            ChangesShowDiff => "Git: Show Diff of Selected Change",
+            ChangesOpenSource => "Git: Open Selected Change",
+            ChangesRollback => "Git: Roll Back Selected Changes",
             GitShowLog => "Git: Show Log",
+            GitGoToRevision => "Git: Go to Hash, Branch or Tag",
             GitShowOutput => "Git: Show Output",
             GitClone => "Git: Clone Repository…",
             GitInit => "Git: Initialize Repository",
@@ -639,11 +785,17 @@ impl Action {
             GitPush => "Git: Push",
             GitSync => "Git: Sync",
             GitStash => "Git: Stash Changes…",
+            GitStageAll => "Git: Stage All Changes",
+            GitUnstageAll => "Git: Unstage All Changes",
+            GitStageFile => "Git: Stage Current File",
             GitFileHistory => "Git: Show File History",
+            GitSelectionHistory => "Git: Show History for Selection",
             GitBlame => "Git: Toggle Blame",
             ShowCommit => "Git: Commit",
             GitRevertChange => "Git: Revert Change",
             ToggleTerminal => "Toggle Terminal",
+            ToggleTerminalPanel => "Terminal: Toggle Panel",
+            EnableTerminal => "Terminal: Enable Built-in Terminal",
             RunConfiguration => "Run Configuration",
             StopConfiguration => "Stop Configuration",
             EditRunConfigurations => "Edit Run Configurations",
@@ -652,8 +804,22 @@ impl Action {
             CloseTerminal => "Terminal: Close Tab",
             NextTerminal => "Terminal: Next Tab",
             PreviousTerminal => "Terminal: Previous Tab",
+            SplitTerminal => "Terminal: Split",
+            NextTerminalPane => "Terminal: Focus Next Pane",
+            PreviousTerminalPane => "Terminal: Focus Previous Pane",
+            FocusTerminal1 => "Terminal: Focus Tab 1",
+            FocusTerminal2 => "Terminal: Focus Tab 2",
+            FocusTerminal3 => "Terminal: Focus Tab 3",
+            FocusTerminal4 => "Terminal: Focus Tab 4",
+            FocusTerminal5 => "Terminal: Focus Tab 5",
+            FocusTerminal6 => "Terminal: Focus Tab 6",
+            FocusTerminal7 => "Terminal: Focus Tab 7",
+            FocusTerminal8 => "Terminal: Focus Tab 8",
+            FocusTerminal9 => "Terminal: Focus Tab 9",
             FindInTerminal => "Terminal: Find",
             MaximizeTerminal => "Terminal: Maximize Panel",
+            ScrollTerminalTop => "Terminal: Scroll to Top",
+            ScrollTerminalBottom => "Terminal: Scroll to Bottom",
             ToggleTerminalPosition => "Terminal: Toggle Panel Position",
             InstallShellCommand => "Shell Command: Install winc Command",
             UninstallShellCommand => "Shell Command: Uninstall winc Command",
@@ -666,6 +832,8 @@ impl Action {
             PreviousError => "Terminal: Previous Error",
             SendToTerminal => "Terminal: Run Selected Text",
             TogglePreview => "Toggle Preview",
+            ToggleReadOnly => "Toggle Read-Only",
+            ToggleReadOnlyAll => "Toggle Read-Only for All Files",
         }
     }
 
@@ -682,14 +850,16 @@ impl Action {
             | GoBack
             | GoForward
             | Settings
+            | ReleaseNotes
             | KeyboardShortcuts
             | RecordKeys
             | InstallShellCommand
             | UninstallShellCommand => Group::General,
-            NewFile | OpenFile | OpenFolder | Save | SaveAs | CloseTab | CloseOtherTabs
-            | CloseAllTabs | ReopenClosed | NextTab | PreviousTab | CloseFolder | CloseWindow
-            | CopyPath | CopyRelativePath | RevealInFinder | CopyActivePath | CopyKeyPath
-            | RevealActiveFile | OpenInTerminal | Quit => Group::File,
+            NewFile | OpenFile | OpenFolder | AddFolder | RemoteConnect | RemoteDisconnect
+            | Save | SaveAs | CloseTab | CloseOtherTabs | CloseAllTabs | ReopenClosed | NextTab
+            | PreviousTab | CloseFolder | CloseWindow | CopyPath | CopyRelativePath
+            | RevealInFinder | CopyActivePath | CopyKeyPath | RevealActiveFile | OpenInTerminal
+            | Quit => Group::File,
             NewWindow | OpenRecent | CopyReference | CopyAbsoluteReference => Group::File,
             Undo
             | Redo
@@ -702,6 +872,7 @@ impl Action {
             | MarkdownItalic
             | MarkdownCode
             | MarkdownStrikethrough
+            | MarkdownHighlight
             | DeleteLine
             | DeleteAllLeft
             | IndentLines
@@ -766,7 +937,12 @@ impl Action {
             | ReplaceOne | ReplaceAll | SelectAllMatches | ToggleCase | ToggleWord
             | ToggleRegex | FilterLines | FindInFiles | ReplaceInFiles | ReplaceAllInFiles
             | NextResult | PreviousResult => Group::Find,
-            RenameFile | DeleteFile | OpenSelected | PreviewSelected | FindInFolder => Group::Tree,
+            RenameFile
+            | DeleteFile
+            | DeleteFilePermanently
+            | OpenSelected
+            | PreviewSelected
+            | FindInFolder => Group::Tree,
             ToggleSidebar
             | FocusSidebar
             | ShowFiles
@@ -788,13 +964,19 @@ impl Action {
             | ToggleStatusBar
             | ToggleWhitespace
             | TogglePreview
+            | ToggleReadOnly
+            | ToggleReadOnlyAll
             | NextDifference
             | PreviousDifference
             | NextDiffFile
             | PreviousDiffFile
             | ToggleDiffLayout
             | GitShowChanges
+            | ChangesShowDiff
+            | ChangesOpenSource
+            | ChangesRollback
             | GitShowLog
+            | GitGoToRevision
             | GitShowOutput
             | GitClone
             | GitInit
@@ -809,11 +991,17 @@ impl Action {
             | GitPush
             | GitSync
             | GitStash
+            | GitStageAll
+            | GitUnstageAll
+            | GitStageFile
             | GitFileHistory
+            | GitSelectionHistory
             | GitBlame
             | ShowCommit
             | GitRevertChange
             | ToggleTerminal
+            | ToggleTerminalPanel
+            | EnableTerminal
             | RunConfiguration
             | StopConfiguration
             | EditRunConfigurations
@@ -822,8 +1010,22 @@ impl Action {
             | CloseTerminal
             | NextTerminal
             | PreviousTerminal
+            | SplitTerminal
+            | NextTerminalPane
+            | PreviousTerminalPane
+            | FocusTerminal1
+            | FocusTerminal2
+            | FocusTerminal3
+            | FocusTerminal4
+            | FocusTerminal5
+            | FocusTerminal6
+            | FocusTerminal7
+            | FocusTerminal8
+            | FocusTerminal9
             | FindInTerminal
             | MaximizeTerminal
+            | ScrollTerminalTop
+            | ScrollTerminalBottom
             | ToggleTerminalPosition
             | RenameTerminal
             | PreviousCommand
@@ -832,7 +1034,14 @@ impl Action {
             | UnfoldOutput
             | NextError
             | PreviousError
-            | SendToTerminal => Group::View,
+            | SendToTerminal
+            | SplitRight
+            | SplitDown
+            | MoveToSplitRight
+            | MoveToSplitDown
+            | Unsplit
+            | NextPane
+            | PreviousPane => Group::View,
         }
     }
 
@@ -884,7 +1093,8 @@ impl Action {
             | MarkdownBold
             | MarkdownItalic
             | MarkdownCode
-            | MarkdownStrikethrough => false,
+            | MarkdownStrikethrough
+            | MarkdownHighlight => false,
             _ => self.group() == Group::Edit,
         }
     }
@@ -901,7 +1111,11 @@ impl Action {
     pub fn module(self) -> Option<Module> {
         match self {
             Action::GitShowChanges
+            | Action::ChangesShowDiff
+            | Action::ChangesOpenSource
+            | Action::ChangesRollback
             | Action::GitShowLog
+            | Action::GitGoToRevision
             | Action::GitShowOutput
             | Action::GitClone
             | Action::GitInit
@@ -916,11 +1130,16 @@ impl Action {
             | Action::GitPush
             | Action::GitSync
             | Action::GitStash
+            | Action::GitStageAll
+            | Action::GitUnstageAll
+            | Action::GitStageFile
             | Action::GitFileHistory
+            | Action::GitSelectionHistory
             | Action::GitBlame
             | Action::ShowCommit
             | Action::GitRevertChange => Some(Module::Git),
             Action::ToggleTerminal
+            | Action::ToggleTerminalPanel
             | Action::RunConfiguration
             | Action::StopConfiguration
             | Action::EditRunConfigurations
@@ -929,8 +1148,22 @@ impl Action {
             | Action::CloseTerminal
             | Action::NextTerminal
             | Action::PreviousTerminal
+            | Action::SplitTerminal
+            | Action::NextTerminalPane
+            | Action::PreviousTerminalPane
+            | Action::FocusTerminal1
+            | Action::FocusTerminal2
+            | Action::FocusTerminal3
+            | Action::FocusTerminal4
+            | Action::FocusTerminal5
+            | Action::FocusTerminal6
+            | Action::FocusTerminal7
+            | Action::FocusTerminal8
+            | Action::FocusTerminal9
             | Action::FindInTerminal
             | Action::MaximizeTerminal
+            | Action::ScrollTerminalTop
+            | Action::ScrollTerminalBottom
             | Action::ToggleTerminalPosition
             | Action::RenameTerminal
             | Action::PreviousCommand
@@ -940,6 +1173,7 @@ impl Action {
             | Action::NextError
             | Action::PreviousError
             | Action::SendToTerminal => Some(Module::Terminal),
+            Action::RemoteConnect | Action::RemoteDisconnect => Some(Module::Remote),
             _ => None,
         }
     }
@@ -975,6 +1209,7 @@ impl Action {
                 | PreviousResult
                 | RenameFile
                 | DeleteFile
+                | DeleteFilePermanently
                 | OpenSelected
                 | PreviewSelected
                 | FindInFolder
@@ -998,6 +1233,7 @@ pub const ACTIONS: &[Action] = {
         GoForward,
         ShowCommands,
         Settings,
+        ReleaseNotes,
         KeyboardShortcuts,
         RecordKeys,
         Format,
@@ -1025,6 +1261,9 @@ pub const ACTIONS: &[Action] = {
         NewWindow,
         OpenFile,
         OpenFolder,
+        AddFolder,
+        RemoteConnect,
+        RemoteDisconnect,
         OpenRecent,
         Save,
         SaveAs,
@@ -1034,6 +1273,13 @@ pub const ACTIONS: &[Action] = {
         ReopenClosed,
         NextTab,
         PreviousTab,
+        SplitRight,
+        SplitDown,
+        MoveToSplitRight,
+        MoveToSplitDown,
+        Unsplit,
+        NextPane,
+        PreviousPane,
         CloseFolder,
         CloseWindow,
         CopyPath,
@@ -1057,6 +1303,7 @@ pub const ACTIONS: &[Action] = {
         MarkdownItalic,
         MarkdownCode,
         MarkdownStrikethrough,
+        MarkdownHighlight,
         DeleteLine,
         DeleteAllLeft,
         IndentLines,
@@ -1116,6 +1363,7 @@ pub const ACTIONS: &[Action] = {
         ClearBookmarks,
         RenameFile,
         DeleteFile,
+        DeleteFilePermanently,
         OpenSelected,
         PreviewSelected,
         FindInFolder,
@@ -1140,9 +1388,15 @@ pub const ACTIONS: &[Action] = {
         ToggleStatusBar,
         ToggleWhitespace,
         TogglePreview,
+        ToggleReadOnly,
+        ToggleReadOnlyAll,
         ShowCommit,
         GitShowChanges,
+        ChangesShowDiff,
+        ChangesOpenSource,
+        ChangesRollback,
         GitShowLog,
+        GitGoToRevision,
         GitShowOutput,
         GitClone,
         GitInit,
@@ -1157,10 +1411,16 @@ pub const ACTIONS: &[Action] = {
         GitPush,
         GitSync,
         GitStash,
+        GitStageAll,
+        GitUnstageAll,
+        GitStageFile,
         GitFileHistory,
+        GitSelectionHistory,
         GitBlame,
         GitRevertChange,
         ToggleTerminal,
+        ToggleTerminalPanel,
+        EnableTerminal,
         RunConfiguration,
         StopConfiguration,
         EditRunConfigurations,
@@ -1168,6 +1428,8 @@ pub const ACTIONS: &[Action] = {
         ClearTerminal,
         FindInTerminal,
         MaximizeTerminal,
+        ScrollTerminalTop,
+        ScrollTerminalBottom,
         ToggleTerminalPosition,
         InstallShellCommand,
         UninstallShellCommand,
@@ -1175,6 +1437,18 @@ pub const ACTIONS: &[Action] = {
         CloseTerminal,
         NextTerminal,
         PreviousTerminal,
+        SplitTerminal,
+        NextTerminalPane,
+        PreviousTerminalPane,
+        FocusTerminal1,
+        FocusTerminal2,
+        FocusTerminal3,
+        FocusTerminal4,
+        FocusTerminal5,
+        FocusTerminal6,
+        FocusTerminal7,
+        FocusTerminal8,
+        FocusTerminal9,
         PreviousCommand,
         NextCommand,
         FoldOutput,

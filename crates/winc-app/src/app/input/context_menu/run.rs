@@ -1,5 +1,6 @@
 //! 执行菜单里选中的命令，以及几个命令共用的动作（复制路径、改名、删除、在目录中查找）。
 
+use winc_editor::panes::Axis;
 use winc_i18n::t;
 
 use super::*;
@@ -7,11 +8,11 @@ use super::*;
 impl App {
     /// 处理菜单中选中的命令 `command`：作用于弹出菜单时记录的目标。
     pub(in crate::app) fn run_menu_command(&mut self, command: MenuCommand) {
-        let Some(menu) = self.context_menu.take() else {
+        let Some(menu) = self.overlays.context_menu.take() else {
             return;
         };
         // 弹出菜单的按钮在菜单关掉以后放开。
-        self.menu_button = None;
+        self.overlays.menu_button = None;
 
         // 菜单中灰显的项本来点不到，这里再校验一次（例如菜单打开期间按了它的快捷键）。
         if !MenuEntry::offers(&menu.entries, command) {
@@ -21,7 +22,7 @@ impl App {
         // 选择器里的菜单选了一项：操作开始，选择器不再需要；取消时选择器留着。
         if matches!(
             menu.target,
-            MenuTarget::BranchOps(_) | MenuTarget::Location(..)
+            MenuTarget::BranchOps(_) | MenuTarget::TagOps(_) | MenuTarget::Location(..)
         ) {
             self.close_picker();
         }
@@ -42,6 +43,14 @@ impl App {
                     self.choose_form_base(base.map(|b| b.name.clone()));
                 }
             }
+            MenuTarget::FormRemote => {
+                if let MenuCommand::FormRemote(i) = command {
+                    let remote = self.git.remotes.get(i).cloned();
+                    if remote.is_some() {
+                        self.choose_form_base(remote);
+                    }
+                }
+            }
             MenuTarget::StatusPlaces(places) => match command {
                 MenuCommand::StatusPlace(i) => {
                     if let Some(place) = places.get(i) {
@@ -51,13 +60,37 @@ impl App {
                 MenuCommand::NewWorktree => self.open_worktree_dialog(),
                 _ => {}
             },
+            MenuTarget::LogColumns => {
+                if let MenuCommand::LogColumn(column) = command {
+                    self.toggle_log_column(column);
+                }
+            }
+            MenuTarget::LogDate => {
+                if let MenuCommand::LogSince(days) = command {
+                    self.change_log_query(|q| q.since_days = (days > 0).then_some(days));
+                }
+            }
+            MenuTarget::LogPath => match command {
+                MenuCommand::LogPath(0) => self.change_log_query(|q| q.paths.clear()),
+                MenuCommand::LogPath(i) => {
+                    if let Some(path) = self.git.log.paths.get(i - 1).cloned() {
+                        self.toggle_log_path(path);
+                    }
+                }
+                MenuCommand::LogPathOther => self.open_log_path_dialog(),
+                _ => {}
+            },
+            MenuTarget::LogAuthor if command == MenuCommand::LogAuthorMe => {
+                let me = self.git.my_email.clone();
+                self.toggle_log_author(me);
+            }
+            // 作者可以选几位：选一位加上或去掉它，「全部作者」清空。
             MenuTarget::LogAuthor => {
                 if let MenuCommand::LogAuthor(i) = command {
-                    let author = i
-                        .checked_sub(1)
-                        .and_then(|i| self.log.authors.get(i))
-                        .cloned();
-                    self.change_log_query(|q| q.author = author);
+                    match i.checked_sub(1).and_then(|i| self.git.log.authors.get(i)) {
+                        Some(author) => self.toggle_log_author(author.clone()),
+                        None => self.change_log_query(|q| q.authors.clear()),
+                    }
                 }
             }
             MenuTarget::Editor(id) => self.run_editor_command(command, id),
@@ -70,6 +103,14 @@ impl App {
                 }
                 MenuCommand::SelectAll => self.markdown_select_all(),
                 MenuCommand::RevealSource => self.reveal_markdown_source(),
+                MenuCommand::TextWidth(i) => {
+                    if let Some(&width) = winc_config::TextWidth::ALL.get(i) {
+                        self.set_text_width(width);
+                    }
+                }
+                MenuCommand::MarkdownLineNumbers => {
+                    self.settings_toggle(crate::layout::Setting::MarkdownLineNumbers);
+                }
                 MenuCommand::Table(op) => {
                     self.live_table_tool(op);
                 }
@@ -82,7 +123,12 @@ impl App {
                 };
                 match command {
                     MenuCommand::RenameTerminal => self.open_terminal_rename(index),
+                    MenuCommand::SplitTerminal => {
+                        self.activate_terminal_tab(index);
+                        self.split_terminal();
+                    }
                     MenuCommand::CloseTerminal => self.close_terminal_tab(index),
+                    MenuCommand::CloseOtherTerminals => self.close_other_terminal_tabs(id),
                     _ => {}
                 }
             }
@@ -99,9 +145,20 @@ impl App {
                 MenuCommand::OpenRecentInNewWindow(i) => self.open_recent_in_new_window(i),
                 MenuCommand::NewWindow => self.new_window(None),
                 MenuCommand::OpenFolder => self.pick(Pick::OpenFolder),
+                MenuCommand::AddFolder => self.ask_add_folder(),
+                MenuCommand::RenameGroup => self.ask_rename_group(),
+                MenuCommand::OpenGroup(i) => self.open_group(i),
+                MenuCommand::GroupFolder(i, j) => self.open_group_folder(i, j),
                 MenuCommand::OpenWslFolder(i) => {
                     if let Some(distro) = crate::system::wsl_distributions().get(i) {
                         self.pick(Pick::WslFolder(distro.clone()));
+                    }
+                }
+                MenuCommand::RemoteConnect | MenuCommand::RemoteOther => self.open_remote_picker(),
+                MenuCommand::RemoteDisconnect => self.remote_disconnect(),
+                MenuCommand::RemoteHost(i) => {
+                    if let Some(host) = crate::app::remote::hosts().get(i) {
+                        self.browse_remote_host(host);
                     }
                 }
                 MenuCommand::CloseFolder => self.close_folder(),
@@ -121,6 +178,13 @@ impl App {
                     self.settings_toggle_skip(language.id);
                 }
             }
+            MenuTarget::NamedTheme(_) => {
+                if let MenuCommand::NamedTheme(dark, i) = command
+                    && i < crate::theme::themes(dark).len()
+                {
+                    self.set_named_theme(dark, i);
+                }
+            }
             MenuTarget::Locale => {
                 if let MenuCommand::Locale(i) = command
                     && let Some(&choice) = winc_i18n::LocaleChoice::ALL.get(i)
@@ -133,6 +197,27 @@ impl App {
                     && let Some(&choice) = winc_config::RenderWhitespace::ALL.get(i)
                 {
                     self.set_render_whitespace(choice);
+                }
+            }
+            MenuTarget::DropFolder => {
+                if let MenuCommand::DropFolder(i) = command
+                    && let Some(&choice) = winc_config::FolderDrop::ALL.get(i)
+                {
+                    self.set_drop_folder(choice);
+                }
+            }
+            MenuTarget::AutoSave => {
+                if let MenuCommand::AutoSave(i) = command
+                    && let Some(&choice) = winc_config::AutoSave::ALL.get(i)
+                {
+                    self.set_auto_save(choice);
+                }
+            }
+            MenuTarget::OpenWorktree => {
+                if let MenuCommand::OpenWorktree(i) = command
+                    && let Some(&choice) = winc_config::WorktreeOpen::ALL.get(i)
+                {
+                    self.set_open_worktree(choice);
                 }
             }
             MenuTarget::VimClipboard => {
@@ -154,6 +239,13 @@ impl App {
                 }
                 _ => {}
             },
+            MenuTarget::TextWidth => {
+                if let MenuCommand::TextWidth(i) = command
+                    && let Some(&width) = winc_config::TextWidth::ALL.get(i)
+                {
+                    self.set_text_width(width);
+                }
+            }
             MenuTarget::BackgroundFit => {
                 if let MenuCommand::BackgroundFit(i) = command
                     && let Some(&fit) = winc_config::BackgroundFit::ALL.get(i)
@@ -178,6 +270,11 @@ impl App {
                     self.set_terminal_position(right);
                 }
             }
+            MenuTarget::TerminalTabPosition => {
+                if let MenuCommand::TerminalTabPosition(right) = command {
+                    self.set_terminal_tab_position(right);
+                }
+            }
             MenuTarget::OptionAsMeta => {
                 if let MenuCommand::OptionAsMeta(i) = command
                     && let Some(&choice) = winc_config::OptionAsMeta::ALL.get(i)
@@ -189,7 +286,12 @@ impl App {
                 MenuCommand::FontDefault => self.settings_choose_font(setting, None),
                 MenuCommand::Font(i) => {
                     if let Some(family) = winc_render::installed_fonts().get(i) {
-                        self.settings_choose_font(setting, Some(family.name.clone()));
+                        self.settings_choose_primary_font(setting, &family.name);
+                    }
+                }
+                MenuCommand::FallbackFont(i) => {
+                    if let Some(family) = winc_render::installed_fonts().get(i) {
+                        self.settings_toggle_fallback_font(setting, &family.name);
                     }
                 }
                 _ => {}
@@ -197,9 +299,23 @@ impl App {
             MenuTarget::Tool(task, id) => {
                 self.settings_choose_tool(tool_setting(task, id), command)
             }
+            MenuTarget::Keymap => match command {
+                MenuCommand::KeymapPreset(preset) => self.set_keymap_preset(preset),
+                MenuCommand::ImportKeymap(i) => self.import_keymap(i),
+                MenuCommand::ResetAllShortcuts => self.reset_all_shortcuts(),
+                _ => {}
+            },
+            MenuTarget::Shortcut(action) => match command {
+                MenuCommand::ShortcutChange => self.start_key_edit(action, false),
+                MenuCommand::ShortcutAdd => self.start_key_edit(action, true),
+                MenuCommand::ShortcutRemove => self.remove_shortcuts(action),
+                MenuCommand::ShortcutReset => self.reset_shortcuts(action),
+                _ => {}
+            },
             MenuTarget::Indent(id)
             | MenuTarget::LineEnding(id)
             | MenuTarget::Encoding(id)
+            | MenuTarget::ReadOnly(id)
             | MenuTarget::Language(id) => self.run_status_command(command, id),
             MenuTarget::BranchOps(_) => {
                 if let MenuCommand::GitBranch(op, i) = command
@@ -208,12 +324,28 @@ impl App {
                     self.run_branch_op(op, branch);
                 }
             }
+            MenuTarget::TagOps(_) => {
+                if let MenuCommand::PickerTag(op, i) = command {
+                    self.run_picker_tag(op, i);
+                }
+            }
             MenuTarget::Location(path, worktree) => match command {
+                MenuCommand::LocationThisWindow => {
+                    self.close_picker();
+                    self.switch_folder(&path);
+                }
                 MenuCommand::LocationNewWindow => self.open_in_new_window(&path),
                 MenuCommand::LocationReveal => self.reveal_in_file_manager(&path),
                 MenuCommand::LocationPrune => {
                     self.close_picker();
                     self.prune_worktrees();
+                }
+                MenuCommand::LocationMerge => {
+                    let tree = worktree.and_then(|i| self.git.worktrees.get(i));
+                    if let Some(name) = tree.and_then(|w| w.branch()).map(str::to_owned) {
+                        self.close_picker();
+                        self.git_merge_branch(name);
+                    }
                 }
                 MenuCommand::LocationRemove => {
                     if let Some(i) = worktree {
@@ -285,8 +417,11 @@ impl App {
                     }
                 }
                 MenuCommand::Cut => self.cut_entries(&self.tree_targets()),
-                MenuCommand::Copy => self.copy_entries(&self.tree_targets()),
-                MenuCommand::Delete => self.ask_delete_all(self.tree_targets()),
+                MenuCommand::Copy => {
+                    self.copy_entries(&self.tree_targets());
+                }
+                MenuCommand::Delete => self.ask_delete_all(self.tree_targets(), false),
+                MenuCommand::Download => self.pick(Pick::Download(self.tree_targets())),
                 MenuCommand::CopyPath => self.copy_paths(&selection, false),
                 MenuCommand::CopyRelativePath => self.copy_paths(&selection, true),
                 _ => {}
@@ -300,10 +435,14 @@ impl App {
                     self.git_file_history(path);
                 }
             }
+            MenuCommand::CommitCheck(on) => self.stage_paths(&[target], on),
+            MenuCommand::GitRollbackFile => self.confirm_rollback(vec![target]),
             MenuCommand::NewFile | MenuCommand::NewFolder => {
                 // 右键时已选中了那一行（空白处则取消选中），新建的位置由选中的行决定。
                 self.start_new_entry(command == MenuCommand::NewFolder);
             }
+            MenuCommand::AddFolder => self.ask_add_folder(),
+            MenuCommand::RemoveFolder => self.remove_folder(&target),
             MenuCommand::Reveal => self.reveal_in_file_manager(&target),
             MenuCommand::OpenInTerminal => self.open_in_terminal(Some(&target)),
             MenuCommand::FindInFolder => self.find_in_folder(&target),
@@ -315,6 +454,7 @@ impl App {
             MenuCommand::Copy => self.copy_entry(&target),
             // 右键时已选中了那一行（空白处则取消选中），粘贴到的目录由选中的行决定。
             MenuCommand::Paste => self.paste_into_tree(),
+            MenuCommand::Download => self.pick(Pick::Download(vec![target])),
             _ => {}
         }
     }
@@ -335,7 +475,8 @@ impl App {
             MenuCommand::TerminalMaximize => self.toggle_terminal_maximized(),
             MenuCommand::TerminalDock => self.toggle_terminal_position(),
             MenuCommand::NewTerminal => self.new_terminal_tab(),
-            MenuCommand::CloseTerminal => self.close_terminal_tab(self.terminal.active),
+            MenuCommand::SplitTerminal => self.split_terminal(),
+            MenuCommand::CloseTerminal => self.close_terminal_pane(),
             _ => {}
         }
     }
@@ -346,6 +487,9 @@ impl App {
         }
         match command {
             MenuCommand::ToggleBlame => self.toggle_blame(),
+            MenuCommand::GitAction(action) => {
+                self.run_action(action);
+            }
             MenuCommand::Cut => self.copy(true),
             MenuCommand::Copy => self.copy(false),
             MenuCommand::Paste => self.paste(),
@@ -363,10 +507,14 @@ impl App {
     }
 
     fn run_tab_command(&mut self, command: MenuCommand, id: DocumentId) {
-        let Some(index) = self.editor.index_of(id) else {
+        let Some(index) = self
+            .editor
+            .index_of(id)
+            .filter(|&i| i < self.editor.tab_count())
+        else {
             return;
         };
-        let docs = &self.editor.documents;
+        let docs = self.editor.tabs();
         let path = docs[index].path.clone();
 
         // 右键点在多选的标签上：关闭、关闭其他作用于选中的各个标签，关闭左侧、右侧以选中的
@@ -394,7 +542,28 @@ impl App {
                     self.git_file_history(&path);
                 }
             }
+            MenuCommand::CommitCheck(on) => {
+                if let Some(path) = path {
+                    self.stage_paths(&[path], on);
+                }
+            }
+            MenuCommand::GitRollbackFile => {
+                if let Some(path) = path {
+                    self.confirm_rollback(vec![path]);
+                }
+            }
             MenuCommand::Close => self.close_tab(index),
+            MenuCommand::SplitRight | MenuCommand::SplitDown => {
+                self.activate_tab(index);
+                let down = command == MenuCommand::SplitDown;
+                self.split_editor(if down { Axis::Column } else { Axis::Row });
+            }
+            MenuCommand::MoveToSplitRight | MenuCommand::MoveToSplitDown => {
+                self.activate_tab(index);
+                let down = command == MenuCommand::MoveToSplitDown;
+                self.move_to_split(if down { Axis::Column } else { Axis::Row });
+            }
+            MenuCommand::ReadOnly(on) => self.set_read_only(id, on),
             MenuCommand::CloseOthers => {
                 let ids = docs.iter().filter(|d| d.id != id).map(|d| d.id).collect();
                 self.close_tabs(ids);
@@ -489,11 +658,12 @@ impl App {
         })
     }
 
-    /// 返回 `path` 相对于已打开目录的路径；不在目录内或就是目录本身时返回 `None`。
+    /// 返回 `path` 相对于它所在的目录（打开的目录或附加的目录）的路径；不在这些目录内或就是
+    /// 目录本身时返回 `None`。
     pub(in crate::app) fn relative_path(&self, path: &Path) -> Option<String> {
-        let root = self.editor.root()?;
-        let relative = path.strip_prefix(root).ok()?;
-        (!relative.as_os_str().is_empty()).then(|| relative.to_string_lossy().into_owned())
+        let folder = self.editor.workspace.as_ref()?.folder_of(path)?;
+        let relative = winc_backend::relative_lossy(path, folder)?;
+        (!relative.is_empty()).then_some(relative)
     }
 
     /// 把 `path` 复制到剪贴板；`relative` 为 `true` 时复制相对于已打开目录的路径。
@@ -509,10 +679,7 @@ impl App {
         let lines: Vec<String> = if relative {
             paths.iter().filter_map(|p| self.relative_path(p)).collect()
         } else {
-            paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect()
+            paths.iter().map(|p| path_to_copy(p)).collect()
         };
         if lines.is_empty() {
             return;
@@ -550,7 +717,7 @@ impl App {
         let path = (!absolute)
             .then(|| self.relative_path(&path))
             .flatten()
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            .unwrap_or_else(|| path_to_copy(&path));
         let reference = if last > first {
             format!("{path}:{}-{}", first + 1, last + 1)
         } else {
@@ -564,23 +731,19 @@ impl App {
     ///
     /// 把「包含」填成 `./相对路径`，并展开过滤条件。
     pub(in crate::app) fn find_in_folder(&mut self, path: &Path) {
-        let dir = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(path)
-        };
+        let dir = self.folder_of(path);
         let include = self
-            .relative_path(dir)
+            .relative_path(&dir)
             .map(|relative| format!("./{relative}"))
             .unwrap_or_default();
 
-        if include != self.global.include.text() {
-            self.global.include.set_text(&include);
+        if include != self.panels.global.include.text() {
+            self.panels.global.include.set_text(&include);
         }
-        self.global.details_open |= !include.is_empty();
+        self.panels.global.details_open |= !include.is_empty();
         self.open_global_search(false);
 
-        if !self.global.query.text().is_empty() {
+        if !self.panels.global.query.text().is_empty() {
             self.global_changed(true);
         }
     }
@@ -588,10 +751,14 @@ impl App {
     /// 在文件树中就地改名：那一行变成输入框，填入原来的名字，并选中扩展名之前的部分；`↩` 确认，
     /// `Esc` 放弃。
     pub(in crate::app) fn start_rename(&mut self, path: &Path) {
-        self.goto_input = None;
+        self.bars.goto_input = None;
         let Some(ws) = &mut self.editor.workspace else {
             return;
         };
+        // 目录自己的一行不能改名。
+        if ws.is_folder_row(path) {
+            return;
+        }
         let Some(index) = ws.row_of(path) else {
             return;
         };
@@ -609,7 +776,7 @@ impl App {
         field.set_caret(0, false);
         field.set_caret(stem, true);
 
-        self.name_input = Some(NameInput {
+        self.panels.name_input = Some(NameInput {
             dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
             kind,
             index,
@@ -620,7 +787,7 @@ impl App {
             contents: None,
         });
         self.focus = Focus::Prompt;
-        self.field_preedit.clear();
+        self.ime.field_preedit.clear();
         self.scroll_tree_to(index, false);
         self.relayout();
         self.request_redraw();
@@ -629,35 +796,53 @@ impl App {
     /// 提交改名 `entry`：文件树同步更新，已打开文档换成新路径（内容和修改状态不变）。
     ///
     /// 失败时输入行保留，并显示原因。
-    pub(in crate::app) fn submit_rename(&mut self, mut entry: NameInput) {
+    pub(in crate::app) fn submit_rename(&mut self, entry: NameInput) {
         let Some((path, _)) = entry.rename.clone() else {
             return;
         };
         let input = entry.field.text().to_owned();
         // 先等待后台保存完成：保存的最后一步把临时文件改名为原路径，
-        // 在此之前改名会使旧路径上重新出现该文件。
-        self.wait_for_saves();
+        // 在此之前改名会使旧路径上重新出现该文件。远端的保存与改名在同一个线程上按顺序执行，
+        // 不需要在界面线程上等待。
+        if !winc_backend::is_remote(&path) {
+            self.wait_for_saves();
+        }
 
-        let renamed = self
-            .editor
-            .workspace
-            .as_mut()
-            .map(|ws| ws.rename(&path, &input));
+        let Some(root) = self.folder_root(&path) else {
+            return;
+        };
+        let (from, name) = (path.clone(), input);
+        let rename = move || winc_editor::rename_at(&root, &from, &name);
+        self.file_work(&path.clone(), rename, move |app, renamed| {
+            app.entry_renamed(entry, &path, renamed);
+        });
+    }
 
+    /// 改名完成：成功时更新文件树和已打开文档的路径，失败时恢复输入行并显示原因。
+    fn entry_renamed(
+        &mut self,
+        mut entry: NameInput,
+        path: &Path,
+        renamed: std::io::Result<PathBuf>,
+    ) {
         match renamed {
-            Some(Ok(target)) => {
-                self.paths_moved(&path, &target);
+            Ok(target) => {
+                if target != path
+                    && let Some(ws) = &mut self.editor.workspace
+                {
+                    ws.relocated(path, &target);
+                }
+                self.paths_moved(path, &target);
                 self.focus = Focus::Tree;
                 if let Some(index) = self.editor.workspace.as_ref().and_then(|w| w.selected) {
                     self.scroll_tree_to(index, false);
                 }
             }
-            Some(Err(e)) => {
+            Err(e) => {
                 entry.error = Some(e.to_string());
-                self.name_input = Some(entry);
+                self.panels.name_input = Some(entry);
                 self.focus = Focus::Prompt;
             }
-            None => {}
         }
 
         self.relayout();
@@ -666,57 +851,108 @@ impl App {
 
     /// 删除前先确认（[`App::show_confirm`]），确认后移到废纸篓。
     pub(in crate::app) fn ask_delete(&mut self, path: &Path) {
-        self.ask_delete_all(vec![path.to_path_buf()]);
+        self.ask_delete_all(vec![path.to_path_buf()], false);
     }
 
-    /// 一次删除 `paths` 里的各项（文件树里多选时）。
+    /// 一次删除 `paths` 里的各项（文件树里多选时）；`permanent` 时不经废纸篓，确认时说明无法恢复。
     ///
-    /// 根目录和目录以外的路径不删；一项都不剩时什么也不做。
-    pub(in crate::app) fn ask_delete_all(&mut self, mut paths: Vec<PathBuf>) {
-        let Some(root) = self.editor.root() else {
+    /// 打开的目录、附加的目录本身和它们以外的路径不删；一项都不剩时什么也不做。
+    pub(in crate::app) fn ask_delete_all(&mut self, mut paths: Vec<PathBuf>, permanent: bool) {
+        let Some(workspace) = &self.editor.workspace else {
             return;
         };
-        paths.retain(|path| path != root && path.starts_with(root));
+        paths.retain(|path| (workspace.folder_of(path)).is_some_and(|folder| folder != path));
         if paths.is_empty() {
             return;
         }
 
+        // 远端主机上和 WSL 发行版中的文件同样不经过废纸篓。
+        let permanent = permanent || crate::system::has_no_trash(&paths[0], cfg!(windows));
         if self.window.handle.is_some() {
-            let message = match paths.as_slice() {
-                [path] => {
-                    let name = winc_editor::display_name(path);
-                    if path.is_dir() {
-                        t!("common-trash-confirm-folder", name = name)
-                    } else {
-                        t!("common-trash-confirm-item", name = name)
-                    }
-                }
-                many => t!("common-trash-confirm-items", count = many.len()),
-            };
-            let detail = t!("common-trash-confirm-detail");
-            self.show_confirm(&message, detail, t!("common-trash-move"), move |ok| {
-                ok.then(|| UserEvent::Delete(paths.clone()))
+            let (message, detail, button) = self.delete_prompt(&paths, permanent);
+            self.show_confirm(&message, &detail, &button, move |ok| {
+                ok.then(|| UserEvent::Delete(paths.clone(), permanent))
             });
             return;
         }
 
         // 没有窗口（测试中）时直接删除。
-        self.delete_entries(&paths);
+        self.delete_entries(&paths, permanent);
     }
 
-    /// 把 `paths` 里的各项移到废纸篓。
+    /// 返回删除 `paths` 前确认框的问题、说明和按钮；`permanent` 时说明无法恢复。
+    pub(in crate::app) fn delete_prompt(
+        &self,
+        paths: &[PathBuf],
+        permanent: bool,
+    ) -> (String, String, String) {
+        let message = match paths {
+            [path] => {
+                let name = winc_editor::display_name(path);
+                // 类别取自文件树：远端的路径不能在界面线程上查询。
+                let folder = self.is_folder(path);
+                match (folder, permanent) {
+                    (true, false) => t!("common-trash-confirm-folder", name = name),
+                    (false, false) => t!("common-trash-confirm-item", name = name),
+                    (true, true) => t!("common-delete-confirm-folder", name = name),
+                    (false, true) => t!("common-delete-confirm-item", name = name),
+                }
+            }
+            many if permanent => t!("common-delete-confirm-items", count = many.len()),
+            many => t!("common-trash-confirm-items", count = many.len()),
+        };
+        let (detail, button) = if permanent {
+            (
+                t!("common-delete-confirm-detail"),
+                t!("common-delete-button"),
+            )
+        } else {
+            (t!("common-trash-confirm-detail"), t!("common-trash-move"))
+        };
+        (message, detail.to_string(), button.to_string())
+    }
+
+    /// 把 `paths` 里的各项删除：`permanent` 时直接删除，否则移到废纸篓（远端的路径总是直接
+    /// 删除）。
     ///
     /// 其中文件对应的标签：没有修改的关闭，有修改的保留，内容仍在，保存时会重新创建文件。
     /// 某一项删除失败时提示原因，其余各项仍然删除。
-    pub(in crate::app) fn delete_entries(&mut self, paths: &[PathBuf]) {
-        // 先等待后台保存完成，否则已删除的文件会被保存重新写出。
-        self.wait_for_saves();
+    pub(in crate::app) fn delete_entries(&mut self, paths: &[PathBuf], permanent: bool) {
+        // 先等待后台保存完成，否则已删除的文件会被保存重新写出。远端的保存与删除按顺序执行。
+        if !paths.iter().any(|path| winc_backend::is_remote(path)) {
+            self.wait_for_saves();
+        }
+        let Some(first) = paths.first().cloned() else {
+            return;
+        };
+        let (trash, paths) = (self.trash, paths.to_vec());
+        let delete = move || {
+            let remove = |path: &PathBuf| match permanent || winc_backend::is_remote(path) {
+                true => winc_backend::fs::remove_all(path),
+                false => trash(path),
+            };
+            let results: Vec<std::io::Result<()>> = paths.iter().map(remove).collect();
+            (paths, results)
+        };
+        self.file_work(&first, delete, move |app, (paths, results)| {
+            app.entries_deleted(paths, results, permanent);
+        });
+    }
+
+    /// 删除完成：关闭对应的标签，更新文件树并提示；`results` 是 `paths` 中各项的结果，
+    /// `permanent` 表示没有经过废纸篓。
+    fn entries_deleted(
+        &mut self,
+        paths: Vec<PathBuf>,
+        results: Vec<std::io::Result<()>>,
+        permanent: bool,
+    ) {
         let mut deleted = Vec::new();
-        for path in paths {
-            match (self.trash)(path) {
-                Ok(()) => deleted.push(path.clone()),
+        for (path, result) in paths.into_iter().zip(results) {
+            match result {
+                Ok(()) => deleted.push(path),
                 Err(e) => {
-                    let name = winc_editor::display_name(path);
+                    let name = winc_editor::display_name(&path);
                     let error = e.to_string();
                     self.notify(t!("common-trash-delete-failed", name = name, error = error));
                 }
@@ -738,7 +974,7 @@ impl App {
             })
             .map(|d| d.id)
             .collect();
-        self.remove_tabs(&ids);
+        self.close_documents(&ids);
 
         // 选中原位置上的下一行，便于继续用 `⌘⌫` 连续删除。
         if let Some(ws) = &mut self.editor.workspace {
@@ -748,15 +984,20 @@ impl App {
             ws.refresh();
             let count = ws.rows().len();
             ws.select(was.filter(|_| count > 0).map(|i| i.min(count - 1)));
-            self.tree.motion = None;
+            self.panels.tree.motion = None;
             self.clamp_tree_scroll();
         }
 
         let message = match deleted.as_slice() {
+            [path] if permanent => t!(
+                "common-deleted-item",
+                name = winc_editor::display_name(path)
+            ),
             [path] => {
                 let name = winc_editor::display_name(path);
                 t!("common-trash-moved-item", name = name)
             }
+            many if permanent => t!("common-deleted-items", count = many.len()),
             many => t!("common-trash-moved-items", count = many.len()),
         };
         self.picker_touched(deleted);
@@ -781,7 +1022,12 @@ impl App {
     /// 没有目标时返回 `None`。
     pub(in crate::app) fn shortcut_target(&self) -> Option<PathBuf> {
         if self.focus == Focus::Results {
-            return self.global.selected.as_ref().map(|(path, _)| path.clone());
+            return self
+                .panels
+                .global
+                .selected
+                .as_ref()
+                .map(|(path, _)| path.clone());
         }
         if self.focus == Focus::Tree {
             return self
@@ -805,4 +1051,13 @@ fn tree_tool_of(command: MenuCommand) -> Option<TreeTool> {
         MenuCommand::TreeLocate => TreeTool::Locate,
         _ => return None,
     })
+}
+
+/// 返回复制路径时给出的文字：WSL 发行版中的路径给出发行版内的写法（`/home/…`），拿到那个
+/// 发行版的终端里可以直接使用；其余路径照所在系统的写法。
+fn path_to_copy(path: &Path) -> String {
+    match winc_editor::wsl::locate_here(path) {
+        Some(place) => place.path,
+        None => winc_backend::native_lossy(path).into_owned(),
+    }
 }

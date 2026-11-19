@@ -47,8 +47,10 @@ fn only_plain_entry_into_the_default_shell_is_injected() {
 fn environment_for_wsl_keeps_what_the_user_forwards() {
     let mut env = vec![(b"WSLENV".to_vec(), b"GOPATH/l".to_vec())];
     forward_to_wsl(&mut env);
-    let forwarded = b"GOPATH/l:WINC_NONCE:WINC_PROMPT:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION";
+    let mut forwarded = b"GOPATH/l:".to_vec();
+    forwarded.extend_from_slice(WSL_ENV);
     assert_eq!(env[0].1, forwarded);
+    assert!(WSL_ENV.starts_with(b"WINC_NONCE:WINC_PROMPT:WINC_PYTHON:"));
 
     let mut env = Vec::new();
     forward_to_wsl(&mut env);
@@ -174,4 +176,34 @@ mod boot {
         assert!(!vars.contains_key("WINC_NONCE"));
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn a_remote_shell_gets_a_fresh_nonce_in_its_command() {
+    let command = |text: &str| vec![b"-t".to_vec(), b"host".to_vec(), text.as_bytes().to_vec()];
+    // 只换最后一处：目录名里恰好有这个记号时不动它。
+    let mut args = command("cd '/a @WINC_NONCE@' && exec sh -c 'x' winc @WINC_NONCE@ 1");
+    let nonce = inject_remote(b"/usr/bin/ssh", &mut args).unwrap();
+    assert_eq!(nonce.len(), 32);
+    let expected = format!("cd '/a @WINC_NONCE@' && exec sh -c 'x' winc {nonce} 1");
+    assert_eq!(args[2], expected.as_bytes());
+    assert_eq!(args[..2], command("")[..2]);
+    let mut again = command("exec sh -c 'x' winc @WINC_NONCE@ 1");
+    assert_ne!(inject_remote(b"ssh", &mut again).unwrap(), nonce);
+
+    // 没有记号的命令、别的程序、没有参数：不注入，参数不变。
+    let mut plain = command("cd '/a' && exec $SHELL -l");
+    assert_eq!(inject_remote(b"ssh", &mut plain), None);
+    assert_eq!(plain, command("cd '/a' && exec $SHELL -l"));
+    let mut other = command("@WINC_NONCE@");
+    assert_eq!(inject_remote(b"/bin/zsh", &mut other), None);
+    assert_eq!(other, command("@WINC_NONCE@"));
+    assert_eq!(inject_remote(b"ssh", &mut []), None);
+    assert!(
+        inject_remote(
+            br"C:\Windows\System32\OpenSSH\ssh.exe",
+            &mut command("@WINC_NONCE@")
+        )
+        .is_some()
+    );
 }

@@ -166,3 +166,49 @@ fn tooltip_lines_wrap_to_the_room_and_keep_continuations_in_the_body() {
         vec![("abc", true), ("def", true), ("abc def", false)]
     );
 }
+
+/// 同名的最近目录截短上级目录时从开头截去，保留区分彼此的部分，放得下时多保留几级；没有同名
+/// 目录时仍从中间截短。
+#[test]
+fn same_named_recent_folders_keep_the_part_that_tells_them_apart() {
+    let mut renderer = Renderer::offscreen(10.0, 10.0, 2.0, Color::hex(0), None, None)
+        .expect("测试机上有系统字体");
+    renderer.draw(|frame| {
+        let size = 11.0;
+        let text = "~/work/clients/companyA/projects".to_owned();
+        let keep = text.find("companyA");
+        let width = |frame: &mut Frame<'_>, s: &str| frame.measure(FontKind::Ui, size, s);
+        let full = width(frame, &text);
+        let parent = Parent { text, keep };
+        assert_eq!(fit_parent(frame, &parent, size, full), parent.text);
+
+        let short = "…/companyA/projects";
+        let max = width(frame, short);
+        assert_eq!(fit_parent(frame, &parent, size, max), short);
+        let longer = "…/clients/companyA/projects";
+        let max = width(frame, longer);
+        assert_eq!(fit_parent(frame, &parent, size, max), longer);
+        // 保留的一段也放不下时截去它的末尾，开头的 `companyA` 仍在。
+        let max = width(frame, "…/companyA/pr…");
+        let tight = fit_parent(frame, &parent, size, max);
+        assert!(tight.starts_with("…/companyA"), "{tight}");
+
+        let unique = Parent {
+            keep: None,
+            ..parent.clone()
+        };
+        let max = width(frame, short);
+        let middle = fit_parent(frame, &unique, size, max);
+        assert!(middle.starts_with("~/") && middle.contains('…'), "{middle}");
+    });
+}
+
+/// 分支选择器中名字优先：右端的上游、时间使用剩余的宽度，不足时不显示。
+#[test]
+fn picker_meta_only_uses_what_the_name_leaves() {
+    use crate::view::git::picker::meta_room;
+    assert_eq!(meta_room(300.0, 120.0), Some(180.0));
+    assert_eq!(meta_room(300.0, 252.0), Some(48.0));
+    assert_eq!(meta_room(300.0, 256.0), None);
+    assert_eq!(meta_room(300.0, 420.0), None);
+}

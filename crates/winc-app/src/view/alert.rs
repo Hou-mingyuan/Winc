@@ -5,7 +5,7 @@
 //! （`view/dialog.rs`）相同。各部分的位置记回提示框，悬停和点击按它判断。
 
 use super::*;
-use crate::app::{AlertPart, AlertParts};
+use crate::app::{AlertPart, AlertParts, InAppAlert};
 
 /// 卡片的内边距（逻辑像素）。
 const PAD: f32 = SETTINGS_PAD;
@@ -17,12 +17,14 @@ const BUTTON_PAD: f32 = 14.0;
 const BUTTON_GAP: f32 = 8.0;
 /// 主句、说明一行的高度（逻辑像素）。
 const LINE: f32 = 20.0;
+/// 卡片的最小宽度（逻辑像素）；内容更宽时加宽，最宽与功能对话框相同（`DIALOG_W`）。
+const MIN_W: f32 = 320.0;
 
 /// 绘制窗口内的提示框（打开着时），并把各部分的位置记回提示框；关闭后淡出期间绘制最后一帧。
 pub(super) fn draw(app: &mut App, frame: &mut Frame<'_>) {
-    app.track_card(Card::Alert, app.alert.is_some());
-    let Some(alert) = app.alert.as_ref() else {
-        if let Some((clock, _, _)) = app.alert_card.closing() {
+    app.track_card(Card::Alert, app.overlays.alert.is_some());
+    let Some(alert) = app.overlays.alert.as_ref() else {
+        if let Some((clock, _, _)) = app.motion.alert_card.closing() {
             let fade = dialog_curve(false, clock).0;
             let scrim = app.palette.scrim;
             frame.rect(app.layout.window, scrim.alpha(scrim.a * fade));
@@ -32,9 +34,13 @@ pub(super) fn draw(app: &mut App, frame: &mut Frame<'_>) {
     };
     let p = app.palette;
     let window = app.layout.window;
-    let width = DIALOG_W.min(window.w - 32.0).max(160.0);
-    let text_w = width - 2.0 * PAD;
     let (size, small) = (app.fonts.ui, app.fonts.ui_small);
+    let width = (natural_width(frame, (size, small), alert) + 2.0 * PAD)
+        .clamp(MIN_W, DIALOG_W)
+        .min(window.w - 32.0)
+        .max(160.0)
+        .round();
+    let text_w = width - 2.0 * PAD;
 
     let message: Vec<String> = lines(frame, size, &alert.message, text_w);
     let detail: Vec<String> = if alert.detail.is_empty() {
@@ -56,7 +62,7 @@ pub(super) fn draw(app: &mut App, frame: &mut Frame<'_>) {
         height,
     );
 
-    let fade = match app.alert_card.motion {
+    let fade = match app.motion.alert_card.motion {
         Some((true, clock)) => dialog_curve(true, clock).0,
         _ => 1.0,
     };
@@ -73,7 +79,7 @@ fn draw_contents(
     card: Rect,
     (message, detail): (&[String], &[String]),
 ) {
-    let Some(alert) = app.alert.as_ref() else {
+    let Some(alert) = app.overlays.alert.as_ref() else {
         return;
     };
     let p = app.palette;
@@ -131,9 +137,29 @@ fn draw_contents(
         row
     });
 
-    if let Some(alert) = app.alert.as_mut() {
+    if let Some(alert) = app.overlays.alert.as_mut() {
         alert.parts = AlertParts { buttons, checkbox };
     }
+}
+
+/// 返回不折行时提示框内容的宽度（逻辑像素）：主句、说明各段与按钮一行（含勾选框）中最宽的。
+fn natural_width(frame: &mut Frame<'_>, (size, small): (f32, f32), alert: &InAppAlert) -> f32 {
+    let mut widest = |size: f32, text: &str| {
+        (text.split('\n'))
+            .map(|line| frame.measure(FontKind::Ui, size, line))
+            .fold(0.0, f32::max)
+    };
+    let text = widest(size, &alert.message).max(widest(small, &alert.detail));
+    let buttons: f32 = (alert.buttons.iter())
+        .map(|b| {
+            (frame.measure(FontKind::Ui, size, &b.title) + 2.0 * BUTTON_PAD).max(DIALOG_BUTTON_W)
+        })
+        .sum::<f32>()
+        + BUTTON_GAP * alert.buttons.len().saturating_sub(1) as f32;
+    let checkbox = (alert.suppression.as_deref()).map_or(0.0, |text| {
+        frame.measure(FontKind::Ui, size, text) + 20.0 + 2.0 * BUTTON_GAP
+    });
+    text.max(buttons + checkbox)
 }
 
 /// 按宽度 `width` 折好 `text`：先按换行符分段，每段再折行；空行保留。

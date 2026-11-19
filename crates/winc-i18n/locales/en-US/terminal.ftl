@@ -2,18 +2,22 @@
 
 terminal-dock-bottom = Dock to bottom
 terminal-dock-right = Dock to right
+terminal-maximize-panel = Maximize panel
+terminal-restore-panel = Restore panel
 terminal-hide-panel = Hide terminal panel
 terminal-show-panel = Show terminal panel
 terminal-tab-default-name = Terminal
+terminal-new = New Terminal
 terminal-module-disabled = The terminal module isn’t enabled
 
 ## Terminal helper
 
 terminal-helper-missing = Couldn’t find the terminal helper; reinstall Winc
 terminal-helper-start-failed = Couldn’t start the terminal helper: { $error }
+terminal-needs-conpty = The terminal needs Windows 10 version 1809 or later
 terminal-helper-exited = The terminal helper exited
 terminal-helper-version-mismatch = The terminal helper’s version doesn’t match Winc; reinstall Winc
-terminal-process-exited = Process exited (code { $code })
+terminal-process-exited = Process exited (exit code { $code })
 terminal-disconnected = Terminal connection lost
 terminal-restart = Restart
 terminal-restart-confirm = Restart this terminal?
@@ -78,6 +82,13 @@ terminal-paste-confirm = { $count ->
        *[other] Paste { $count } lines into the terminal?
     }
 terminal-paste-confirm-detail = The program in the terminal hasn’t enabled bracketed paste, so each line will run as a separate command right away.
+terminal-upload-started = Sending the clipboard to { $host }…
+terminal-upload-failed = Couldn’t send the clipboard to the remote host: { $error }
+terminal-upload-folder = Folders can’t be pasted into a remote terminal: { $name }
+terminal-upload-too-large = { $size } is too large to send to the remote host ({ $limit } at most)
+terminal-upload-no-image = Couldn’t read the image on the clipboard
+terminal-upload-no-folder = Couldn’t create a folder for it on the remote host
+terminal-upload-elsewhere = Sent to the remote host: { $path }
 
 ## 运行配置。
 
@@ -91,9 +102,14 @@ terminal-run-confirm-command = Command: { $command }
 terminal-run-confirm-cwd = Working directory: { $cwd }
 terminal-run-confirm-env = Environment variable: { $variable }
 terminal-run-confirm-action = Run
+terminal-python-confirm = Load this project’s Python environment in terminals?
+terminal-python-confirm-detail = The environment is at { $path }. Once loaded, its programs run ahead of system commands with the same name. Load it only if you trust this project.
+terminal-python-confirm-action = Load
+terminal-python-confirm-decline = Don’t Load
 terminal-run-config-problem = Run configurations (.winc/run.json): { $problem }
 terminal-run-create-failed = Couldn’t create run configurations: { $error }
 terminal-run-add = Add Run Configuration
+terminal-run-remote = Folders on a remote host have no run configurations
 terminal-run-stopped = Stopped
 terminal-run-finished = Completed
 terminal-run-failed = “{ $name }” failed (exit code { $code })

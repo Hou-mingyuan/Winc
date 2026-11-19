@@ -6,6 +6,8 @@
 //! 刷新仓库状态，并重新读被改动过的文件。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use winc_editor::git::{Branch, BranchDeleted, Carried, Git, Operation, Remote, Stash};
@@ -68,6 +70,10 @@ impl BranchOp {
 /// 对日志里一个标签做的事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TagOp {
+    /// 从该标签新建分支（输入名字）。
+    NewBranch,
+    /// 把该标签指向的提交合并到当前分支。
+    Merge,
     /// 推送到远程仓库。
     Push,
     /// 删除本地标签（先确认）。
@@ -78,11 +84,19 @@ pub enum TagOp {
 
 impl TagOp {
     /// 全部操作，顺序就是子菜单里的顺序。
-    pub const ALL: [TagOp; 3] = [TagOp::Push, TagOp::Delete, TagOp::DeleteRemote];
+    pub const ALL: [TagOp; 5] = [
+        TagOp::NewBranch,
+        TagOp::Merge,
+        TagOp::Push,
+        TagOp::Delete,
+        TagOp::DeleteRemote,
+    ];
 
     /// 子菜单里的文字。
     pub fn label(self) -> &'static str {
         match self {
+            TagOp::NewBranch => t!("git-branch-new-from"),
+            TagOp::Merge => t!("git-branch-merge-into-current"),
             TagOp::Push => t!("git-tag-push"),
             TagOp::Delete => t!("git-tag-delete"),
             TagOp::DeleteRemote => t!("git-tag-delete-remote"),
@@ -184,7 +198,9 @@ pub(crate) struct BranchState {
     /// 后台送达的输入请求及其所属操作的编号。
     pub(super) questions: QuestionChannel,
     /// 对话框正在处理的请求：所属操作的编号和答复通道；丢弃通道表示取消。
-    pub(in crate::app) asking: Option<(u64, Sender<String>)>,
+    pub(in crate::app) asking: Option<(super::question::Asker, Sender<String>)>,
+    /// 正在询问的登录请求的「记住密码」标记；该请求不提供此选项时为 `None`。
+    pub(in crate::app) remember: Option<Arc<AtomicBool>>,
     /// 用户是否取消了当前操作的输入请求；为真时该操作的失败不按错误提示。
     pub(in crate::app) declined: bool,
     /// 登录对话框中填写的密码及其远程地址，用于答复随后的密码请求，操作结束时清除。
@@ -200,13 +216,14 @@ impl Default for BranchState {
             results: channel(),
             questions: channel(),
             asking: None,
+            remember: None,
             declined: false,
             password: None,
         }
     }
 }
 
-/// 提交视图「⋯」里的 Git 操作：进行中的合并、变基的继续和中止，储藏更改，远程仓库。
+/// 提交视图「⋯」里的 Git 操作：进行中的合并、变基的继续、跳过和中止，储藏更改，远程仓库。
 ///
 /// 拉取、推送、获取和新建分支、工作树都在分支选择器里，各条储藏在改动列表下面的储藏一组里，回滚
 /// 勾选的文件在组标题上，这里不再列出。
@@ -218,8 +235,12 @@ pub(crate) fn branch_menu(
     use MenuCommand::*;
     let mut entries = Vec::new();
     // 合并、变基停下来等着处理冲突：最上面是继续和中止。
-    if operation.is_some() {
+    if let Some(operation) = operation {
         entries.push(MenuEntry::Item(GitContinue, !busy));
+        // 合并只有一个提交，没有可以跳过的。
+        if operation != Operation::Merge {
+            entries.push(MenuEntry::Item(GitSkip, !busy));
+        }
         entries.push(MenuEntry::Item(GitAbort, !busy));
         entries.push(MenuEntry::Separator);
     }
@@ -241,6 +262,23 @@ pub(crate) fn branch_menu(
     items.push(MenuEntry::Item(GitAddRemote, !busy));
     entries.push(MenuEntry::Submenu(t!("git-remotes-menu").to_owned(), items));
     entries
+}
+
+/// 分支选择器里第 `index` 个标签的操作菜单，和分支的菜单同样分组：签出和新建、合并到当前
+/// 分支、推送、删除，组之间有分隔线。
+pub(crate) fn tag_ops(index: usize, busy: bool) -> Vec<MenuEntry> {
+    let item = |op: Option<TagOp>| MenuEntry::Item(MenuCommand::PickerTag(op, index), !busy);
+    vec![
+        item(None),
+        item(Some(TagOp::NewBranch)),
+        MenuEntry::Separator,
+        item(Some(TagOp::Merge)),
+        MenuEntry::Separator,
+        item(Some(TagOp::Push)),
+        MenuEntry::Separator,
+        item(Some(TagOp::Delete)),
+        item(Some(TagOp::DeleteRemote)),
+    ]
 }
 
 /// 第 `index` 条储藏的菜单：应用、应用并删除，分隔线，删除（删除先确认）。
@@ -403,11 +441,14 @@ impl App {
                 }
             }
             GitStash => self.open_stash_prompt(),
-            GitContinue | GitAbort => {
+            GitContinue | GitSkip | GitAbort => {
                 let Some(operation) = self.git.status.as_ref().and_then(|s| s.operation) else {
                     return;
                 };
                 match command {
+                    GitSkip => self.git_operate(t!("git-op-skip").into(), move |git, root| {
+                        git.skip_operation(root, operation)
+                    }),
                     // 合并在提交视图里完成：写好（已经填上的）提交信息再提交。
                     GitContinue if operation == Operation::Merge => self.show_commit(),
                     GitContinue => self
@@ -441,13 +482,21 @@ impl App {
         }
     }
 
+    /// 把分支 `name` 合并到当前分支。
+    pub(in crate::app) fn git_merge_branch(&mut self, name: String) {
+        self.git_operate(
+            t!("git-op-merge", name = name.as_str()),
+            move |git, root| git.operate(root, &["merge", "--no-edit", "--end-of-options", &name]),
+        );
+    }
+
     /// 对分支 `branch` 执行操作菜单中的 `op`。
     pub(in crate::app) fn run_branch_op(&mut self, op: BranchOp, branch: Branch) {
         let name = branch.name.clone();
         match op {
             // 分支已经在其他工作树里签出：git 不允许重复签出，改为切到该工作树。
             BranchOp::Checkout if let Some(i) = self.git.worktree_holding(local_name(&branch)) => {
-                self.open_worktree(i, false);
+                self.open_worktree_asking(i);
             }
             BranchOp::NewWorktree => self.new_worktree_for(&branch),
             BranchOp::Checkout if branch.remote => {
@@ -477,12 +526,7 @@ impl App {
             BranchOp::NewFrom => {
                 self.open_branch_dialog(Some(name), None);
             }
-            BranchOp::Merge => self.git_operate(
-                t!("git-op-merge", name = name.as_str()),
-                move |git, root| {
-                    git.operate(root, &["merge", "--no-edit", "--end-of-options", &name])
-                },
-            ),
+            BranchOp::Merge => self.git_merge_branch(name),
             BranchOp::Rebase => self.git_operate(
                 t!("git-op-rebase-onto", name = name.as_str()),
                 move |git, root| git.operate(root, &["rebase", "--end-of-options", &name]),
@@ -709,24 +753,28 @@ impl App {
         what: String,
         work: impl FnOnce(&Git, &Path) -> Result<(String, Then), String> + Send + 'static,
     ) {
-        if self.branch.running.is_some() {
+        if self.git.branch.running.is_some() {
             self.flash(t!("git-op-busy"));
             return;
         }
         let root = self.git.root.clone();
-        let sender = self.branch.results.0.clone();
-        self.branch.running = Some(what.clone());
-        self.branch.finished = None;
-        self.branch.declined = false;
-        self.branch.started += 1;
-        let id = self.branch.started;
-        let wake = self.proxy.clone();
-        let questions = self.branch.questions.0.clone();
+        let sender = self.git.branch.results.0.clone();
+        self.git.branch.running = Some(what.clone());
+        self.git.branch.finished = None;
+        self.git.branch.declined = false;
+        self.git.branch.started += 1;
+        let id = self.git.branch.started;
+        let wake = self.link.proxy.clone();
+        let questions = self.git.branch.questions.0.clone();
+        // 凭据只为本机运行的 `git` 保存：远端主机和发行版中的 `git` 访问不到本机的凭据存储。
+        let remember = self.config.git_remember_credentials != Some(false)
+            && winc_editor::git::runs_here(&dir);
         self.spawn_git(UserEvent::GitOperated, move |tool| {
             let result = match tool {
                 Ok(git) => {
                     // 端点只在操作期间存在，`listener` 在本分支结束时被丢弃。
-                    let listener = wake.and_then(|proxy| question::listen(proxy, questions, id));
+                    let listener =
+                        wake.and_then(|proxy| question::listen(proxy, questions, id, remember));
                     let askpass = listener.as_ref().and_then(Listener::askpass);
                     work(&git.with_askpass(askpass), &dir)
                 }
@@ -744,19 +792,20 @@ impl App {
 
     /// 同步控件上对勾的不透明度：过渡和侧栏里展开、收起的时长相同，没有对勾时为 0。
     pub(crate) fn sync_check(&self) -> f32 {
-        self.branch
+        self.git
+            .branch
             .finished
             .map_or(0.0, |clock| clock.pulse(TREE_ANIMATION))
     }
 
     /// 收下后台做完的分支操作。
     pub(in crate::app) fn poll_branch_ops(&mut self) {
-        while let Ok(done) = self.branch.results.1.try_recv() {
+        while let Ok(done) = self.git.branch.results.1.try_recv() {
             self.end_git_questions(done.id);
             // 做的时候换了目录（换的时候 `running` 已经清掉，见 `git_folder_changed`）：只说一声在
             // 哪个仓库里做完了；新建的工作树仍然打开，检查完的不再移除。换回原来的目录、又起了新
             // 操作时根目录对得上但不是正在做的这个，同样按旧结果处理，不清掉新操作的 `running`。
-            let stale = self.branch.running.is_none() || self.branch.started != done.id;
+            let stale = self.git.branch.running.is_none() || self.git.branch.started != done.id;
             if stale || self.git.root != done.root {
                 let root = done.root.unwrap_or_default();
                 let name = winc_editor::display_name(&root);
@@ -784,7 +833,8 @@ impl App {
                 }
                 continue;
             }
-            self.branch.running = None;
+            self.git.branch.running = None;
+            self.git.logs_outdated |= done.result.is_ok();
             // 操作由表单对话框发起时：成功则关闭对话框，失败则在对话框中显示原因。
             let error = done.result.as_ref().err().map(String::as_str);
             if self.form_operation_done(done.id, error) && error.is_some() {
@@ -806,7 +856,7 @@ impl App {
                     self.worktree_done(then);
                     // 只更新帧间隔：对勾是操作结果，动态效果关闭时也要显示。
                     let _ = self.clock(COMMITTED_SHOWN);
-                    self.branch.finished = Some(Clock::new(COMMITTED_SHOWN));
+                    self.git.branch.finished = Some(Clock::new(COMMITTED_SHOWN));
                 }
                 Err(e) => {
                     let what = done.what;

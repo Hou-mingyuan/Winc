@@ -6,6 +6,8 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "shells/python.rs"]
+mod python;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -45,10 +47,17 @@ impl Drop for Temp {
 }
 
 fn find(shell: &str) -> Option<String> {
-    ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+    let mut dirs: Vec<PathBuf> = ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
         .iter()
-        .map(|dir| format!("{dir}/{shell}"))
-        .find(|path| Path::new(path).exists())
+        .map(PathBuf::from)
+        .collect();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join(shell))
+        .find(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 fn env(home: &Path, extra: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -124,6 +133,7 @@ impl Shell {
         let text = command.trim_start();
         let new = |b: &Block| b.text.trim_start() == text && !seen.contains(&b.id);
         self.input(&format!("{command}\r"));
+        self.client.waiting = format!("命令「{command}」的块结束，结束行是提示符");
         // 块的消息不受额度限制，屏幕可能尚未更新：等到结束行在屏幕上是提示符。
         self.until(|c, blocks| {
             blocks
@@ -136,6 +146,7 @@ impl Shell {
                         .is_some_and(|l| l.marks.flags & Marks::PROMPT != 0)
                 })
         });
+        self.client.waiting.clear();
         self.blocks.iter().find(|b| new(b)).unwrap().clone()
     }
 
@@ -241,19 +252,27 @@ fn bash_as_a_login_shell_reads_the_profile() {
     let t = Temp::new("bash");
     t.write(
         "home/.bash_profile",
-        "PS1='[$?] bb$ '\nPROMPT_COMMAND='USER_PC=$?'\nHISTCONTROL=ignorespace\n",
+        "PS1='[$?] bb$ '\nPROMPT_COMMAND='USER_PC=$?'\nHISTCONTROL=ignoreboth\n",
     );
     let mut sh = Shell::start(&bash, true, env(&t.home(), &[]), &t.0.join("shell"));
     sh.client.until_text("bb$");
     sh.check("none");
     // 用户自己的 `PROMPT_COMMAND` 照常运行，看到的是命令的退出码；`PS1` 里的 `$?` 同样如此。
-    sh.run("false");
-    sh.client.until_text("[1] bb$");
+    // 屏幕上更早的行也有 `[1] bb$`（`check` 运行过失败的命令），只看这条命令之后的提示符。
+    let failed = sh.run("false");
+    let prompt = failed.end.unwrap() as usize;
+    sh.client.waiting = format!("第 {prompt} 行的提示符以「[1] bb$」开头");
+    sh.until(|c, _| c.screen[prompt].text.starts_with("[1] bb$"));
+    sh.client.waiting.clear();
     let pc = sh.run("echo $USER_PC");
     assert_eq!(sh.output(&pc), "1");
     // 钩子不改变 `$_` 的值。
     let last = sh.run("true abc && echo $_");
     assert_eq!(sh.output(&last), "abc");
+    // 重复执行的命令不再记入历史（`ignoredups`），仍报告整行，不只是管道的第一段。
+    sh.run("echo dup | cat");
+    let again = sh.run("echo dup | cat");
+    assert_eq!(sh.output(&again), "dup");
     // 未记入历史的命令（首字符为空格，`HISTCONTROL=ignorespace`）仍报告该命令自身的命令行。
     let hidden = sh.run(" echo hidden");
     assert_eq!(sh.output(&hidden), "hidden");

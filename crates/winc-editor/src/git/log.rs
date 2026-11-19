@@ -53,6 +53,8 @@ pub struct LogView {
     pub query: LogQuery,
     /// 正在比较两个版本（两个提交，或者两个分支）：详情一栏换成两者之间改了的文件。
     pub compare: Option<Compare>,
+    /// 发起或退出比较的次数；与输入的版本比较的结果返回时次数已变即为过时，不再使用。
+    pub compare_request: u64,
     /// 重取了、新的第一批还没到。
     ///
     /// `commits`、`graph` 还是重取之前的内容，仍然可以显示和点击，第一批到达时整体替换
@@ -125,6 +127,10 @@ pub struct Compare {
     pub from: String,
     /// 新的一边。
     pub to: String,
+    /// `from` 由输入的分支名或标签名解析而来时的那个名称，显示时代替提交号。
+    pub from_name: Option<String>,
+    /// `to` 由输入的分支名或标签名解析而来时的那个名称，显示时代替提交号。
+    pub to_name: Option<String>,
     /// 改了的文件；取回来之前为 `None`。
     pub files: Option<Vec<CommitFile>>,
     /// 取文件列表失败的原因。
@@ -138,10 +144,16 @@ pub struct Details {
     pub oid: String,
     /// 完整的说明。
     pub message: Option<String>,
-    /// 改动的文件（和第一个父提交比）。
+    /// 改动的文件（和 `base` 比）。
     pub files: Option<Vec<CommitFile>>,
+    /// 改动的文件对照的版本：第一个父提交，根提交为 `None`。按路径筛选的日志里列表上的父提交
+    /// 是改写过的（[`crate::git::LogQuery::rewrites_parents`]），这里是真正的父提交。
+    pub base: Option<String>,
     /// 取详情失败的原因。
     pub error: Option<String>,
+    /// 包含该提交的本地分支和远程分支（[`crate::git::Git::containing_branches`]），本地的在前；
+    /// 取回来之前为 `None`。分支随时会变，重取日志时作废。
+    pub branches: Option<Vec<String>>,
 }
 
 impl LogView {
@@ -245,6 +257,19 @@ impl LogView {
         self.error = None;
         if self.selected.is_none() {
             self.details = None;
+        }
+        // 重取多半是分支变了（提交、拉取、切换）：包含各提交的分支重新查。
+        let details = self.details.iter_mut().chain(&mut self.previous);
+        for d in details.chain(&mut self.cache) {
+            d.branches = None;
+        }
+    }
+
+    /// 记下包含提交 `oid` 的分支：选中的、之前显示的和缓存里的详情一并更新。
+    pub fn set_branches(&mut self, oid: &str, branches: &[String]) {
+        let details = self.details.iter_mut().chain(&mut self.previous);
+        for d in details.chain(&mut self.cache).filter(|d| d.oid == oid) {
+            d.branches = Some(branches.to_vec());
         }
     }
 

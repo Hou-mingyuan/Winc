@@ -7,27 +7,39 @@ use std::path::{Path, PathBuf};
 
 use crate::json::Json;
 
-/// 最近目录和各目录现场的最大数量（个）。
-///
-/// 取 10（经验值），作用于最近项目菜单、每个目录现场的保存数量和徽章颜色分配。
-pub const MAX_RECENT: usize = 10;
+/// 最近打开的目录的最大数量（个），全部列在「打开最近的目录」中。
+pub const MAX_RECENT: usize = 50;
+
+/// 项目名菜单列出的最近目录数（个），与徽章颜色数相同：菜单中的目录颜色互不相同。
+pub const RECENT_IN_MENU: usize = BADGE_COLORS;
+
+/// 保存现场的目录数和退出时记下的其他窗口数的上限（个）。
+pub const MAX_SESSIONS: usize = 10;
 
 /// 项目徽章的颜色数量（种）。
-///
-/// 取 10（经验值）：最近列表里的目录各用一种颜色，互不相同，因此 [`MAX_RECENT`] 不能超过
-/// 该值。
 pub const BADGE_COLORS: usize = 10;
-const _: () = assert!(
-    MAX_RECENT <= BADGE_COLORS,
-    "最近列表中的每个目录必须使用不同的颜色"
-);
+
+/// 记住的提交信息的条数上限，与输入框的输入历史相同。
+pub const MAX_COMMIT_MESSAGES: usize = 50;
+
+impl State {
+    /// 把提交过的信息 `message` 记为最新的一条：相同的旧条目移到最前，超过上限时丢掉最旧的。
+    pub fn remember_commit_message(&mut self, message: &str) {
+        if message.is_empty() {
+            return;
+        }
+        self.commit_messages.retain(|m| m != message);
+        self.commit_messages.insert(0, message.to_owned());
+        self.commit_messages.truncate(MAX_COMMIT_MESSAGES);
+    }
+}
 
 /// 由程序维护的运行状态：最近目录、各目录的现场和项目工具选择。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct State {
     /// 最近打开的目录，最新的在前，不重复。
     pub recent: Vec<PathBuf>,
-    /// 每个目录上次的现场，最近的在前，每个目录一条，最多 [`MAX_RECENT`] 条。
+    /// 每个目录上次的现场，最近的在前，每个目录一条，最多 [`MAX_SESSIONS`] 条。
     pub sessions: Vec<Session>,
     /// 上次退出时开着的目录；退出时没有打开目录则为 `None`，下次启动显示开始页。
     pub last: Option<PathBuf>,
@@ -40,8 +52,35 @@ pub struct State {
     ///
     /// `false`（默认）时平铺，每个文件一行。所有窗口和仓库共用，下次启动沿用。
     pub commit_tree: bool,
+    /// 提交视图中各组里文件的排序方式：`name` 按文件名，`status` 按更改的类型；为空（默认）时按
+    /// 路径。所有窗口和仓库共用，下次启动沿用。
+    pub commit_sort: String,
+    /// 提交视图是否在当前仓库的更改之后列出打开的目录中其他仓库的更改。
+    ///
+    /// `None`（没有选过）时由提交视图的样式决定：勾选式列出，暂存区视图只显示当前仓库。所有
+    /// 窗口共用，下次启动沿用。
+    pub commit_all_repositories: Option<bool>,
+    /// Git 日志左侧是否显示分支面板；`None`（没有选过）时显示。所有窗口共用，下次启动沿用。
+    pub log_branches: Option<bool>,
+    /// Git 日志列表右边显示的列（`author`、`date`、`hash`）；`None`（没有选过）时显示作者和
+    /// 日期。所有窗口共用，下次启动沿用。
+    pub log_columns: Option<Vec<String>>,
+    /// 提交过的信息，最新的在前，最多 `MAX_COMMIT_MESSAGES` 条。提交信息框里按 `↑` 翻阅，
+    /// 提交按钮的菜单里列出最近的几条；所有窗口和仓库共用，下次启动沿用。
+    pub commit_messages: Vec<String>,
+    /// 提交前检查这次新增的内容里有没有 TODO、FIXME，有时先确认。所有窗口和仓库共用。
+    pub commit_check_todo: bool,
+    /// 提交前用格式化工具整理要提交的文件。所有窗口和仓库共用。
+    pub commit_reformat: bool,
+    /// 提交时附加签署行（`Signed-off-by`）的仓库，元素是仓库的根目录。
+    ///
+    /// 在提交按钮的菜单中逐个仓库打开；所有窗口共用，下次启动沿用。
+    pub sign_off_repos: Vec<PathBuf>,
     /// PDF 预览是否隐藏页面缩略图栏；默认显示。所有窗口共用，下次启动沿用。
     pub pdf_thumbnails_hidden: bool,
+    /// Markdown 预览左侧的标题列表是否钉住、一直展开；默认只在鼠标停留时展开。所有窗口共用，
+    /// 下次启动沿用。
+    pub markdown_toc_pinned: bool,
     /// 侧栏宽度（逻辑像素）；`None` 表示没有调整过。所有视图、窗口和仓库共用，下次启动沿用。
     pub panel_width: Option<f32>,
     /// 能预览的文件（SVG、Markdown、表格）打开时的显示方式：`"split"`（分栏）或 `"preview"`
@@ -50,13 +89,20 @@ pub struct State {
     pub preview_mode: Option<String>,
     /// 上次关闭的窗口的大小和位置；没有记录时为 `None`。
     pub window: Option<WindowFrame>,
+    /// 上次运行的程序的版本号（如 `0.1.626`）；没有记录时为 `None`。启动时与当前版本比较，
+    /// 得知这是否为更新之后的第一次启动。
+    pub version: Option<String>,
+    /// 首次设置（第一次运行时开始页上的语言、外观、主题和模块）是否尚未完成：第一次运行时
+    /// 置位，用户点击「完成」后清除；未完成时下次启动仍然显示。
+    pub setup_pending: bool,
     /// 从磁盘映像等位置运行时不询问是否移到「应用程序」文件夹：用户曾选择不移动并勾选「不再
     /// 询问」。仅在 macOS 上使用。
     pub stay_outside_applications: bool,
-    /// 最近列表里每个目录的徽章颜色（值在 `0..BADGE_COLORS` 之内），互不相同。
+    /// 最近列表前 [`BADGE_COLORS`] 个目录的徽章颜色（值在 `0..BADGE_COLORS` 之内），互不相同；
+    /// 更早的目录按名字取色。
     ///
-    /// 目录第一次进入最近列表时，选一个其他目录未使用的颜色，之后保持不变，使项目名旁和最近
-    /// 项目菜单中始终显示同一种颜色。
+    /// 目录进入这一段时选一个其他目录未使用的颜色，之后保持不变，使项目名旁和最近项目菜单中
+    /// 始终显示同一种颜色。
     badges: Vec<(PathBuf, usize)>,
     /// 用户对项目自带格式化工具（位于 `node_modules/.bin` 等目录）的确认结果，最近的在前。
     ///
@@ -68,6 +114,10 @@ pub struct State {
     ///
     /// 仓库的配置变了（指纹不同）要重新确认。
     trusted_repos: Vec<(PathBuf, u64)>,
+    /// 用户为远端主机指定的密钥文件：（连接目标的文字，密钥文件的路径），按目标排序。
+    ///
+    /// 只记路径，不读取也不保存密钥的内容；路径原样交给 `ssh`。
+    remote_keys: Vec<(String, String)>,
     /// Vim 模式的大写标记：名字、文件路径、行号与列号（都从 0 起），按名字排序。
     pub vim_marks: Vec<(char, PathBuf, usize, usize)>,
     /// Vim 模式命令行的历史，从旧到新，最多 `MAX_VIM_HISTORY` 条。
@@ -122,12 +172,28 @@ pub struct Session {
     ///
     /// 位置记为视口顶边所在的页（页号从 0 起），以及视口顶边到该页顶边的距离与页高之比。
     pub pdf_places: Vec<(PathBuf, (usize, f32))>,
+    /// 各 EPUB 文件的阅读位置，包括当前未打开的文件；位于书的开头的文件不记录。
+    ///
+    /// 位置记为视口顶边所在的顶层块（从 0 起），以及视口顶边到该块上边缘的距离与块高之比。
+    pub book_places: Vec<(PathBuf, (usize, f32))>,
     /// 终端面板；终端里没有标签时为 `None`。
     pub terminal: Option<TerminalSession>,
     /// 选中的运行配置的名字。
     pub run: Option<String>,
+    /// 附加的目录，按添加的顺序。
+    pub folders: Vec<PathBuf>,
+    /// 用户给这组目录起的名字；没有起名时为 `None`。
+    pub name: Option<String>,
+    /// 打开着的标签中用户设为只读的文件。
+    pub readonly: Vec<PathBuf>,
+    /// 窗口是否把全部标签设为只读。
+    pub readonly_all: bool,
     /// 侧栏是否收起；没有记录过的目录为 `false`，打开时显示文件树。
     pub sidebar_hidden: bool,
+    /// 开着这个目录的窗口关闭时的大小和位置；没有记录时用 [`State::window`]。
+    pub window: Option<WindowFrame>,
+    /// 编辑区拆分成的窗格；没有拆分时为 `None`。
+    pub panes: Option<SessionPanes>,
 }
 
 /// 现场里的终端面板：各标签的工作目录（按标签栏中的顺序）、正在看的标签、面板开着没有、大小。
@@ -150,6 +216,8 @@ pub struct TerminalSession {
     pub height: f32,
     /// 面板在编辑区右边时的宽度（逻辑像素），0 表示默认值。
     pub width: f32,
+    /// 面板是否最大化（铺满编辑区）。
+    pub maximized: bool,
 }
 
 /// 现场里的一个标签：已保存的文件，或未保存文档的备份。
@@ -294,26 +362,8 @@ impl State {
                         .collect()
                 })
                 .unwrap_or_default();
-            let pdf_places = s
-                .get("pdfPlaces")
-                .and_then(Json::as_object)
-                .map(|files| {
-                    let place = |place: &Json| match place.as_array()? {
-                        [page, at] => {
-                            let page = page.as_number()?;
-                            let at = at.as_number().filter(|n| n.is_finite())?;
-                            (page >= 0.0 && page.fract() == 0.0)
-                                .then_some((page as usize, at as f32))
-                        }
-                        _ => None,
-                    };
-                    files
-                        .iter()
-                        .filter(|(path, _)| !path.is_empty())
-                        .filter_map(|(path, at)| Some((PathBuf::from(path), place(at)?)))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let pdf_places = read_places(s.get("pdfPlaces"));
+            let book_places = read_places(s.get("bookPlaces"));
             let terminal = s.get("terminal").and_then(Json::as_object).and_then(|t| {
                 let number = |key| {
                     t.get(key)
@@ -343,8 +393,25 @@ impl State {
                     open: t.get("open").and_then(Json::as_bool).unwrap_or(false),
                     height: number("height").unwrap_or(0.0) as f32,
                     width: number("width").unwrap_or(0.0) as f32,
+                    maximized: t.get("maximized").and_then(Json::as_bool).unwrap_or(false),
                 })
             });
+            let folders = (s
+                .get("folders")
+                .and_then(Json::as_array)
+                .into_iter()
+                .flatten())
+            .filter_map(Json::as_str)
+            .map(PathBuf::from)
+            .collect();
+            let readonly = (s
+                .get("readOnly")
+                .and_then(Json::as_array)
+                .into_iter()
+                .flatten())
+            .filter_map(Json::as_str)
+            .map(PathBuf::from)
+            .collect();
             Some(Session {
                 folder,
                 tabs,
@@ -353,9 +420,16 @@ impl State {
                 outline,
                 folds,
                 pdf_places,
+                book_places,
                 terminal,
                 run: s.get("run").and_then(Json::as_str).map(str::to_owned),
+                folders,
+                readonly,
+                readonly_all: s.get("readOnlyAll").and_then(Json::as_bool) == Some(true),
+                name: s.get("name").and_then(Json::as_str).map(str::to_owned),
                 sidebar_hidden: (s.get("sidebarHidden").and_then(Json::as_bool)).unwrap_or(false),
+                window: (s.get("window").and_then(Json::as_object)).and_then(window_frame),
+                panes: s.get("panes").and_then(read_panes),
             })
         };
 
@@ -402,6 +476,17 @@ impl State {
             .take(MAX_TOOL_CHOICES)
             .collect();
 
+        let remote_keys = root
+            .get("remoteKeys")
+            .and_then(Json::as_object)
+            .map(|items| {
+                (items.iter())
+                    .filter_map(|(target, key)| Some((target.clone(), key.as_str()?.to_owned())))
+                    .filter(|(_, key)| !key.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let vim_marks = vim_marks(root);
         let vim_commands = vim_history(root, "vimCommands");
         let vim_searches = vim_history(root, "vimSearches");
@@ -411,6 +496,7 @@ impl State {
             badges,
             tool_choices,
             trusted_repos,
+            remote_keys,
             vim_marks,
             vim_commands,
             vim_searches,
@@ -426,7 +512,7 @@ impl State {
             .filter_map(session)
         {
             if !state.sessions.iter().any(|old| old.folder == s.folder)
-                && state.sessions.len() < MAX_RECENT
+                && state.sessions.len() < MAX_SESSIONS
             {
                 state.sessions.push(s);
             }
@@ -441,10 +527,33 @@ impl State {
             .get("commitTree")
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        state.commit_sort = root
+            .get("commitSort")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        state.commit_all_repositories = root.get("commitAllRepositories").and_then(Json::as_bool);
+        state.log_branches = root.get("logBranches").and_then(Json::as_bool);
+        state.log_columns = (root.get("logColumns").and_then(Json::as_array)).map(|columns| {
+            let names = columns.iter().filter_map(Json::as_str);
+            names.map(str::to_owned).collect()
+        });
+        state.commit_messages = (root.get("commitMessages").and_then(Json::as_array))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Json::as_str)
+            .filter(|m| !m.is_empty())
+            .take(MAX_COMMIT_MESSAGES)
+            .map(str::to_owned)
+            .collect();
+        state.commit_check_todo = root.get("commitCheckTodo").and_then(Json::as_bool) == Some(true);
+        state.commit_reformat = root.get("commitReformat").and_then(Json::as_bool) == Some(true);
         state.pdf_thumbnails_hidden = root
             .get("pdfThumbnailsHidden")
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        state.markdown_toc_pinned =
+            root.get("markdownTocPinned").and_then(Json::as_bool) == Some(true);
         state.stay_outside_applications = root
             .get("stayOutsideApplications")
             .and_then(Json::as_bool)
@@ -457,14 +566,25 @@ impl State {
             .get("window")
             .and_then(Json::as_object)
             .and_then(window_frame);
+        state.setup_pending = root.get("setupPending").and_then(Json::as_bool) == Some(true);
+        state.version = root
+            .get("version")
+            .and_then(Json::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
         state.preview_mode = root
             .get("previewMode")
             .and_then(Json::as_str)
             .filter(|m| matches!(*m, "split" | "preview"))
             .map(str::to_owned);
         for path in paths(root.get("otherWindows")) {
-            if !state.others.contains(&path) && state.others.len() < MAX_RECENT {
+            if !state.others.contains(&path) && state.others.len() < MAX_SESSIONS {
                 state.others.push(path);
+            }
+        }
+        for path in paths(root.get("signOffRepos")) {
+            if !state.sign_off_repos.contains(&path) {
+                state.sign_off_repos.push(path);
             }
         }
 
@@ -491,11 +611,11 @@ impl State {
 
     /// 记录一个目录的现场并移到最前面。
     ///
-    /// 同目录的旧记录被替换，超出 [`MAX_RECENT`] 的从末尾移除。
+    /// 同目录的旧记录被替换，超出 [`MAX_SESSIONS`] 的从末尾移除。
     pub fn set_session(&mut self, session: Session) {
         self.sessions.retain(|s| s.folder != session.folder);
         self.sessions.insert(0, session);
-        self.sessions.truncate(MAX_RECENT);
+        self.sessions.truncate(MAX_SESSIONS);
     }
 
     /// 把 Vim 模式的大写标记与两种历史加入状态文件的字段 `fields`，为空的不加。
@@ -516,9 +636,10 @@ impl State {
 
     /// 序列化为 `state.json` 的内容，末尾带一个换行符。
     ///
-    /// `last`、`previewMode` 没有值，`otherWindows`、`toolChoices`、`trustedRepos`、`vimMarks`、
-    /// `vimCommands`、`vimSearches` 为空，`commitTree`、`pdfThumbnailsHidden`、
-    /// `stayOutsideApplications` 为假时省略对应的键。
+    /// `last`、`previewMode` 没有值，`otherWindows`、`signOffRepos`、`toolChoices`、
+    /// `trustedRepos`、`vimMarks`、`vimCommands`、`vimSearches` 为空，`commitTree`、
+    /// `commitAllRepositories`、`pdfThumbnailsHidden`、`stayOutsideApplications` 为假时省略
+    /// 对应的键。
     pub fn to_json(&self) -> String {
         let path = |p: &PathBuf| Json::String(p.to_string_lossy().into_owned());
         let mut fields = vec![(
@@ -539,8 +660,40 @@ impl State {
         if self.commit_tree {
             fields.push(("commitTree", Json::Bool(true)));
         }
+        if !self.commit_sort.is_empty() {
+            fields.push(("commitSort", Json::String(self.commit_sort.clone())));
+        }
+        if !self.sign_off_repos.is_empty() {
+            fields.push((
+                "signOffRepos",
+                Json::Array(self.sign_off_repos.iter().map(path).collect()),
+            ));
+        }
+        if let Some(all) = self.commit_all_repositories {
+            fields.push(("commitAllRepositories", Json::Bool(all)));
+        }
+        if let Some(shown) = self.log_branches {
+            fields.push(("logBranches", Json::Bool(shown)));
+        }
+        if let Some(columns) = &self.log_columns {
+            let names = columns.iter().map(|c| Json::String(c.clone()));
+            fields.push(("logColumns", Json::Array(names.collect())));
+        }
+        if !self.commit_messages.is_empty() {
+            let messages = self.commit_messages.iter().map(|m| Json::String(m.clone()));
+            fields.push(("commitMessages", Json::Array(messages.collect())));
+        }
+        if self.commit_check_todo {
+            fields.push(("commitCheckTodo", Json::Bool(true)));
+        }
+        if self.commit_reformat {
+            fields.push(("commitReformat", Json::Bool(true)));
+        }
         if self.pdf_thumbnails_hidden {
             fields.push(("pdfThumbnailsHidden", Json::Bool(true)));
+        }
+        if self.markdown_toc_pinned {
+            fields.push(("markdownTocPinned", Json::Bool(true)));
         }
         if self.stay_outside_applications {
             fields.push(("stayOutsideApplications", Json::Bool(true)));
@@ -551,18 +704,14 @@ impl State {
         if let Some(mode) = &self.preview_mode {
             fields.push(("previewMode", Json::String(mode.clone())));
         }
+        if let Some(version) = &self.version {
+            fields.push(("version", Json::String(version.clone())));
+        }
+        if self.setup_pending {
+            fields.push(("setupPending", Json::Bool(true)));
+        }
         if let Some(frame) = &self.window {
-            let mut window = vec![
-                ("width", Json::Number(frame.width)),
-                ("height", Json::Number(frame.height)),
-                ("scale", Json::Number(frame.scale)),
-                ("maximized", Json::Bool(frame.maximized)),
-            ];
-            if let Some((x, y)) = frame.position {
-                window.push(("x", Json::Number(x)));
-                window.push(("y", Json::Number(y)));
-            }
-            fields.push(("window", Json::object(window)));
+            fields.push(("window", window_json(frame)));
         }
 
         let badges = self.badges.iter().map(|(folder, color)| {
@@ -608,13 +757,10 @@ impl State {
                 items.push(("outline", Json::Object(files.collect())));
             }
             if !session.pdf_places.is_empty() {
-                // 比例保留四位小数：一页高 10000 逻辑像素时误差为 1 逻辑像素。
-                let files = session.pdf_places.iter().map(|(file, (page, at))| {
-                    let at = (f64::from(*at) * 1e4).round() / 1e4;
-                    let place = vec![Json::Number(*page as f64), Json::Number(at)];
-                    (file.to_string_lossy().into_owned(), Json::Array(place))
-                });
-                items.push(("pdfPlaces", Json::Object(files.collect())));
+                items.push(("pdfPlaces", write_places(&session.pdf_places)));
+            }
+            if !session.book_places.is_empty() {
+                items.push(("bookPlaces", write_places(&session.book_places)));
             }
             if let Some(t) = &session.terminal {
                 let number = |n: f32| Json::Number(f64::from(n));
@@ -625,6 +771,10 @@ impl State {
                     ("height", number(t.height)),
                     ("width", number(t.width)),
                 ];
+                // 没有最大化时不写。
+                if t.maximized {
+                    fields.push(("maximized", Json::Bool(true)));
+                }
                 // 都没起名字时不写。
                 if t.names.iter().any(|n| !n.is_empty()) {
                     let names = t.names.iter().map(|n| Json::String(n.clone()));
@@ -640,14 +790,39 @@ impl State {
             if let Some(run) = &session.run {
                 items.push(("run", Json::String(run.clone())));
             }
+            if !session.folders.is_empty() {
+                let folders = session.folders.iter().map(&path);
+                items.push(("folders", Json::Array(folders.collect())));
+            }
+            if session.readonly_all {
+                items.push(("readOnlyAll", Json::Bool(true)));
+            }
+            if !session.readonly.is_empty() {
+                let files = session.readonly.iter().map(&path);
+                items.push(("readOnly", Json::Array(files.collect())));
+            }
+            if let Some(name) = &session.name {
+                items.push(("name", Json::String(name.clone())));
+            }
             // 展开是默认状态，不写。
             if session.sidebar_hidden {
                 items.push(("sidebarHidden", Json::Bool(true)));
+            }
+            if let Some(frame) = &session.window {
+                items.push(("window", window_json(frame)));
+            }
+            if let Some(panes) = &session.panes {
+                items.push(("panes", panes_json(panes)));
             }
             Json::object(items)
         });
         fields.push(("sessions", Json::Array(sessions.collect())));
 
+        if !self.remote_keys.is_empty() {
+            let keys = (self.remote_keys.iter())
+                .map(|(target, key)| (target.clone(), Json::String(key.clone())));
+            fields.push(("remoteKeys", Json::object(keys)));
+        }
         if !self.tool_choices.is_empty() {
             let choices = self.tool_choices.iter().map(|(folder, run)| {
                 Json::object(vec![("folder", path(folder)), ("run", Json::Bool(*run))])
@@ -733,6 +908,22 @@ impl State {
         self.assign_badges();
     }
 
+    /// 返回用户为连接目标 `target` 指定的密钥文件；没有指定时返回 `None`。
+    pub fn remote_key(&self, target: &str) -> Option<&str> {
+        (self.remote_keys.iter())
+            .find(|(known, _)| known == target)
+            .map(|(_, key)| key.as_str())
+    }
+
+    /// 记下连接目标 `target` 使用的密钥文件 `key`；`key` 为空时去掉这条记录。
+    pub fn set_remote_key(&mut self, target: &str, key: &str) {
+        self.remote_keys.retain(|(known, _)| known != target);
+        if !key.is_empty() {
+            self.remote_keys.push((target.to_owned(), key.to_owned()));
+            self.remote_keys.sort();
+        }
+    }
+
     /// 返回 `folder` 中项目自带格式化工具的上次选择：运行该目录中的程序（`true`），
     /// 或使用系统安装的程序（`false`）；没有记录时返回 `None`。
     pub fn tool_choice(&self, folder: &Path) -> Option<bool> {
@@ -765,8 +956,8 @@ impl State {
         self.trusted_repos.truncate(MAX_TOOL_CHOICES);
     }
 
-    /// 返回目录 `folder` 的徽章颜色（值在 `0..BADGE_COLORS` 之内）；不在最近列表中时按名字
-    /// 计算一个。
+    /// 返回目录 `folder` 的徽章颜色（值在 `0..BADGE_COLORS` 之内）；不在最近列表的前
+    /// [`BADGE_COLORS`] 个中时按名字计算一个。
     pub fn badge_color(&self, folder: &Path) -> usize {
         self.badges
             .iter()
@@ -774,10 +965,9 @@ impl State {
             .map_or_else(|| preferred_color(folder), |&(_, color)| color)
     }
 
-    /// 使最近列表里的目录各有一个互不相同的颜色。
+    /// 使最近列表前 [`BADGE_COLORS`] 个目录各有一个互不相同的颜色。
     ///
-    /// 已有的颜色保持不变，新来的目录从按名字算出的颜色起向后取第一个未占用的颜色；列表
-    /// 最多 [`MAX_RECENT`] 个，且 `MAX_RECENT <= BADGE_COLORS`，颜色一定够用。
+    /// 已有的颜色保持不变，新来的目录从按名字算出的颜色起向后取第一个未占用的颜色。
     fn assign_badges(&mut self) {
         // 先保留已有的颜色，再给新来的目录分配：新来的目录排在列表最前面，先分配会占用其他
         // 目录已有的颜色。
@@ -785,6 +975,7 @@ impl State {
         let mut colors: Vec<Option<usize>> = self
             .recent
             .iter()
+            .take(BADGE_COLORS)
             .map(|folder| {
                 let color = self
                     .badges
@@ -915,6 +1106,147 @@ fn vim_marks(
     marks
 }
 
+/// 编辑区拆分成的窗格：排列、各窗格的标签和前台的窗格。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPanes {
+    /// 窗格的排列，叶子是 `panes` 中的序号。
+    pub tree: PaneNode,
+    /// 各窗格的标签。
+    pub panes: Vec<SessionPane>,
+    /// 前台的窗格（`panes` 中的序号）。
+    pub focused: usize,
+}
+
+/// 窗格排列的节点。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaneNode {
+    /// 一个窗格（`SessionPanes::panes` 中的序号）。
+    Pane(usize),
+    /// 拆成两半：`column` 为真时上下排，`share` 是前一半所占的比例。
+    Split {
+        /// 是否上下排。
+        column: bool,
+        /// 前一半所占的比例。
+        share: f32,
+        /// 前一半。
+        first: Box<PaneNode>,
+        /// 后一半。
+        second: Box<PaneNode>,
+    },
+}
+
+/// 一个窗格的标签：`Session::tabs` 中的序号，以及其中的当前标签。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SessionPane {
+    /// 标签，按标签栏中的顺序。
+    pub tabs: Vec<usize>,
+    /// 当前标签。
+    pub active: Option<usize>,
+}
+
+/// 读取 `"panes"`：格式不对时返回 `None`，只是不恢复拆分。
+fn read_panes(value: &Json) -> Option<SessionPanes> {
+    let object = value.as_object()?;
+    let index = |v: &Json| {
+        v.as_number()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|n| n as usize)
+    };
+    let panes = (object.get("panes")?.as_array()?.iter())
+        .map(|pane| {
+            let pane = pane.as_object()?;
+            let tabs = pane
+                .get("tabs")?
+                .as_array()?
+                .iter()
+                .filter_map(index)
+                .collect();
+            Some(SessionPane {
+                tabs,
+                active: pane.get("active").and_then(index),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let tree = read_node(object.get("tree")?, 0)?;
+    let focused = object.get("focused").and_then(index).unwrap_or(0);
+    Some(SessionPanes {
+        tree,
+        panes,
+        focused,
+    })
+}
+
+/// 读取窗格排列的一个节点；嵌套过深时放弃。
+fn read_node(value: &Json, depth: usize) -> Option<PaneNode> {
+    if depth > 32 {
+        return None;
+    }
+    let object = value.as_object()?;
+    if let Some(pane) = object.get("pane") {
+        let at = pane.as_number().filter(|n| n.is_finite() && *n >= 0.0)?;
+        return Some(PaneNode::Pane(at as usize));
+    }
+    let share = object.get("share")?.as_number()?.clamp(0.05, 0.95) as f32;
+    Some(PaneNode::Split {
+        column: object.get("split")?.as_str()? == "column",
+        share,
+        first: Box::new(read_node(object.get("first")?, depth + 1)?),
+        second: Box::new(read_node(object.get("second")?, depth + 1)?),
+    })
+}
+
+/// 返回写进 `state.json` 的窗格，格式见 [`read_panes`]。
+fn panes_json(panes: &SessionPanes) -> Json {
+    let pane = |p: &SessionPane| {
+        let tabs = p.tabs.iter().map(|&t| Json::Number(t as f64)).collect();
+        let mut items = vec![("tabs", Json::Array(tabs))];
+        if let Some(active) = p.active {
+            items.push(("active", Json::Number(active as f64)));
+        }
+        Json::object(items)
+    };
+    Json::object(vec![
+        ("tree", node_json(&panes.tree)),
+        ("panes", Json::Array(panes.panes.iter().map(pane).collect())),
+        ("focused", Json::Number(panes.focused as f64)),
+    ])
+}
+
+fn node_json(node: &PaneNode) -> Json {
+    match node {
+        PaneNode::Pane(at) => Json::object(vec![("pane", Json::Number(*at as f64))]),
+        PaneNode::Split {
+            column,
+            share,
+            first,
+            second,
+        } => Json::object(vec![
+            (
+                "split",
+                Json::String(if *column { "column" } else { "row" }.into()),
+            ),
+            ("share", Json::Number(f64::from(*share))),
+            ("first", node_json(first)),
+            ("second", node_json(second)),
+        ]),
+    }
+}
+
+/// 返回写进 `state.json` 的窗口大小和位置，格式见 [`window_frame`]。
+fn window_json(frame: &WindowFrame) -> Json {
+    let mut window = vec![
+        ("width", Json::Number(frame.width)),
+        ("height", Json::Number(frame.height)),
+        ("scale", Json::Number(frame.scale)),
+        ("maximized", Json::Bool(frame.maximized)),
+    ];
+    if let Some((x, y)) = frame.position {
+        window.push(("x", Json::Number(x)));
+        window.push(("y", Json::Number(y)));
+    }
+    Json::object(window)
+}
+
 /// 从 `state.json` 的 `window` 一节读出窗口的大小和位置；缺项或者数值不合理时为 `None`。
 fn window_frame(json: &std::collections::BTreeMap<String, Json>) -> Option<WindowFrame> {
     let number = |key: &str| json.get(key).and_then(Json::as_number);
@@ -929,6 +1261,37 @@ fn window_frame(json: &std::collections::BTreeMap<String, Json>) -> Option<Windo
             .and_then(Json::as_bool)
             .unwrap_or(false),
     })
+}
+
+/// 读出各文件的阅读位置（`pdfPlaces`、`bookPlaces`）：每项是文件路径到 `[序号, 比例]`，序号
+/// 为负数或小数、比例不是有限的数、缺少一项的记录跳过。
+fn read_places(value: Option<&Json>) -> Vec<(PathBuf, (usize, f32))> {
+    let place = |place: &Json| match place.as_array()? {
+        [index, at] => {
+            let index = index.as_number()?;
+            let at = at.as_number().filter(|n| n.is_finite())?;
+            (index >= 0.0 && index.fract() == 0.0).then_some((index as usize, at as f32))
+        }
+        _ => None,
+    };
+    (value.and_then(Json::as_object))
+        .map(|files| {
+            (files.iter())
+                .filter(|(path, _)| !path.is_empty())
+                .filter_map(|(path, at)| Some((PathBuf::from(path), place(at)?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 写出各文件的阅读位置；比例保留四位小数：一页（一块）高 10000 逻辑像素时误差为 1 逻辑像素。
+fn write_places(places: &[(PathBuf, (usize, f32))]) -> Json {
+    let files = places.iter().map(|(file, (index, at))| {
+        let at = (f64::from(*at) * 1e4).round() / 1e4;
+        let place = vec![Json::Number(*index as f64), Json::Number(at)];
+        (file.to_string_lossy().into_owned(), Json::Array(place))
+    });
+    Json::Object(files.collect())
 }
 
 #[cfg(test)]

@@ -130,6 +130,21 @@ static METHOD: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
+/// 带缩进的 C++ 函数开头：可选的 `[[属性]]`、返回类型（可含空格，例如模板实参之间），其后是
+/// 名字和左括号。构造函数和析构函数没有返回类型，名字可以带 `~`。
+static C_MEMBER_START: LazyLock<Regex> = LazyLock::new(|| {
+    regex(
+        r"^\s+(?:\[\[[^\]]*\]\]\s*)*(?P<head>[A-Za-z_][\w:<>,*&\s]*[\s*&])?(?P<name>~?IDENT)\s*\(",
+    )
+});
+
+/// 向后读取函数签名的行数上限（行）：每个参数各占一行时可容纳十余个参数，超出时不列出该函数。
+const C_SIGNATURE_LINES: usize = 16;
+
+/// 向后读取函数签名的字节数上限（字节）：[`C_SIGNATURE_LINES`] 行、每行 256 字节，用于限制
+/// 单行极长的文件中每个候选行的读取量。
+const C_SIGNATURE_BYTES: usize = 4096;
+
 /// C、C++ 的函数定义：行首（无缩进）是返回类型，其后是名字和左括号，该行不含分号。
 static C_FUNCTION: LazyLock<Regex> = LazyLock::new(|| {
     regex(r"^(?P<head>[A-Za-z_][\w:<>,*&\s]*[\s*&])(?P<name>[A-Za-z_~][\w:~]*)\s*\([^;]*$")
@@ -137,6 +152,40 @@ static C_FUNCTION: LazyLock<Regex> = LazyLock::new(|| {
 
 /// C 的 `#define` 宏。
 static C_DEFINE: LazyLock<Regex> = LazyLock::new(|| regex(r"^\s*#\s*define\s+(?P<name>IDENT)"));
+
+/// 返回类型写在上一行的 C 函数定义：行首的 `name(…`，不含分号。
+static C_BARE_FUNCTION: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^(?P<name>[A-Za-z_]\w*)\s*\([^;]*$"));
+
+/// 只有类型的一行：`static void`、`uint8_t *`。
+static C_TYPE_LINE: LazyLock<Regex> = LazyLock::new(|| regex(r"^[A-Za-z_][\w\s*&]*$"));
+
+/// C 的全局变量和 `extern` 声明：行首的类型、名字和可选的数组维度，以 `;`、`,`、`=` 结尾。
+static C_GLOBAL: LazyLock<Regex> = LazyLock::new(|| {
+    regex(r"^(?P<head>(?:[A-Za-z_]\w*[\s*&]+)+)(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*[;,=]")
+});
+
+/// C 的 `typedef` 别名：`typedef unsigned char u8;`、`typedef struct node node_t;`。
+static C_TYPEDEF: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^typedef\b[^;(]*[\s*](?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*;"));
+
+/// C 的函数指针 `typedef`：`typedef void (*uart_cb_t)(uint8_t);`。
+static C_TYPEDEF_POINTER: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^typedef\b[^;]*\(\s*\*\s*(?P<name>[A-Za-z_]\w*)\s*\)\s*\("));
+
+/// 行首 `}` 之后的名字：`} app_state_t;`；逗号分隔多个时取第一个。
+static C_CLOSE: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^\}\s*(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*[,;=]"));
+
+/// GCC 的属性 `__attribute__((…))`。
+static C_ATTRIBUTE: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"__attribute__\s*\(\((?:[^()]|\([^()]*\))*\)\)"));
+
+/// C 中以这些单词开头的行是语句。
+const C_STATEMENTS: &[&str] = &[
+    "return", "else", "if", "while", "for", "switch", "case", "default", "typedef", "goto",
+    "break", "continue", "do", "sizeof",
+];
 
 /// 顶格的常量和变量：`const X`、`static mut Y`、`let z`、`var w`。
 static TOP_VARIABLE: LazyLock<Regex> = LazyLock::new(|| {
@@ -201,6 +250,15 @@ const NOT_NAMES: &[&str] = &[
     "typeof",
 ];
 
+/// 识别 C 系语言符号所需的跨行上下文。
+#[derive(Default)]
+struct CContext {
+    /// 上一行非空代码。
+    previous: String,
+    /// 是否位于行首 `typedef` 开始、尚未被行首 `}` 结束的块内：块后的名字是类型。
+    typedef_block: bool,
+}
+
 /// 返回 `text` 中的符号，按行号从小到大排列。
 ///
 /// `language` 决定按哪种语言的写法识别。
@@ -210,6 +268,8 @@ pub fn symbols(text: &Rope, language: &Language) -> Vec<Symbol> {
     let mut parents: Vec<(usize, String, SymbolKind)> = Vec::new();
     let mut skip = Skip::default();
     let mut line = String::new();
+    let mut c = CContext::default();
+    let c_family = is_c_family(language);
 
     for (i, slice) in text.lines().enumerate() {
         line.clear();
@@ -219,7 +279,25 @@ pub fn symbols(text: &Rope, language: &Language) -> Vec<Symbol> {
         if skip.line(content, language) {
             continue;
         }
-        let Some((name, kind, col, level, container)) = recognize(content, language) else {
+        let recognized = if c_family {
+            let recognized = recognize_c(content, &c);
+            c.advance(content);
+            recognized
+                .or_else(|| recognize(content, language))
+                .or_else(|| {
+                    let indent = indent_width(content);
+                    let parent = parents.iter().rev().find(|(level, ..)| *level < indent)?;
+                    let owner = match parent {
+                        (_, name, SymbolKind::Type) => Some(name.as_str()),
+                        (_, _, SymbolKind::Module) => None,
+                        _ => return None,
+                    };
+                    recognize_c_member(text, i, content, indent, owner)
+                })
+        } else {
+            recognize(content, language)
+        };
+        let Some((name, kind, col, level, container)) = recognized else {
             continue;
         };
 
@@ -322,6 +400,209 @@ impl Skip {
     }
 }
 
+/// 是否是 C 系语言（C、C++、Objective-C）。
+fn is_c_family(language: &Language) -> bool {
+    matches!(language.id, "c" | "cpp" | "objective-c" | "objective-cpp")
+}
+
+impl CContext {
+    /// 读过一行 `content` 之后更新上下文。
+    fn advance(&mut self, content: &str) {
+        if content.trim().is_empty() {
+            return;
+        }
+        if content.starts_with("typedef") && !content.contains(';') {
+            self.typedef_block = true;
+        } else if content.starts_with('}') {
+            self.typedef_block = false;
+        }
+        content.clone_into(&mut self.previous);
+    }
+}
+
+/// 识别 C 系语言行首（无缩进）的符号，返回值同 [`recognize`]：`typedef` 别名、`} name_t;`、
+/// 全局变量，以及返回类型在上一行或带 `__attribute__` 的函数定义。
+fn recognize_c(
+    content: &str,
+    c: &CContext,
+) -> Option<(String, SymbolKind, usize, usize, Option<String>)> {
+    if content.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let symbol = |name: regex::Match<'_>, kind: SymbolKind| {
+        let col = content[..name.start()].chars().count();
+        Some((name.as_str().to_owned(), kind, col, 0, None))
+    };
+    if let Some(caps) = C_TYPEDEF_POINTER
+        .captures(content)
+        .or_else(|| C_TYPEDEF.captures(content))
+    {
+        return symbol(caps.name("name")?, SymbolKind::Type);
+    }
+    if let Some(caps) = C_CLOSE.captures(content) {
+        let kind = if c.typedef_block {
+            SymbolKind::Type
+        } else {
+            SymbolKind::Variable
+        };
+        return symbol(caps.name("name")?, kind);
+    }
+    let first = content
+        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .next()
+        .unwrap_or_default();
+    if C_STATEMENTS.contains(&first) {
+        return None;
+    }
+    // 属性替换为等长空白，列号不变。
+    let plain = C_ATTRIBUTE.replace_all(content, |m: &regex::Captures<'_>| " ".repeat(m[0].len()));
+    let code = plain.trim_start();
+    let skipped = plain.len() - code.len();
+    if plain != content
+        && let Some(caps) = C_FUNCTION.captures(code)
+        && !NOT_NAMES.contains(&&caps["name"])
+    {
+        let name = caps.name("name")?;
+        let col = plain[..skipped + name.start()].chars().count();
+        return Some((name.as_str().to_owned(), SymbolKind::Function, col, 0, None));
+    }
+    if let Some(caps) = C_BARE_FUNCTION.captures(content)
+        && !NOT_NAMES.contains(&&caps["name"])
+        && C_TYPE_LINE.is_match(&c.previous)
+        && !c.previous.starts_with(char::is_whitespace)
+        && !C_STATEMENTS
+            .iter()
+            .any(|w| c.previous.split_whitespace().next() == Some(w))
+    {
+        return symbol(caps.name("name")?, SymbolKind::Function);
+    }
+    if let Some(caps) = C_GLOBAL.captures(content) {
+        let head = caps["head"].trim_end_matches(|ch: char| ch.is_whitespace() || ch == '*');
+        // 单个单词后接两侧带空格的 `*` 是乘法；`struct node;` 是前置声明。
+        let multiply = !head.contains(char::is_whitespace) && caps["head"].ends_with(" * ");
+        let forward = matches!(head, "struct" | "enum" | "union" | "class");
+        if !multiply && !forward {
+            return symbol(caps.name("name")?, SymbolKind::Variable);
+        }
+    }
+    None
+}
+
+/// 识别类型或命名空间内带缩进的 C++ 函数定义（包括按 C 高亮的 `.h`），返回值同 [`recognize`]。
+///
+/// 签名可以折成多行，函数体可以与左花括号同一行；只有声明没有函数体时不识别。`owner` 是所在
+/// 类型的名字：没有返回类型的只认与它同名的构造函数和析构函数。名字的行列是它原来的位置。
+fn recognize_c_member(
+    text: &Rope,
+    line: usize,
+    content: &str,
+    indent: usize,
+    owner: Option<&str>,
+) -> Option<(String, SymbolKind, usize, usize, Option<String>)> {
+    let caps = C_MEMBER_START.captures(content)?;
+    let name = caps.name("name")?;
+    let first = content.split_whitespace().next()?;
+    if NOT_NAMES.contains(&name.as_str())
+        || NOT_NAMES.contains(&first)
+        || C_STATEMENTS.contains(&first)
+    {
+        return None;
+    }
+    if caps.name("head").is_none() && owner != Some(name.as_str().trim_start_matches('~')) {
+        return None;
+    }
+    let mut signature = CSignature::default();
+    let mut bytes = content.len();
+    let mut body = signature.scan(&content[caps.get(0)?.end()..]);
+    let mut next = String::new();
+    for slice in text.lines_at(line + 1).take(C_SIGNATURE_LINES) {
+        bytes += slice.len_bytes();
+        if body.is_some() || bytes > C_SIGNATURE_BYTES {
+            break;
+        }
+        next.clear();
+        next.extend(slice.chunks());
+        body = signature.scan(&next);
+    }
+    if body != Some(true) {
+        return None;
+    }
+    let col = content[..name.start()].chars().count();
+    Some((
+        name.as_str().to_owned(),
+        SymbolKind::Function,
+        col,
+        indent,
+        None,
+    ))
+}
+
+/// 逐行读取函数左括号之后的内容，判断签名之后是函数体还是声明的结尾。
+struct CSignature {
+    /// 尚未闭合的圆括号层数；从参数列表内开始，为 0 时位于参数列表之后。
+    depth: usize,
+    /// 位于块注释内。
+    comment: bool,
+}
+
+impl Default for CSignature {
+    fn default() -> Self {
+        Self {
+            depth: 1,
+            comment: false,
+        }
+    }
+}
+
+impl CSignature {
+    /// 读入一行 `line`：读到函数体的左花括号或构造函数初始化列表的 `:` 时返回 `Some(true)`，
+    /// 读到声明的结尾或函数签名中不会出现的符号时返回 `Some(false)`，尚无结论时返回 `None`。
+    ///
+    /// 注释、字符串和字符字面量中的内容不参与判断；圆括号内（参数、默认值、`noexcept(…)`）
+    /// 只计括号层数。
+    fn scan(&mut self, line: &str) -> Option<bool> {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let next = bytes.get(i + 1).copied();
+            if self.comment {
+                let closed = bytes[i] == b'*' && next == Some(b'/');
+                self.comment = !closed;
+                i += if closed { 2 } else { 1 };
+                continue;
+            }
+            match bytes[i] {
+                b'/' if next == Some(b'/') => return None,
+                b'/' if next == Some(b'*') => {
+                    self.comment = true;
+                    i += 1;
+                }
+                quote @ (b'"' | b'\'') => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'(' => self.depth += 1,
+                b')' if self.depth == 0 => return Some(false),
+                b')' => self.depth -= 1,
+                _ if self.depth > 0 => {}
+                b'{' => return Some(true),
+                // `::` 是尾置返回类型中的限定名；单个 `:` 之后是构造函数的初始化列表。
+                b':' if next == Some(b':') => i += 1,
+                b':' => return Some(true),
+                // `->` 之后是尾置返回类型。
+                b'-' if next == Some(b'>') => i += 1,
+                b';' | b'=' | b'}' | b',' | b'?' | b'.' | b'+' | b'-' | b'/' | b'|' | b'^'
+                | b'!' | b'%' => return Some(false),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
 /// 识别一行中的符号，返回（名字，种类，列，层级，行内写明的上级）。
 ///
 /// 列是名字的字符偏移（从 0 起）；层级是缩进列数（Tab 按 4 列计）或 Markdown 标题级别。
@@ -376,7 +657,7 @@ fn recognize(
                 None,
             ));
         }
-        "text" | "json" | "html" | "xml" | "svg" | "css" | "scss" | "sass" | "less"
+        "text" | "json" | "html" | "xml" | "svg" | "css" | "scss" | "sass" | "less" | "wxss"
         | "dockerfile" | "dotenv" | "ignore" => return None,
         _ => {}
     }
@@ -400,7 +681,9 @@ fn recognize(
         let col = content[..caps.name("name")?.start()].chars().count();
         return Some((name, SymbolKind::Module, col, indent, None));
     }
-    if let Some(caps) = DECLARATION.captures(content) {
+    if let Some(caps) = DECLARATION.captures(content)
+        && !c_type_use(&caps, content, language)
+    {
         let kind = match &caps["kw"] {
             "mod" | "module" | "namespace" | "extension" => SymbolKind::Module,
             "class" | "struct" | "enum" | "trait" | "interface" | "type" | "union" | "protocol"
@@ -413,11 +696,20 @@ fn recognize(
         return found(&caps, SymbolKind::Function);
     }
 
-    let c_family = matches!(language.id, "c" | "cpp" | "objective-c" | "objective-cpp");
+    let c_family = is_c_family(language);
     let braces = c_family
         || matches!(
             language.id,
-            "javascript" | "typescript" | "arkts" | "vue" | "java" | "groovy" | "scala" | "kotlin"
+            "javascript"
+                | "typescript"
+                | "arkts"
+                | "vue"
+                | "wxml"
+                | "wxs"
+                | "java"
+                | "groovy"
+                | "scala"
+                | "kotlin"
         );
     if braces
         && let Some(caps) = METHOD.captures(content)
@@ -440,7 +732,7 @@ fn recognize(
             return found(&caps, SymbolKind::Variable);
         }
     }
-    // C 系语言的 `static int x` 把类型写在名字之前，上面的规则无法识别；这里直接返回，
+    // C 系语言的 `static int x` 把类型写在名字之前，由 [`recognize_c`] 识别；这里直接返回，
     // 避免 `TOP_VARIABLE` 把该声明误判为名为 `int` 的变量。
     if c_family {
         return None;
@@ -454,6 +746,19 @@ fn recognize(
         return found(&caps, SymbolKind::Variable);
     }
     None
+}
+
+/// `struct`、`enum`、`union` 后的名字是否是类型的使用：其后不是 `{`、`:`（C++ 继承）或行尾，
+/// 如 `struct node *next;`、`struct node;`。
+fn c_type_use(caps: &regex::Captures<'_>, content: &str, language: &Language) -> bool {
+    if !is_c_family(language) || !matches!(&caps["kw"], "struct" | "enum" | "union") {
+        return false;
+    }
+    let Some(name) = caps.name("name") else {
+        return false;
+    };
+    let rest = content[name.end()..].trim_start();
+    !(rest.is_empty() || rest.starts_with(['{', ':']) || rest.starts_with("//"))
 }
 
 /// 返回行首空白的宽度（列），Tab 按 4 列计，其他空白字符按 1 列计。

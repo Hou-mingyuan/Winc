@@ -42,7 +42,7 @@ fn the_default_shell_is_chosen_from_the_detected_shells_or_typed() {
     // 没有设置时是系统默认；检测到的 shell 以启动命令为副标题。
     app.settings_open_menu(Setting::TerminalShell);
     assert_eq!(
-        app.context_menu.as_ref().map(|m| &m.target),
+        app.overlays.context_menu.as_ref().map(|m| &m.target),
         Some(&MenuTarget::DefaultShell)
     );
     assert!(app.menu_checked(MenuCommand::DefaultShell(None)));
@@ -66,7 +66,7 @@ fn the_default_shell_is_chosen_from_the_detected_shells_or_typed() {
     app.settings_open_menu(Setting::TerminalShell);
     assert!(app.menu_checked(MenuCommand::DefaultShell(Some(1))));
     assert!(!app.menu_checked(MenuCommand::DefaultShellCustom));
-    app.context_menu = None;
+    app.overlays.context_menu = None;
 
     // 自定义命令：输入框里是当前的命令，确认后写入；不在检测到的列表里时「自定义命令…」打勾。
     app.settings_open_menu(Setting::TerminalShell);
@@ -108,12 +108,12 @@ fn the_terminal_font_size_and_switches_write_the_config() {
     // 字体：菜单的第一项是「跟随编辑器」，和编辑器字体一样先列出等宽字体。
     app.settings_open_menu(Setting::TerminalFont);
     assert_eq!(
-        app.context_menu.as_ref().map(|m| &m.target),
+        app.overlays.context_menu.as_ref().map(|m| &m.target),
         Some(&MenuTarget::Font(Setting::TerminalFont))
     );
     assert_eq!(app.menu_label(MenuCommand::FontDefault).title, "跟随编辑器");
     assert!(app.menu_checked(MenuCommand::FontDefault));
-    app.context_menu = None;
+    app.overlays.context_menu = None;
     // 找不到的字体名：原因写在该行，取消后配置退回原值。
     app.settings_start_editing(Setting::TerminalFont);
     app.edit_field(|f| f.insert("Comic Sanz"));
@@ -129,6 +129,7 @@ fn the_terminal_font_size_and_switches_write_the_config() {
         (Setting::TerminalConfirmClose, true),
         (Setting::TerminalPrompt, true),
         (Setting::TerminalShellIntegration, true),
+        (Setting::TerminalApplicationPriority, false),
     ] {
         assert_eq!(app.switch_on(setting), on, "{setting:?}");
         app.settings_toggle(setting);
@@ -138,21 +139,50 @@ fn the_terminal_font_size_and_switches_write_the_config() {
     assert_eq!(app.config.terminal_confirm_close, Some(false));
     assert_eq!(app.config.terminal_prompt, Some(false));
     assert_eq!(app.config.terminal_shell_integration, Some(false));
+    assert_eq!(app.config.terminal_application_priority, Some(true));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn the_position_and_meta_key_are_chosen_from_menus() {
     let (mut app, dir) = terminal_settings("settings-terminal-choices");
+    assert_eq!(
+        Setting::TerminalTabPosition.control(),
+        SettingControl::Choice
+    );
 
     app.settings_open_menu(Setting::TerminalPosition);
     assert_eq!(
-        app.context_menu.as_ref().map(|m| &m.target),
+        app.overlays.context_menu.as_ref().map(|m| &m.target),
         Some(&MenuTarget::TerminalPosition)
     );
     assert!(app.menu_checked(MenuCommand::TerminalPosition(false)));
     app.run_menu_command(MenuCommand::TerminalPosition(true));
     assert_eq!(app.config.terminal_right, Some(true));
+    assert!(app.terminal_right());
+
+    app.settings_open_menu(Setting::TerminalTabPosition);
+    assert_eq!(
+        app.overlays.context_menu.as_ref().map(|m| &m.target),
+        Some(&MenuTarget::TerminalTabPosition)
+    );
+    assert_eq!(
+        app.menu_label(MenuCommand::TerminalTabPosition(false))
+            .title,
+        "顶部"
+    );
+    assert_eq!(
+        app.menu_label(MenuCommand::TerminalTabPosition(true)).title,
+        "右侧"
+    );
+    assert!(app.menu_checked(MenuCommand::TerminalTabPosition(false)));
+    app.run_menu_command(MenuCommand::TerminalTabPosition(true));
+    assert_eq!(app.config.terminal_vertical_tabs, Some(true));
+    assert!(app.menu_checked(MenuCommand::TerminalTabPosition(true)));
+    assert!(app.terminal_right());
+    app.settings_open_menu(Setting::TerminalTabPosition);
+    app.run_menu_command(MenuCommand::TerminalTabPosition(false));
+    assert_eq!(app.config.terminal_vertical_tabs, Some(false));
     assert!(app.terminal_right());
 
     // 「Meta 键」只在 macOS 上列出。
@@ -166,6 +196,31 @@ fn the_position_and_meta_key_are_chosen_from_menus() {
             app.config.option_as_meta,
             Some(winc_config::OptionAsMeta::Both)
         );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 绘制终端标签位置菜单，覆盖顶部和右侧两种选择。
+///
+/// ```text
+/// cargo test -p winc-app snapshot_terminal_tab_position_menu -- --ignored
+/// ```
+#[test]
+#[ignore = "截图，手动运行"]
+fn snapshot_terminal_tab_position_menu() {
+    let (mut app, dir) = terminal_settings("settings-terminal-tab-position");
+    for right in [false, true] {
+        app.set_terminal_tab_position(right);
+        app.settings_open_menu(Setting::TerminalTabPosition);
+        shoot(
+            &mut app,
+            if right {
+                "settings-terminal-tabs-right"
+            } else {
+                "settings-terminal-tabs-top"
+            },
+        );
+        app.overlays.context_menu = None;
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -200,7 +255,7 @@ fn the_terminal_page_is_listed_only_when_the_module_is_on() {
 fn freeze_terminal_page(app: &mut App, on: bool, at: std::time::Duration) {
     use crate::app::animation::{Clock, MODULE_FADE};
 
-    let fx = &mut app.module_fx.terminal;
+    let fx = &mut app.motion.module_fx.terminal;
     fx.track(!on, None);
     fx.track(on, Some(Clock::frozen(at, MODULE_FADE)));
 }
@@ -228,7 +283,7 @@ fn the_terminal_page_slides_in_and_out_with_the_module() {
     assert!(terminal.h > 0.0 && terminal.h < SETTINGS_NAV_ROW);
     let moved = row(&app, SettingsPage::Modules).unwrap();
     assert!(moved.y > modules.y && moved.y < modules.y + SETTINGS_NAV_ROW + 2.0);
-    assert!(app.module_fx.terminal.opacity(true) < 1.0);
+    assert!(app.motion.module_fx.terminal.opacity(true) < 1.0);
     freeze_terminal_page(&mut app, true, MODULE_FADE);
     assert_eq!(
         row(&app, SettingsPage::Terminal).unwrap().h,
@@ -242,7 +297,7 @@ fn the_terminal_page_slides_in_and_out_with_the_module() {
         row(&app, SettingsPage::Terminal).unwrap().h,
         SETTINGS_NAV_ROW
     );
-    let opacity = app.module_fx.terminal.opacity(false);
+    let opacity = app.motion.module_fx.terminal.opacity(false);
     assert!(opacity > 0.0 && opacity < 1.0);
     app.settings_show_page(SettingsPage::Terminal);
     assert_eq!(app.settings_layout().page, SettingsPage::Modules);

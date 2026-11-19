@@ -13,7 +13,7 @@ fn cwd(dir: &std::path::Path) -> String {
 
 /// 第 0 行第 `col` 格，按住 ⌘ 移过去，返回认出的链接。
 fn hover_link(app: &mut App, row: usize, col: usize) -> Option<TermLink> {
-    app.modifiers = command_modifiers();
+    app.pointer.modifiers = command_modifiers();
     let (x, y) = cell_center(app, row, col);
     app.on_mouse_move(x, y);
     app.terminal.link.clone()
@@ -60,7 +60,7 @@ fn command_hover_finds_urls_osc8_links_and_files() {
     assert!(hover_link(&mut app, 0, 66).is_none());
 
     // 松开 ⌘，链接没了。
-    app.modifiers = winit::keyboard::ModifiersState::empty();
+    app.pointer.modifiers = winit::keyboard::ModifiersState::empty();
     app.update_terminal_link();
     assert!(app.terminal.link.is_none());
 
@@ -75,7 +75,7 @@ fn command_hover_finds_urls_osc8_links_and_files() {
     // ⌘⇧ 单击：在文件树里定位。
     app.focus = Focus::Terminal;
     hover_link(&mut app, 0, 55);
-    app.modifiers = command_modifiers() | winit::keyboard::ModifiersState::SHIFT;
+    app.pointer.modifiers = command_modifiers() | winit::keyboard::ModifiersState::SHIFT;
     let at = cell_center(&app, 0, 55);
     click(&mut app, at);
     let ws = app.editor.workspace.as_ref().unwrap();
@@ -359,7 +359,7 @@ fn terminal_tabs_are_renamed_in_place() {
     app.on_mouse_down(MouseButton::Right);
     app.on_mouse_up(MouseButton::Right);
     assert_eq!(app.terminal.active, 0);
-    let menu = app.context_menu.as_ref().unwrap();
+    let menu = app.overlays.context_menu.as_ref().unwrap();
     assert_eq!(menu.target, MenuTarget::TerminalTab(id));
     app.run_menu_command(MenuCommand::RenameTerminal);
 
@@ -661,13 +661,12 @@ fn the_status_bar_button_slides_the_panel_out_and_back() {
 #[test]
 fn the_terminal_menu_maximizes_and_the_options_apply() {
     use crate::app::input::context_menu::{MenuEntry, MenuTarget};
-    use crate::app::terminal::{DEFAULT_HEIGHT, EDITOR_MIN};
+    use crate::app::terminal::{DEFAULT_HEIGHT, EDITOR_MIN_WIDTH};
     use crate::keymap::Action;
 
     let dir = sample_folder("terminal-menu");
     let mut app = app_with(&dir.join("short.rs"), false);
     show_terminal(&mut app, "$ echo hi\r\nhi\r\n$ ");
-    let full = app.layout.editor.h + app.layout.terminal.h;
 
     // 右键点在网格上：终端的菜单，没有选区时「复制」灰着。
     let right_click = |app: &mut App| {
@@ -675,7 +674,7 @@ fn the_terminal_menu_maximizes_and_the_options_apply() {
         app.on_mouse_move(x, y);
         app.on_mouse_down(MouseButton::Right);
         app.on_mouse_up(MouseButton::Right);
-        let menu = app.context_menu.as_ref().unwrap();
+        let menu = app.overlays.context_menu.as_ref().unwrap();
         assert_eq!(menu.target, MenuTarget::Terminal(None));
         menu.entries
             .iter()
@@ -696,13 +695,19 @@ fn the_terminal_menu_maximizes_and_the_options_apply() {
             (MenuCommand::TerminalMaximize, true),
             (MenuCommand::TerminalDock, true),
             (MenuCommand::NewTerminal, true),
+            (MenuCommand::SplitTerminal, true),
             (MenuCommand::CloseTerminal, true),
         ]
     );
     app.run_menu_command(MenuCommand::SelectAll);
     assert!(right_click(&mut app).contains(&(MenuCommand::Copy, true)));
     app.run_menu_command(MenuCommand::Copy);
-    assert!(app.copied.as_deref().is_some_and(|t| t.contains("echo hi")));
+    assert!(
+        app.clipboard
+            .copied
+            .as_deref()
+            .is_some_and(|t| t.contains("echo hi"))
+    );
 
     // 菜单里切换停靠位置，文字说的是切换后的位置。
     assert_eq!(
@@ -720,36 +725,56 @@ fn the_terminal_menu_maximizes_and_the_options_apply() {
     app.terminal.motion = None;
     app.relayout();
 
-    // 最大化：编辑区只留最小的高度；再来一次还原。
+    // 最大化：面板铺满编辑区一栏（连同顶栏那一行），编辑区和标签栏不占地方；焦点进面板，
+    // 随现场保存；再来一次还原。
+    let l = app.layout;
+    let column = Rect::new(
+        l.top_bar.x,
+        l.top_bar.y,
+        l.top_bar.w,
+        l.terminal.bottom() - l.top_bar.y,
+    );
+    app.focus = Focus::Editor;
     right_click(&mut app);
     app.run_menu_command(MenuCommand::TerminalMaximize);
     assert!(app.terminal.maximized);
-    assert_eq!(app.layout.editor.h, EDITOR_MIN);
-    assert_eq!(app.layout.editor.h + app.layout.terminal.h, full);
+    assert_eq!(app.layout.terminal, column);
+    assert_eq!((app.layout.editor.w, app.layout.tabs.w), (0.0, 0.0));
+    assert_eq!(app.layout.terminal_divider, Rect::default());
+    assert_eq!(app.focus, Focus::Terminal);
+    assert!(app.terminal_session().unwrap().maximized);
     app.run_action(Action::MaximizeTerminal);
     assert!(!app.terminal.maximized);
     assert_eq!(app.layout.terminal.h, DEFAULT_HEIGHT);
+    assert!(!app.terminal_session().unwrap().maximized);
 
-    // 最大化之后拖动分隔条：从当前大小继续拖动，不再是最大化状态。
+    // 面板在右边时最大化：同样铺满这一栏。
+    app.toggle_terminal_position();
+    app.terminal.motion = None;
     app.run_action(Action::MaximizeTerminal);
-    let gap = app.layout.terminal_divider;
-    let (x, y) = (gap.x + 200.0, gap.y + gap.h / 2.0);
-    app.on_mouse_move(x, y);
-    app.on_mouse_down(MouseButton::Left);
-    app.on_mouse_move(x, y + 50.0);
-    app.on_mouse_up(MouseButton::Left);
+    assert_eq!(app.layout.terminal, column);
+    app.run_action(Action::MaximizeTerminal);
+    assert!(app.layout.editor.w >= EDITOR_MIN_WIDTH);
+    app.toggle_terminal_position();
+    app.terminal.motion = None;
+    app.relayout();
+
+    // 最大化时切到某个文件：面板还原，让出编辑区。
+    app.run_action(Action::MaximizeTerminal);
+    app.activate_tab(0);
     assert!(!app.terminal.maximized);
-    assert_eq!(app.layout.editor.h, EDITOR_MIN + 50.0);
+    assert_eq!(app.focus, Focus::Editor);
+    assert_eq!(app.layout.terminal.h, DEFAULT_HEIGHT);
 
     // 选中松开就复制（`copyOnSelect`）。
-    app.copied = None;
+    app.clipboard.copied = None;
     app.config.terminal_copy_on_select = Some(true);
     let (from, to) = (cell_center(&app, 1, 0), cell_center(&app, 1, 1));
-    app.on_mouse_move(from.0 - app.terminal_cell / 2.0 + 0.5, from.1);
+    app.on_mouse_move(from.0 - app.metrics.terminal_cell / 2.0 + 0.5, from.1);
     app.on_mouse_down(MouseButton::Left);
-    app.on_mouse_move(to.0 + app.terminal_cell / 2.0 - 0.5, to.1);
+    app.on_mouse_move(to.0 + app.metrics.terminal_cell / 2.0 - 0.5, to.1);
     app.on_mouse_up(MouseButton::Left);
-    assert_eq!(app.copied.as_deref(), Some("hi"));
+    assert_eq!(app.clipboard.copied.as_deref(), Some("hi"));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -955,6 +980,91 @@ fn bells_and_notifications_reach_the_user() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// 面板铺满编辑区一栏时，提示条和冲突卡片靠在面板内容区域的右上角，消息不被截成省略号；面板
+/// 的查找条打开时排在它下方，输入条在这一区域顶部居中。还原途中仍靠在面板上，还原后回到编辑区。
+#[test]
+fn notices_and_cards_stay_in_the_maximized_terminal() {
+    use crate::app::animation::{Clock, SIDEBAR_ANIMATION};
+    use std::time::{Duration, SystemTime};
+
+    let dir = sample_folder("terminal-max-notice");
+    let dir = winc_config::files::canonicalize(&dir).unwrap();
+    let file = dir.join("short.rs");
+    let mut app = app_with(&file, false);
+    show_terminal(&mut app, "$ ");
+    // 有未保存的修改时磁盘上的文件被其他程序修改：冲突卡片。
+    app.run(Command::Insert("// mine\n".into()));
+    std::fs::write(&file, "fn theirs() {}\n").unwrap();
+    let later = SystemTime::now() + Duration::from_secs(1);
+    (std::fs::File::options().write(true).open(&file).unwrap())
+        .set_modified(later)
+        .unwrap();
+    app.apply_changes(winc_editor::Changes {
+        paths: vec![file.clone()],
+        rescan: false,
+        git: false,
+    });
+    app.run_action(crate::keymap::Action::MaximizeTerminal);
+    assert_eq!(app.layout.editor.w, 0.0);
+    let message = "已复制路径：/tmp/winc/terminal-max-notice/short.rs";
+    app.notify(message);
+    paint(&mut app);
+
+    let area = app.overlay_area();
+    let content = app.terminal_content_card();
+    assert_eq!((area.x, area.right()), (content.x, content.right()));
+    assert!(area.y > content.y && area.bottom() == content.bottom());
+    let (card, buttons) = app.hits.conflict_card.clone().unwrap();
+    let notice = app.hits.notice_card.unwrap();
+    for rect in [card, notice] {
+        assert!(
+            rect.x > area.x && rect.right() < area.right() && rect.y > area.y,
+            "{rect:?}"
+        );
+    }
+    assert!(
+        buttons
+            .iter()
+            .all(|(button, _)| card.contains(button.x, button.y))
+    );
+    assert!(notice.y > card.bottom());
+    // 消息完整显示：提示条比图标和留白宽出整条消息。
+    let mut text = 0.0;
+    let renderer = app.frame.renderer.as_mut().unwrap();
+    renderer.draw(|frame| text = frame.measure(winc_render::FontKind::Ui, app.fonts.ui, message));
+    assert!(notice.w >= text + 34.0, "{} < {text}", notice.w);
+
+    // 面板的查找条打开时排在它下方。
+    app.open_terminal_find();
+    paint(&mut app);
+    let bar = app.terminal_find_bar().unwrap();
+    let (card, _) = app.hits.conflict_card.clone().unwrap();
+    assert!(card.y > bar.bottom());
+    app.close_terminal_find();
+
+    // 输入条在这一区域顶部居中。
+    let prompt = app.prompt_bar();
+    assert!(prompt.w > 0.0 && prompt.x > area.x && prompt.right() < area.right());
+
+    // 还原途中编辑区已排好，提示仍靠在面板上；还原后回到编辑区。
+    app.run_action(crate::keymap::Action::MaximizeTerminal);
+    app.terminal.grow = Some(Clock::stopped(SIDEBAR_ANIMATION, SIDEBAR_ANIMATION / 2));
+    app.relayout();
+    assert!(app.layout.editor.w > 0.0);
+    assert_eq!(
+        app.overlay_area().right(),
+        app.terminal_content_card().right()
+    );
+    app.terminal.grow = None;
+    app.relayout();
+    assert_eq!(app.overlay_area(), app.layout.editor);
+    paint(&mut app);
+    let (card, _) = app.hits.conflict_card.clone().unwrap();
+    assert!(card.right() < app.layout.editor.right());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 #[ignore = "截图，手动运行"]
 fn snapshot_terminal_maximized() {
@@ -998,7 +1108,7 @@ fn crowded_terminal_tabs_shrink_and_keep_the_active_one_in_view() {
     paint(&mut app);
 
     // 都窄到最窄还放不下：正在看的（最后一个）和「+」都在右边的按钮左边，看得见、点得到。
-    assert!(app.terminal.strip.widths.iter().all(|&w| w == TAB_SQUEEZED));
+    assert!(app.terminal.strip.sizes.iter().all(|&w| w == TAB_SQUEEZED));
     let active = header_hit(&app, HeaderHit::Tab(8));
     let plus = header_hit(&app, HeaderHit::New);
     assert_eq!(active.w, TAB_SQUEEZED);
@@ -1193,7 +1303,7 @@ fn the_panel_position_survives_a_restart() {
     let dir = sample_folder("terminal-position");
     let path = dir.join("config.json");
     let mut app = app_with(&dir.join("short.rs"), false);
-    app.config_path = Some(path.clone());
+    app.store.config_path = Some(path.clone());
     show_terminal(&mut app, "$ ");
     app.toggle_terminal_position();
     let (config, _) = winc_config::Config::load_from(&path);

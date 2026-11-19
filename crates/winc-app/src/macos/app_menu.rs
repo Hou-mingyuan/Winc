@@ -9,6 +9,7 @@ use objc2::runtime::Bool;
 
 use super::files::{ns_string, rust_string};
 use super::*;
+use crate::cli::Target;
 
 /// ⌘Q 时调用的回调，返回是否允许立即退出；只在主线程上设置和调用。
 type QuitHandler = Box<dyn Fn() -> bool + Send + Sync>;
@@ -116,17 +117,17 @@ fn add_should_reopen(class: &AnyClass, imp: ShouldReopen) -> bool {
 }
 
 /// 系统交来要打开的文件和目录时调用的回调；只在主线程上设置和调用。
-type OpenHandler = Box<dyn Fn(Vec<PathBuf>) + Send + Sync>;
+type OpenHandler = Box<dyn Fn(Vec<Target>) + Send + Sync>;
 
 static OPEN_HANDLER: OnceLock<OpenHandler> = OnceLock::new();
 
 /// 文件或目录拖到程序坞的图标上、在文件管理器里用「打开方式 → winc」或「服务 → 在 Winc 中
-/// 打开」打开时，以它们的路径调用 `open`（`application:openURLs:`、`openInWinc:userData:error:`）；
-/// winc 还没运行时，系统先启动它再交来。
+/// 打开」打开，或打开 `winc://file/…` 链接时，以要打开的目标调用 `open`
+/// （`application:openURLs:`、`openInWinc:userData:error:`）；winc 还没运行时，系统先启动它再交来。
 ///
 /// 必须在 `winit` 建好事件循环（已设置应用委托）之后、开始运行之前调用：启动时交来的那一批在
 /// `applicationDidFinishLaunching:` 之前就到了。只有第一次调用生效。
-pub fn on_open_files(open: impl Fn(Vec<PathBuf>) + Send + Sync + 'static) {
+pub fn on_open_files(open: impl Fn(Vec<Target>) + Send + Sync + 'static) {
     if OPEN_HANDLER.set(Box::new(open)).is_err() {
         return;
     }
@@ -140,7 +141,7 @@ pub fn on_open_files(open: impl Fn(Vec<PathBuf>) + Send + Sync + 'static) {
 }
 
 /// 实现 `- (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls`：系统交来
-/// 要打开的文件和网址。
+/// 要打开的文件和 `winc://` 链接（见 [`crate::cli::link`]），其他网址跳过。
 extern "C-unwind" fn open_urls(
     _this: *mut AnyObject,
     _cmd: Sel,
@@ -148,19 +149,53 @@ extern "C-unwind" fn open_urls(
     urls: *mut AnyObject,
 ) {
     // SAFETY: `urls` 由 AppKit 传入，在整个调用期间有效（所有权归自动释放池），可为空；不为空时
-    // 是元素均为 NSURL 的 NSArray，满足 `file_paths` 的要求。
-    let paths = unsafe {
+    // 是元素均为 NSURL 的 NSArray，满足 `url_targets` 的要求。
+    let targets = unsafe {
         urls.as_ref()
-            .map(|urls| file_paths(urls))
+            .map(|urls| url_targets(urls))
             .unwrap_or_default()
     };
-    open_paths(paths);
+    open_targets(targets);
 }
 
-/// 把要打开的路径交给 [`on_open_files`] 登记的回调；没有路径时不调用。
-fn open_paths(paths: Vec<PathBuf>) {
-    if let Some(open) = OPEN_HANDLER.get().filter(|_| !paths.is_empty()) {
-        open(paths);
+/// 把要打开的目标交给 [`on_open_files`] 登记的回调；没有目标时不调用。
+fn open_targets(targets: Vec<Target>) {
+    if let Some(open) = OPEN_HANDLER.get().filter(|_| !targets.is_empty()) {
+        open(targets);
+    }
+}
+
+/// 不带行号的一项目标。
+fn whole(path: PathBuf) -> Target {
+    Target {
+        path,
+        line: None,
+        col: None,
+    }
+}
+
+/// 取出 NSURL 数组中的文件和 `winc://` 链接，跳过其他网址。
+///
+/// # Safety
+///
+/// `urls` 必须是元素均为 NSURL 的有效 NSArray，且在调用期间有效。
+unsafe fn url_targets(urls: &AnyObject) -> Vec<Target> {
+    // SAFETY: 由调用方保证 `urls` 是有效的 NSArray；`count` 与 `objectAtIndex:` 是 NSArray 的
+    // 公开方法，下标小于 `count`；元素是 NSURL，由数组持有，在本次调用内有效，判空后使用；
+    // `absoluteString` 返回 NSURL 持有的 NSString 或 nil，判空后立即拷贝。
+    unsafe {
+        let count: usize = msg_send![urls, count];
+        (0..count)
+            .filter_map(|i| {
+                let url: *mut AnyObject = msg_send![urls, objectAtIndex: i];
+                let url = url.as_ref()?;
+                if let Some(path) = super::files::url_path(url) {
+                    return Some(whole(path));
+                }
+                let text: *mut AnyObject = msg_send![url, absoluteString];
+                crate::cli::link(&rust_string(text.as_ref()?)?)
+            })
+            .collect()
     }
 }
 
@@ -202,7 +237,7 @@ extern "C-unwind" fn open_service(
             .map(|p| service_paths(p))
             .unwrap_or_default()
     };
-    open_paths(paths);
+    open_targets(paths.into_iter().map(whole).collect());
 }
 
 /// 读出服务剪贴板中的文件路径。
@@ -404,30 +439,90 @@ pub fn add_install_command_menu(install: impl Fn() + Send + Sync + 'static) {
     };
     add_method(delegate, INSTALL_COMMAND_ACTION, install_command);
 
-    // SAFETY: 用到的 `NSApplication`、`NSMenu` 是公开 API，只在主线程调用。指针先判空再使用；
-    // 取出的 `app`、`main_menu`、`app_item`、`app_menu` 和委托由 AppKit 持有，调用内有效，满足
-    // `insert_install_item` 的要求。
+    // SAFETY: 在主线程调用；`app_menu_and_delegate` 返回的菜单和委托由 AppKit 持有，调用内有效，
+    // 满足 `insert_install_item` 的要求。
     unsafe {
-        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        let Some(app) = app.as_ref() else {
-            return;
-        };
-        let target: *mut AnyObject = msg_send![app, delegate];
-        let Some(target) = target.as_ref() else {
-            return;
-        };
-        let main_menu: *mut AnyObject = msg_send![app, mainMenu];
-        let Some(main_menu) = main_menu.as_ref() else {
-            return;
-        };
-        let app_item: *mut AnyObject = msg_send![main_menu, itemAtIndex: 0isize];
-        let Some(app_item) = app_item.as_ref() else {
-            return;
-        };
-        let app_menu: *mut AnyObject = msg_send![app_item, submenu];
-        if let Some(app_menu) = app_menu.as_ref() {
+        if let Some((app_menu, target)) = app_menu_and_delegate() {
             insert_install_item(app_menu, target);
         }
+    }
+}
+
+/// 返回应用菜单（菜单栏上第一项的子菜单）和应用委托；有一个取不到时返回 `None`。
+///
+/// # Safety
+///
+/// 只能在主线程调用；返回的引用由 `AppKit` 持有，只在本次调用所在的事件回调内使用。
+unsafe fn app_menu_and_delegate<'a>() -> Option<(&'a AnyObject, &'a AnyObject)> {
+    // SAFETY: 由调用方保证在主线程调用。`NSApplication`、`NSMenu`、`NSMenuItem` 是公开 API，
+    // 指针先判空再使用。
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let app = app.as_ref()?;
+        let delegate: *mut AnyObject = msg_send![app, delegate];
+        let main_menu: *mut AnyObject = msg_send![app, mainMenu];
+        let app_item: *mut AnyObject = msg_send![main_menu.as_ref()?, itemAtIndex: 0isize];
+        let app_menu: *mut AnyObject = msg_send![app_item.as_ref()?, submenu];
+        Some((app_menu.as_ref()?, delegate.as_ref()?))
+    }
+}
+
+/// 菜单栏「更新日志」被选中时调用的回调；只在主线程上设置和调用。
+type ReleaseNotesHandler = Box<dyn Fn() + Send + Sync>;
+
+static RELEASE_NOTES_HANDLER: OnceLock<ReleaseNotesHandler> = OnceLock::new();
+
+/// 菜单项「更新日志」的动作名，添加在 `winit` 的应用委托上。
+const RELEASE_NOTES_ACTION: &CStr = c"wincReleaseNotes:";
+
+/// 在应用菜单的「关于」下面添加一项「更新日志」，选中时调用 `open`。
+///
+/// 必须在事件循环开始之后调用；只有第一次调用生效。「检查更新」之后才加入，同样放在「关于」
+/// 下面，因此排在本项之前。
+pub fn add_release_notes_menu(open: impl Fn() + Send + Sync + 'static) {
+    if RELEASE_NOTES_HANDLER.set(Box::new(open)).is_err() {
+        return;
+    }
+
+    /// 实现 `- (void)wincReleaseNotes:(id)sender`：菜单项「更新日志」的动作。
+    extern "C-unwind" fn release_notes(_this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
+        if let Some(open) = RELEASE_NOTES_HANDLER.get() {
+            open();
+        }
+    }
+
+    let Some(delegate) = AnyClass::get(DELEGATE) else {
+        return;
+    };
+    add_method(delegate, RELEASE_NOTES_ACTION, release_notes);
+    let (Some(title), Some(key)) = (
+        ns_string(winc_i18n::t!("menu-release-notes")),
+        ns_string(""),
+    ) else {
+        return;
+    };
+    // SAFETY: 在主线程调用；`app_menu_and_delegate` 返回的菜单和委托由 AppKit 持有，调用内有效。
+    // `NSMenu`、`NSMenuItem` 是公开 API；标题和空的快捷键字符串由 `ns_string` 创建并持有到块
+    // 末尾。菜单项 `alloc` 后 +1，加入菜单后由菜单持有，`release` 抵消。插入下标不超过项数。
+    unsafe {
+        let Some((app_menu, target)) = app_menu_and_delegate() else {
+            return;
+        };
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
+            item,
+            initWithTitle: &*title,
+            action: Sel::register(RELEASE_NOTES_ACTION),
+            keyEquivalent: &*key
+        ];
+        let Some(item) = item.as_ref() else {
+            return;
+        };
+        let () = msg_send![item, setTarget: target];
+        // 「关于」是第 0 项，本项紧跟在它后面。
+        let count: isize = msg_send![app_menu, numberOfItems];
+        let () = msg_send![app_menu, insertItem: item, atIndex: count.min(1)];
+        let () = msg_send![item, release];
     }
 }
 

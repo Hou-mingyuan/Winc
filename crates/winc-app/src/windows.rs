@@ -1,12 +1,19 @@
-//! Windows 上交由系统的操作，读取的系统设置，任务栏的跳转列表，以及按屏幕刷新绘制动画的
-//! 显示链接。
+//! Windows 上交由系统的操作，读取的系统设置，任务栏的跳转列表，按屏幕刷新绘制动画的显示链接，
+//! 以及文件拖进拖出时的鼠标位置和系统拖放。
 
 mod display_link;
+// 测试中以 `TreeState::dragged_out` 代替系统的拖放。
+#[cfg_attr(test, allow(dead_code))]
+mod drag;
 mod jump_list;
+mod pointer;
 mod touch;
 
 pub use display_link::DisplayLink;
+#[cfg_attr(test, allow(unused_imports))]
+pub use drag::drag_files;
 pub use jump_list::sync_jump_list;
+pub use pointer::mouse_location;
 pub use touch::{WindowHitTest, WindowInput};
 
 use std::io;
@@ -87,6 +94,19 @@ pub fn move_to_recycle_bin(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 系统有没有终端要用的伪终端接口（ConPTY，Windows 10 1809 起才有）。
+#[allow(unsafe_code)] // GetModuleHandleW、GetProcAddress
+pub fn has_conpty() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    let name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+    // SAFETY: `kernel32.dll` 在每个进程中都已加载；两个名字都以 NUL 结尾，只查函数在不在。
+    unsafe {
+        let module = GetModuleHandleW(name.as_ptr());
+        !module.is_null()
+            && GetProcAddress(module, c"CreatePseudoConsole".as_ptr().cast()).is_some()
+    }
+}
+
 /// 离开当前接上的控制台；没有接上控制台时没有效果。
 #[allow(unsafe_code)] // FreeConsole
 pub fn detach_console() {
@@ -112,4 +132,24 @@ pub fn attach_console() {
     use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
     // SAFETY: 只接上父进程的控制台，失败（没有父控制台）时没有效果。
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+/// 返回显示器 `monitor`（`HMONITOR`）可用区域的宽度和高度（物理像素）；读取失败时返回 `None`。
+///
+/// 可用区域是显示器减去任务栏等系统保留区域后的部分，最大化的窗口占满可用区域。
+#[allow(unsafe_code)] // GetMonitorInfoW
+pub fn work_size(monitor: isize) -> Option<(f64, f64)> {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+    // SAFETY: `MONITORINFO` 只含整数字段，全零是有效值。
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = size_of::<MONITORINFO>() as u32;
+    // SAFETY: `info` 是可写的栈变量，`cbSize` 已按结构体大小填写；句柄无效时调用失败并返回 0。
+    if unsafe { GetMonitorInfoW(monitor as _, &mut info) } == 0 {
+        return None;
+    }
+    let work = info.rcWork;
+    Some((
+        f64::from(work.right - work.left),
+        f64::from(work.bottom - work.top),
+    ))
 }

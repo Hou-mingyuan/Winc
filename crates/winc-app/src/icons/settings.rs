@@ -3,21 +3,45 @@
 use super::*;
 
 /// 绘制锁图标，9×12：线条风格，锁梁加圆角的锁身，锁身中间一道短竖线是锁孔。
-pub fn lock(frame: &mut Frame<'_>, (cx, cy): (f32, f32), color: Color, clip: Rect) {
-    let (r, top) = (2.25, cy - 2.5);
+pub fn lock(frame: &mut Frame<'_>, center: (f32, f32), color: Color, clip: Rect) {
+    padlock(frame, center, color, clip, (1.0, false));
+}
+
+/// 绘制状态栏的锁图标，约 11×13；`open` 时锁梁右端不与锁身相接。
+pub fn status_lock(
+    frame: &mut Frame<'_>,
+    (cx, cy): (f32, f32),
+    open: bool,
+    color: Color,
+    clip: Rect,
+) {
+    padlock(frame, (cx, cy - 0.5), color, clip, (1.25, open));
+}
+
+/// 绘制锁：各部分的尺寸为 9×12 的锁乘以 `scale`，笔宽不变；`open` 时锁梁右端不与锁身相接。
+fn padlock(
+    frame: &mut Frame<'_>,
+    (cx, cy): (f32, f32),
+    color: Color,
+    clip: Rect,
+    (scale, open): (f32, bool),
+) {
+    let (r, top) = (2.25 * scale, cy - 2.5 * scale);
     let h = GLYPH_STROKE / 2.0;
+    let seat = cy - 0.5 * scale + h;
+    let free = if open { top + 0.5 * scale } else { seat };
     let shackle = [
         Stroke::Arc(cx, top, r, -PI, 0.0),
-        Stroke::Line(cx - r, top, cx - r, cy - 0.5 + h),
-        Stroke::Line(cx + r, top, cx + r, cy - 0.5 + h),
-        Stroke::Line(cx, cy + 1.75, cx, cy + 3.0),
+        Stroke::Line(cx - r, top, cx - r, seat),
+        Stroke::Line(cx + r, top, cx + r, free),
+        Stroke::Line(cx, cy + 1.75 * scale, cx, cy + 3.0 * scale),
     ];
     let body = rounded_outline(
-        cx - 4.5 + h,
-        cy - 0.5 + h,
-        9.0 - 2.0 * h,
-        6.0 - 2.0 * h,
-        1.5,
+        cx - 4.5 * scale + h,
+        seat,
+        9.0 * scale - 2.0 * h,
+        6.0 * scale - 2.0 * h,
+        1.5 * scale,
     );
     let shapes: Strokes<12> = joined(&[&shackle, &body]);
     frame.stroke(shapes.as_slice(), GLYPH_STROKE, color, clip);
@@ -112,6 +136,26 @@ pub fn console(frame: &mut Frame<'_>, (cx, cy): (f32, f32), color: Color, clip: 
         Stroke::Line(x + 7.5, y + 8.0, x + 11.0, y + 8.0),
     ];
     let shapes: Strokes<11> = joined(&[&rounded_outline(x, y, w, h, 2.5), &prompt]);
+    frame.stroke(shapes.as_slice(), RING_STROKE, color, clip);
+}
+
+/// 绘制「主机」图标，13×12：上下两个圆角的机箱，各有一道短线表示指示灯。
+///
+/// 用于连接远端主机的入口和主机列表。
+pub fn server(frame: &mut Frame<'_>, (cx, cy): (f32, f32), color: Color, clip: Rect) {
+    let (w, h) = (13.0, 5.0);
+    let x = cx - w / 2.0;
+    // 两个机箱之间留 2 的空隙，整体在竖直方向居中。
+    let (top, bottom) = (cy - 6.0, cy + 1.0);
+    let lights = [
+        Stroke::Line(x + 3.0, top + 2.5, x + 5.0, top + 2.5),
+        Stroke::Line(x + 3.0, bottom + 2.5, x + 5.0, bottom + 2.5),
+    ];
+    let shapes: Strokes<18> = joined(&[
+        &rounded_outline(x, top, w, h, 1.5),
+        &rounded_outline(x, bottom, w, h, 1.5),
+        &lights,
+    ]);
     frame.stroke(shapes.as_slice(), RING_STROKE, color, clip);
 }
 

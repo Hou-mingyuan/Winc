@@ -7,7 +7,8 @@ impl App {
     pub(super) fn panel_hover_at(&self, x: f32, y: f32) -> Option<Hover> {
         let sidebar = self.layout.sidebar;
 
-        if sidebar.right() <= 0.0 || !(sidebar.contains(x, y) || self.in_commit_overflow(x, y)) {
+        let spilled = self.in_commit_overflow(x, y) || self.in_result_overflow(x, y);
+        if sidebar.right() <= 0.0 || !(sidebar.contains(x, y) || spilled) {
             return None;
         }
 
@@ -32,7 +33,7 @@ impl App {
 
         // 文件视图底部的大纲：按绘制时记下的位置找；分隔条由 `Target::Splitter` 处理。
         if self.layout.outline.contains(x, y) {
-            if self.sidebar.visible && self.layout.splitter.contains(x, y) {
+            if self.panels.sidebar.visible && self.layout.splitter.contains(x, y) {
                 return None;
             }
             return Some(hit(&self.hits.outline, x, y).map_or(Hover::None, Hover::Outline));
@@ -47,25 +48,28 @@ impl App {
             return Some(hit(&self.hits.commit, x, y).map_or(Hover::None, Hover::Commit));
         }
 
-        // 面板只负责顶栏以下、分隔条以左的区域；侧栏开关和分隔条由后面的判断处理。
+        // 面板只负责顶栏以下、分隔条以左的区域；侧栏开关和分隔条由后面的判断处理。写全名的结果行
+        // 覆盖在分隔条和滚动条之上，伸出侧栏的那一段同样属于这一行。
         let panel = self.panel_rect();
-        let on_splitter = self.sidebar.visible && self.layout.splitter.contains(x, y);
+        let over_overflow = self.over_result_overflow_row(y);
+        let on_splitter =
+            self.panels.sidebar.visible && self.layout.splitter.contains(x, y) && !over_overflow;
+        let in_panel = panel.contains(x, y) || self.in_result_overflow(x, y);
 
-        if !self.panel_shown() || !panel.contains(x, y) || on_splitter {
+        if !self.panel_shown() || !in_panel || on_splitter {
             return None;
         }
 
         let parts = self.panel_parts();
-        let g = &self.global;
+        let g = &self.panels.global;
 
         if let Some(button) = parts.button_at(x, y, g.replace_open) {
             return Some(Hover::Panel(button));
         }
 
-        if parts.results.contains(x, y) {
+        if parts.results.contains(x, y) || (over_overflow && self.in_result_overflow(x, y)) {
             let index = self.result_row_at(y)?;
-            let row = self.result_row_rect(index);
-            let (replace, dismiss) = row_actions(row, g.replace_open);
+            let (replace, dismiss) = self.result_actions(index);
 
             return Some(if dismiss.contains(x, y) {
                 Hover::RowAction(index, RowAction::Dismiss)
@@ -120,7 +124,16 @@ impl App {
             self.close_settings();
             return;
         }
+        // 顶部一条的空白处：拖动卡片，正在编辑的输入框保持不变。
+        if part.is_none() && layout.title_strip().contains(x, y) {
+            let grab = (x - layout.card.x, y - layout.card.y);
+            self.pointer.drag = Drag::SettingsCard { grab };
+            return;
+        }
 
+        if !self.keeps_key_edit(part) {
+            self.cancel_key_edit();
+        }
         let editing = self.settings.editing.as_ref().map(|(s, _)| *s);
         if editing.is_some() && part != editing.map(SettingsPart::Field) {
             self.settings_leave_field();
@@ -179,6 +192,15 @@ impl App {
             }
             Some(SettingsPart::Action(setting)) => self.settings_open_menu(setting),
             Some(SettingsPart::Record) => self.toggle_recording(),
+            Some(SettingsPart::Keymap) => self.open_keymap_menu(),
+            Some(
+                part @ (SettingsPart::KeyRow(_)
+                | SettingsPart::KeyEdit(_)
+                | SettingsPart::KeyReset(_)
+                | SettingsPart::KeyRemove(_)
+                | SettingsPart::KeySave
+                | SettingsPart::KeyCancel),
+            ) => self.click_keys_part(part),
             Some(SettingsPart::KeySearch) => {
                 self.set_recording(false);
                 self.focus = Focus::KeySearch;
@@ -214,7 +236,7 @@ impl App {
     /// 点在面板内交给面板处理；点在面板外则关闭面板，不会同时点到下方的内容。
     /// 面板没有打开时返回 `false`。
     pub(super) fn click_picker(&mut self, x: f32, y: f32) -> bool {
-        if !self.picker.open {
+        if !self.overlays.picker.open {
             return false;
         }
 
@@ -241,7 +263,7 @@ impl App {
         if parts.bar.contains(x, y) {
             self.focus = Focus::Picker;
             // 位置浮窗的标题行没有输入框：筛选文字直接打字输入。
-            if self.picker.places.is_none() {
+            if self.overlays.picker.places.is_none() {
                 self.click_field(x, y);
             }
             return true;
@@ -249,12 +271,12 @@ impl App {
 
         self.focus = Focus::Picker;
 
-        if let Some(index) = parts.row_at(y, self.picker.scroll)
-            && index < self.picker.hits.len()
+        if let Some(index) = parts.row_at(y, self.overlays.picker.scroll)
+            && index < self.overlays.picker.hits.len()
         {
             // 分组标题点了没有反应。
             if self.picker_row_selectable(index) {
-                self.picker.selected = index;
+                self.overlays.picker.selected = index;
                 self.picker_accept();
             }
         }
@@ -265,7 +287,7 @@ impl App {
     /// (`x`, `y`) 是否在分隔条上、且不在提交视图里写全名的那一行上：该行覆盖在分隔条之上，与文件
     /// 树的处理相同（见 [`App::target_at`]）。
     fn on_splitter_outside_commit_overflow(&self, x: f32, y: f32) -> bool {
-        self.sidebar.visible
+        self.panels.sidebar.visible
             && self.layout.splitter.contains(x, y)
             && !self.over_commit_overflow_row(y)
     }
@@ -274,7 +296,8 @@ impl App {
     pub(super) fn click_panel(&mut self, x: f32, y: f32) -> bool {
         let sidebar = self.layout.sidebar;
 
-        if sidebar.right() <= 0.0 || !(sidebar.contains(x, y) || self.in_commit_overflow(x, y)) {
+        let spilled = self.in_commit_overflow(x, y) || self.in_result_overflow(x, y);
+        if sidebar.right() <= 0.0 || !(sidebar.contains(x, y) || spilled) {
             return false;
         }
 
@@ -309,7 +332,7 @@ impl App {
         }
 
         if self.layout.outline.contains(x, y) {
-            if self.sidebar.visible && self.layout.splitter.contains(x, y) {
+            if self.panels.sidebar.visible && self.layout.splitter.contains(x, y) {
                 return false;
             }
             if let Some(target) = hit(&self.hits.outline, x, y) {
@@ -339,15 +362,21 @@ impl App {
             return false;
         }
 
-        // 分隔条在侧栏右边缘，由后面的分支处理。
-        if self.sidebar.visible && self.layout.splitter.contains(x, y) {
+        // 分隔条在侧栏右边缘，由后面的分支处理；写全名的结果行覆盖在分隔条之上。
+        if self.panels.sidebar.visible
+            && self.layout.splitter.contains(x, y)
+            && !self.over_result_overflow_row(y)
+        {
             return false;
         }
 
         match self.panel_hover_at(x, y) {
             Some(Hover::Panel(button)) => self.press_panel_button(button),
             Some(Hover::RowAction(index, action)) => self.press_row_action(index, action),
-            Some(Hover::Result(index)) => self.click_result(index),
+            Some(Hover::Result(index)) => {
+                let double = self.click_count(x, y) == 2;
+                self.click_result(index, double);
+            }
             _ => {
                 if let Some(focus) = self.field_at(x, y) {
                     self.focus = focus;
@@ -361,21 +390,32 @@ impl App {
     }
 
     /// 返回鼠标所在输入框对应的焦点；只考虑正在显示的输入框。
-    pub(super) fn field_at(&self, x: f32, y: f32) -> Option<Focus> {
+    pub(in crate::app) fn field_at(&self, x: f32, y: f32) -> Option<Focus> {
         let visible = [
-            (Focus::Search, self.find.open, &self.find.input),
+            (Focus::Search, self.bars.find.open, &self.bars.find.input),
             (
                 Focus::Replace,
-                self.find.open && self.find.replace_open,
-                &self.find.replace_input,
+                self.bars.find.open && self.bars.find.replace_open,
+                &self.bars.find.replace_input,
             ),
         ];
-        let prompt = self.goto_input.as_ref().map(|f| (Focus::Prompt, true, f));
-        let rename = (self.terminal.rename.as_ref()).map(|(_, f)| (Focus::TerminalRename, true, f));
+        let prompt = self
+            .bars
+            .goto_input
+            .as_ref()
+            .map(|f| (Focus::Prompt, true, f));
+        let rename = self.terminal.rename.as_ref().map(|(id, field)| {
+            let shown = self.hits.terminal.iter().any(|(rect, hit)| {
+                matches!(hit, crate::app::terminal::HeaderHit::Tab(index)
+                    if rect.contains(x, y)
+                        && self.terminal.tabs.get(*index).is_some_and(|tab| tab.id == *id))
+            });
+            (Focus::TerminalRename, shown, field)
+        });
         let terminal_find =
             (self.terminal.find.as_ref()).map(|f| (Focus::TerminalFind, true, &f.field));
         let shown = self.panel_shown();
-        let g = &self.global;
+        let g = &self.panels.global;
         let panel = [
             (Focus::GlobalQuery, shown, &g.query),
             (Focus::GlobalReplace, shown && g.replace_open, &g.replace),
@@ -384,7 +424,7 @@ impl App {
             (
                 Focus::CommitMessage,
                 self.commit_shown() && self.commit_compose_shown(),
-                &self.commit.message,
+                &self.git.commit.message,
             ),
         ];
 
@@ -401,7 +441,7 @@ impl App {
     /// 处理对当前输入框的点击：单击放置光标（按住 `Shift` 时扩展选区），双击选词，三击全选。
     pub(in crate::app) fn click_field(&mut self, x: f32, y: f32) {
         let count = self.click_count(x, y);
-        let shift = self.modifiers.shift_key();
+        let shift = self.pointer.modifiers.shift_key();
 
         let Some(field) = self.focused_field() else {
             return;
@@ -413,7 +453,7 @@ impl App {
             3 => field.select_all(),
             _ => {
                 field.set_caret(pos, shift);
-                self.drag = Drag::Field;
+                self.pointer.drag = Drag::Field;
             }
         }
 
@@ -429,7 +469,7 @@ impl App {
     /// 这一行。
     pub(super) fn click_tree(&mut self, x: f32, y: f32) {
         self.focus = Focus::Tree;
-        let (command, shift) = (self.command_held(), self.modifiers.shift_key());
+        let (command, shift) = (self.command_held(), self.pointer.modifiers.shift_key());
 
         // 点在最后一行下面的空白处：不选中任何一项，此时新建的内容放在根目录；
         // 双击则在根目录新建文件。
@@ -470,7 +510,7 @@ impl App {
         let mut drag = TreeDrag::new(ws, index, (x, y));
         drag.sticky = sticky;
         drag.keep = count == 2;
-        self.tree.drag = Some(drag);
+        self.panels.tree.drag = Some(drag);
     }
 
     /// 处理对编辑区窗口坐标 (`x`, `y`)（逻辑像素）处的点击：放置光标，双击选词，三击或点击行号栏
@@ -484,7 +524,7 @@ impl App {
             return;
         }
         self.focus = Focus::Editor;
-        self.preedit.clear();
+        self.ime.preedit.clear();
 
         // 差异、图片、表格这类不显示文本的标签：点击只拿焦点，表格底部的工作表标签例外，
         // 点它会换工作表。
@@ -503,9 +543,9 @@ impl App {
 
         // `⌘` 单击转到定义，其他平台上为 `Ctrl` 单击。
         let jump = if cfg!(target_os = "macos") {
-            self.modifiers.super_key()
+            self.pointer.modifiers.super_key()
         } else {
-            self.modifiers.control_key()
+            self.pointer.modifiers.control_key()
         };
         if jump && count == 1 && !l.gutter.contains(x, y) {
             self.select(pos, pos);
@@ -514,7 +554,10 @@ impl App {
         }
 
         // `⇧⌥` 按下拖动框出一列；`⌥` 单击添加或移除一个光标，按住拖动则添加一个选区。
-        let (shift, alt) = (self.modifiers.shift_key(), self.modifiers.alt_key());
+        let (shift, alt) = (
+            self.pointer.modifiers.shift_key(),
+            self.pointer.modifiers.alt_key(),
+        );
         if alt && !l.gutter.contains(x, y) {
             if shift {
                 self.start_column_drag(x, y);
@@ -524,7 +567,7 @@ impl App {
                 // 点在已有的光标上是移除，不继续拖动。
                 let added = self.editor.active().map(|d| d.selections().0.len()) > before;
                 if added {
-                    self.drag = Drag::AddSelect { origin: pos };
+                    self.pointer.drag = Drag::AddSelect { origin: pos };
                 }
             }
             return;
@@ -544,7 +587,7 @@ impl App {
             2 => {
                 let (a, b) = movement::word_at(doc.text(), pos);
                 doc.selection = Selection::new(a, b);
-                self.drag = Drag::Select {
+                self.pointer.drag = Drag::Select {
                     by_word: true,
                     origin: (a, b),
                 };
@@ -553,12 +596,12 @@ impl App {
                 let (line, _) = doc.text().pos_to_line_col(pos);
                 let span = doc.text().line_span(line);
                 doc.selection = Selection::new(span.start, span.end);
-                self.drag = Drag::SelectLine { line };
+                self.pointer.drag = Drag::SelectLine { line };
             }
             _ => {
                 let anchor = if shift { doc.selection.anchor } else { pos };
                 doc.selection = Selection::new(anchor, pos);
-                self.drag = Drag::Select {
+                self.pointer.drag = Drag::Select {
                     by_word: false,
                     origin: (anchor, anchor),
                 };
@@ -569,13 +612,13 @@ impl App {
     /// 在窗口坐标 (`x`, `y`)（逻辑像素）处开始列选择：先在这里放一个光标，拖动时框出一列。
     pub(super) fn start_column_drag(&mut self, x: f32, y: f32) {
         self.focus = Focus::Editor;
-        self.preedit.clear();
+        self.ime.preedit.clear();
         let x = x.max(self.layout.text.x);
         if let Some(anchor) = self.line_cell_at(x, y) {
             if let Some(doc) = self.editor.active_mut() {
                 doc.record_cursors();
             }
-            self.drag = Drag::Columns { anchor };
+            self.pointer.drag = Drag::Columns { anchor };
             self.drag_columns(x, y, anchor);
         }
     }

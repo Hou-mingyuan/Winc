@@ -112,7 +112,7 @@ fn preview(text: &str) -> String {
 impl App {
     /// 输入条是否为 Vim 模式的命令行或查找。
     pub(crate) fn vim_prompt_open(&self) -> bool {
-        self.goto_input.is_some() && self.prompt_kind.is_vim()
+        self.bars.goto_input.is_some() && self.bars.prompt_kind.is_vim()
     }
 
     /// 打开命令行或查找模式的输入条。
@@ -135,7 +135,7 @@ impl App {
 
     /// 把输入条的文字换成 `text`，光标放在末尾。
     fn vim_line_set(&mut self, text: &str) {
-        if let Some(field) = &mut self.goto_input {
+        if let Some(field) = &mut self.bars.goto_input {
             field.set_text(text);
             field.set_caret(text.len(), false);
         }
@@ -152,7 +152,7 @@ impl App {
         else {
             return false;
         };
-        let ctrl = self.modifiers.control_key();
+        let ctrl = self.pointer.modifiers.control_key();
         let handled = if std::mem::take(&mut line.register) {
             let name = base.chars().next().filter(|_| base.chars().count() == 1);
             if let Some(text) = name.and_then(|name| self.vim_insertion(name, ctrl)) {
@@ -169,8 +169,8 @@ impl App {
                     self.vim_recall(&mut line, older);
                     true
                 }
-                Key::Named(NamedKey::Tab) if self.prompt_kind == PromptKind::VimCommand => {
-                    self.vim_complete(&mut line, self.modifiers.shift_key());
+                Key::Named(NamedKey::Tab) if self.bars.prompt_kind == PromptKind::VimCommand => {
+                    self.vim_complete(&mut line, self.pointer.modifiers.shift_key());
                     true
                 }
                 // 单独的修饰键不打断翻阅与补全。
@@ -205,11 +205,11 @@ impl App {
 
     /// 翻阅历史：只取以开始翻阅时输入的文字为前缀的条目；`older` 为真时取更早的一条。
     fn vim_recall(&mut self, line: &mut Line, older: bool) {
-        let history: Vec<String> = match self.prompt_kind {
+        let history: Vec<String> = match self.bars.prompt_kind {
             PromptKind::VimCommand => shared().command_history().to_vec(),
             _ => shared().search_history().to_vec(),
         };
-        let typed = (self.goto_input.as_ref()).map_or(String::new(), |f| f.text().to_owned());
+        let typed = (self.bars.goto_input.as_ref()).map_or(String::new(), |f| f.text().to_owned());
         let (prefix, index) = line.recall.take().unwrap_or((typed, history.len()));
         let fits = |at: &usize| history[*at].starts_with(&prefix);
         let found = if older {
@@ -232,7 +232,7 @@ impl App {
     ///
     /// 输入条的文字不是上一次补全的结果时重新开始补全。
     fn vim_complete(&mut self, line: &mut Line, back: bool) {
-        let text = (self.goto_input.as_ref()).map_or(String::new(), |f| f.text().to_owned());
+        let text = (self.bars.goto_input.as_ref()).map_or(String::new(), |f| f.text().to_owned());
         let resumed = line.completion.take().filter(|last| last.shown == text);
         let (start, candidates, index) = match resumed {
             Some(last) => {
@@ -248,7 +248,7 @@ impl App {
                 let candidates = match found.kind {
                     Completing::Path => self.vim_paths(partial),
                     Completing::Buffer => {
-                        let names = self.editor.documents.iter().map(|doc| doc.name());
+                        let names = self.editor.tabs().iter().map(|doc| doc.name());
                         let mut names: Vec<String> = names
                             .filter(|name| name.starts_with(partial))
                             .map(|name| name.into_owned())
@@ -304,19 +304,22 @@ impl App {
             None => ("", partial),
         };
         let Ok(entries) =
-            std::fs::read_dir(self.vim_path(if folder.is_empty() { "." } else { folder }))
+            winc_backend::fs::read_dir(self.vim_path(if folder.is_empty() { "." } else { folder }))
         else {
             return Vec::new();
         };
         let mut found: Vec<String> = entries
             .filter_map(Result::ok)
             .filter_map(|entry| {
-                let name = entry.file_name().into_string().ok()?;
+                let name = entry.name.clone().into_string().ok()?;
                 let hidden = name.starts_with('.') && !prefix.starts_with('.');
                 if !name.starts_with(prefix) || hidden {
                     return None;
                 }
-                let slash = if entry.path().is_dir() { "/" } else { "" };
+                // 类别取自目录项，指向目录的符号链接再查一次。
+                let is_dir = entry.kind.is_dir()
+                    || entry.kind.is_symlink() && winc_backend::fs::is_dir(entry.path());
+                let slash = if is_dir { "/" } else { "" };
                 Some(format!("{folder}{name}{slash}"))
             })
             .collect();
@@ -369,21 +372,21 @@ impl App {
             AppCommand::Edit { path: None, .. } => self.flash(t!("editor-vim-unsupported")),
             AppCommand::New { path: None } => self.new_file(),
             AppCommand::BufferStep(step) => {
-                let count = self.editor.documents.len();
+                let count = self.editor.tab_count();
                 for _ in 0..step.unsigned_abs().min(count) {
                     self.cycle_tab(step > 0);
                 }
             }
             AppCommand::BufferNumber(number) => self.vim_activate(number.checked_sub(1)),
             AppCommand::BufferName(name) => {
-                let documents = self.editor.documents.iter();
+                let documents = self.editor.tabs().iter();
                 let found = documents
                     .enumerate()
                     .find(|(_, doc)| doc.name().contains(&name));
                 self.vim_activate(found.map(|(index, _)| index));
             }
             AppCommand::Only => {
-                let others = self.editor.documents.iter().map(|doc| doc.id);
+                let others = self.editor.tabs().iter().map(|doc| doc.id);
                 self.close_tabs(others.filter(|id| Some(*id) != active).collect());
             }
             AppCommand::List(listing) => self.vim_show_list(listing),
@@ -432,7 +435,12 @@ impl App {
         if doc.path.as_ref() == Some(&to) {
             return self.vim_save();
         }
-        if to.exists() && !force {
+        // 远端的路径在界面线程上查不到是否已有文件：不加 `!` 时不写入，不会不经确认就覆盖。
+        let unknown = winc_backend::is_remote(&to) && self.known_folder(&to).is_none();
+        if unknown && !force {
+            return self.flash(t!("editor-vim-file-unknown"));
+        }
+        if !unknown && self.may_exist(&to) && !force {
             return self.flash(t!("editor-vim-file-exists"));
         }
         if doc.path.is_none() {
@@ -471,7 +479,7 @@ impl App {
 
     /// 切换到第 `index` 个文档；不存在时提示。
     fn vim_activate(&mut self, index: Option<usize>) {
-        match index.filter(|index| *index < self.editor.documents.len()) {
+        match index.filter(|index| *index < self.editor.tab_count()) {
             Some(index) => self.activate_tab(index),
             None => self.flash(t!("editor-vim-no-buffer")),
         }
@@ -510,7 +518,7 @@ impl App {
             Some(content[start..=end].iter().collect::<String>())
         });
         let path = word.map(|word| self.vim_path(&word));
-        match path.filter(|path| path.is_file()) {
+        match path.filter(|path| self.may_be_file(path)) {
             Some(path) => self.open_path(&path),
             None => self.flash(t!("editor-vim-no-file")),
         }
@@ -647,7 +655,7 @@ impl App {
                     })
                     .collect()
             }
-            Listing::Buffers => (self.editor.documents.iter().enumerate())
+            Listing::Buffers => (self.editor.tabs().iter().enumerate())
                 .map(|(index, doc)| {
                     let mark = if doc.is_dirty() { " +" } else { "" };
                     VimRow {
@@ -659,19 +667,21 @@ impl App {
                 .collect(),
         };
         self.finish_name_input();
-        self.picker.places = None;
-        self.picker.branch_rows = None;
-        self.picker.location_rows = None;
-        self.picker.folders = false;
-        self.picker.vim_list = Some(VimList {
+        self.overlays.picker.places = None;
+        self.overlays.picker.branch_rows = None;
+        self.overlays.picker.location_rows = None;
+        self.overlays.picker.folders = false;
+        self.overlays.picker.languages = false;
+        self.overlays.picker.remote = None;
+        self.overlays.picker.vim_list = Some(VimList {
             kind: listing,
             rows,
         });
-        self.picker.open = true;
-        self.picker.doc = self.editor.active().map(|doc| doc.id);
-        self.picker.input.set_text("");
-        self.picker.selected = 0;
-        self.picker.scroll = 0.0;
+        self.overlays.picker.open = true;
+        self.overlays.picker.doc = self.editor.active().map(|doc| doc.id);
+        self.overlays.picker.input.set_text("");
+        self.overlays.picker.selected = 0;
+        self.overlays.picker.scroll = 0.0;
         self.focus = Focus::Picker;
         self.picker_refresh();
         self.relayout();
@@ -681,21 +691,22 @@ impl App {
 
     /// 按查询筛选列表：名字或内容中含有查询的各行，不区分大小写。
     pub(in crate::app) fn vim_list_refresh(&mut self) {
-        let needle = self.picker.input.text().to_lowercase();
-        let Some(list) = &self.picker.vim_list else {
+        let needle = self.overlays.picker.input.text().to_lowercase();
+        let Some(list) = &self.overlays.picker.vim_list else {
             return;
         };
         let fits = |row: &VimRow| {
             row.label.to_lowercase().contains(&needle) || row.text.to_lowercase().contains(&needle)
         };
         let rows = list.rows.iter().enumerate();
-        self.picker.hits = (rows.filter(|(_, row)| fits(row)).map(|(index, _)| index)).collect();
+        self.overlays.picker.hits =
+            (rows.filter(|(_, row)| fits(row)).map(|(index, _)| index)).collect();
     }
 
     /// 选中列表中的一行：粘贴寄存器、跳转到标记或切换到文档。
     pub(in crate::app) fn vim_list_accept(&mut self) {
-        let row = (self.picker.hits.get(self.picker.selected))
-            .and_then(|index| self.picker.vim_list.as_ref()?.rows.get(*index));
+        let row = (self.overlays.picker.hits.get(self.overlays.picker.selected))
+            .and_then(|index| self.overlays.picker.vim_list.as_ref()?.rows.get(*index));
         let Some(target) = row.map(|row| row.target) else {
             return;
         };

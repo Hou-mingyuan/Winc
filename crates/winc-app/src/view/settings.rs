@@ -42,11 +42,11 @@ pub(super) fn draw(app: &mut App, frame: &mut Frame<'_>) {
         return;
     }
 
-    // 遮罩颜色很淡，只略微压暗下层内容，卡片自身靠阴影浮起；卡片覆盖的区域不需要再铺遮罩。
+    // 遮罩颜色很淡，只略微压暗下层内容，卡片自身靠阴影浮起。遮罩铺满整个窗口（与动画途中相同），
+    // 卡片移到哪里，下方都已压暗。
     let p = app.palette;
-    let covered = frame.covered(layout.card, RADIUS_CARD);
-    frame.rect_except(app.layout.window, p.scrim, 0.0, covered);
-    // 开始滚动时保存已绘制的窗口和遮罩，滚动期间不再重绘（`draw_scrolling`）。
+    frame.rect(app.layout.window, p.scrim);
+    // 开始滚动或拖动时保存已绘制的窗口和遮罩，期间不再重绘（`draw_scrolling`）。
     if app.settings.scrolled_at.is_some() && app.settings.scroll_base.is_none() {
         app.settings.scroll_base = Some(frame.snapshot(frame.bounds()));
     }
@@ -54,7 +54,7 @@ pub(super) fn draw(app: &mut App, frame: &mut Frame<'_>) {
     draw_dialog(app, frame, &layout);
 }
 
-/// 绘制设置页滚动期间的一帧：恢复保存的窗口画面（含遮罩），只重绘卡片，返回 `true`。
+/// 绘制设置页滚动或拖动期间的一帧：恢复保存的窗口画面（含遮罩），只重绘卡片，返回 `true`。
 ///
 /// 没有快照，或窗口尺寸、缩放比例已变化时返回 `false`，由调用方完整绘制并重新保存快照。
 pub(crate) fn draw_scrolling(app: &mut App, frame: &mut Frame<'_>) -> bool {
@@ -124,9 +124,9 @@ fn draw_dialog(app: &mut App, frame: &mut Frame<'_>, layout: &SettingsLayout) {
     draw_header(app, frame, layout);
 
     // 滚动内容被限制在标题下方的区域内：滚到上方的行不会压在标题上，滚到下方的行不会绘制到
-    // 卡片之外。
+    // 卡片之外。「快捷键」页的搜索框在标题行中，由该页自行裁剪。
     let caret = if layout.page == SettingsPage::Keys && !layout.searching {
-        frame.within(layout.body, |frame| keys::draw(app, frame))
+        keys::draw(app, frame, layout.body)
     } else {
         frame.within(layout.body, |frame| draw_body(app, frame, layout))
     };
@@ -168,8 +168,12 @@ fn draw_nav(app: &App, frame: &mut Frame<'_>, layout: &SettingsLayout) {
         // 「Git」「终端」两项随各自的模块淡入淡出（`App::track_modules`），高度在布局中按显示比例收放；
         // 图标和文字仍按整行的高度居中，不随高度挤压。
         let opacity = match page {
-            SettingsPage::Terminal => app.module_fx.terminal.opacity(app.terminal_enabled()),
-            SettingsPage::Git => app.module_fx.git.opacity(app.git_enabled()),
+            SettingsPage::Terminal => app
+                .motion
+                .module_fx
+                .terminal
+                .opacity(app.terminal_enabled()),
+            SettingsPage::Git => app.motion.module_fx.git.opacity(app.git_enabled()),
             _ => 1.0,
         };
         let full = Rect::new(row.x, row.y, row.w, SETTINGS_NAV_ROW);
@@ -414,7 +418,10 @@ fn draw_row(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) 
 
     match row.setting.control() {
         SettingControl::Font => draw_field(app, frame, row, clip),
-        SettingControl::Command if editing => draw_field(app, frame, row, clip),
+        // 「Git 程序」是填写的路径，没有可选的菜单：始终画成输入框。
+        SettingControl::Command if editing || row.setting == Setting::GitPath => {
+            draw_field(app, frame, row, clip)
+        }
         SettingControl::Command => {
             let (text, dim) = match app.settings.tool_row(row.setting) {
                 Some(r) => (r.tool.clone(), r.unset),
@@ -425,7 +432,7 @@ fn draw_row(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) 
                 None => (t!("format-tool-auto").to_owned(), false),
             };
             let hovered = app.settings.hover == Some(SettingsPart::Field(row.setting));
-            draw_popup(app, frame, row.control, &text, dim, hovered, clip);
+            super::controls::popup_value(app, frame, row.control, &text, dim, hovered, clip);
             None
         }
         SettingControl::Choice => {
@@ -435,11 +442,23 @@ fn draw_row(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) 
             } else if row.setting == Setting::RenderWhitespace {
                 let choice = app.config.render_whitespace.unwrap_or_default();
                 (crate::layout::whitespace_label(choice).to_owned(), false)
+            } else if row.setting == Setting::AutoSave {
+                let choice = app.config.auto_save.unwrap_or_default();
+                (crate::layout::auto_save_label(choice).to_owned(), false)
+            } else if row.setting == Setting::DropFolder {
+                let choice = app.config.drop_folder.unwrap_or_default();
+                (crate::layout::drop_folder_label(choice).to_owned(), false)
+            } else if row.setting == Setting::GitOpenWorktree {
+                let choice = app.config.git_open_worktree.unwrap_or_default();
+                (crate::layout::open_worktree_label(choice).to_owned(), false)
             } else if row.setting == Setting::VimClipboard {
                 let choice = app.config.vim_clipboard.unwrap_or_default();
                 (crate::layout::vim_clipboard_label(choice).to_owned(), false)
             } else if row.setting == Setting::Zoom {
                 (format!("{}%", app.config.ui_zoom.unwrap_or(100)), false)
+            } else if row.setting == Setting::TextWidth {
+                let choice = app.config.markdown_text_width.unwrap_or_default();
+                (crate::layout::text_width_label(choice).to_owned(), false)
             } else if row.setting == Setting::BackgroundFit {
                 let choice = app.config.ui_background_fit.unwrap_or_default();
                 (
@@ -461,6 +480,13 @@ fn draw_row(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) 
                     t!("settings-terminal-position-bottom")
                 };
                 (text.to_owned(), false)
+            } else if row.setting == Setting::TerminalTabPosition {
+                let text = if app.config.terminal_vertical_tabs == Some(true) {
+                    t!("settings-terminal-tab-position-right")
+                } else {
+                    t!("settings-terminal-tab-position-top")
+                };
+                (text.to_owned(), false)
             } else if row.setting == Setting::TerminalOptionAsMeta {
                 let choice = (app.config.option_as_meta).unwrap_or(winc_config::OptionAsMeta::Left);
                 (
@@ -471,7 +497,7 @@ fn draw_row(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) 
                 let none = || t!("settings-skip-on-save-none").to_owned();
                 (app.skipped_on_save().unwrap_or_else(none), false)
             };
-            draw_popup(app, frame, row.control, &text, dim, hovered, clip);
+            super::controls::popup_value(app, frame, row.control, &text, dim, hovered, clip);
             None
         }
         SettingControl::Switch => {
@@ -512,7 +538,7 @@ fn draw_row(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) 
     }
 }
 
-/// 绘制「关于」页的链接：右对齐的显示名后跟外链箭头。
+/// 绘制「关于」页的链接：右对齐的显示名后跟外链箭头；在应用内打开的更新日志后跟朝右的箭头。
 ///
 /// 悬停时只在内容处铺悬停底色（[`crate::layout::value_area`]），点击范围与之相同。
 fn draw_link(app: &App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) {
@@ -526,7 +552,11 @@ fn draw_link(app: &App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) {
     }
     let right = area.right() - SETTINGS_GLYPH_PAD;
     let center = (right - 4.5, area.y + area.h / 2.0);
-    icons::external(frame, center, p.text_dim, clip);
+    if row.setting == Setting::ReleaseNotes {
+        icons::chevron(frame, center, 6.5, Direction::Right, p.text_dim, clip);
+    } else {
+        icons::external(frame, center, p.text_dim, clip);
+    }
     ui_text(
         frame,
         app,
@@ -566,21 +596,43 @@ fn draw_product(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Re
     ui_text(frame, app, x, area, &text, p.text_muted, clip);
 }
 
+/// 找到新版本 `version` 时的说明：不由应用自己更新的安装写明从哪里取得。
+fn found_text(version: &str) -> String {
+    #[cfg(not(target_os = "macos"))]
+    {
+        use crate::updates::Delivery;
+        match crate::updates::delivery() {
+            Some(Delivery::Download) => {
+                return t!("settings-updates-found-download", version = version);
+            }
+            Some(Delivery::Pacman) => {
+                return t!("settings-updates-found-pacman", version = version);
+            }
+            _ => {}
+        }
+    }
+    t!("settings-updates-found", version = version)
+}
+
 /// 「关于」页「更新」一行下方的状态文字和颜色；也是状态栏更新按钮的悬停提示（见
 /// `status::update_tooltip`）。
 pub(in crate::view) fn update_status(app: &App) -> (String, Color) {
     use crate::winc::UpdateState;
     let p = app.palette;
-    match &*app.shared.update_state.borrow() {
+    match &*app.link.shared.update_state.borrow() {
         UpdateState::Off => (t!("settings-updates-off").to_owned(), p.text_muted),
         UpdateState::Idle => (t!("settings-updates-idle").to_owned(), p.text_muted),
         UpdateState::Checking => (t!("settings-updates-checking").to_owned(), p.text_muted),
         UpdateState::Latest => (t!("settings-updates-latest").to_owned(), p.text_muted),
-        UpdateState::Found(version) => (
-            t!("settings-updates-found", version = version.as_str()),
-            p.accent,
+        UpdateState::Found(version) => (found_text(version), p.accent),
+        UpdateState::Failed(None) => (t!("settings-updates-failed").to_owned(), p.text_muted),
+        UpdateState::Failed(Some(failure)) => (
+            t!(
+                "settings-updates-failed-because",
+                reason = failure.message()
+            ),
+            p.text_muted,
         ),
-        UpdateState::Failed => (t!("settings-updates-failed").to_owned(), p.text_muted),
         UpdateState::Downloading(version, percent) => (
             t!(
                 "settings-updates-downloading",
@@ -652,39 +704,6 @@ fn draw_tool_detail(app: &mut App, frame: &mut Frame<'_>, setting: Setting, line
     }
 }
 
-/// 绘制点击后弹出菜单的值：平时是一段右对齐的淡色文本（未选择时 `dim` 为真，颜色更淡），
-/// 其后一对上下小箭头表示可选；悬停时铺悬停底色。
-///
-/// 不绘制边框，样式与字体名等其他设置项一致。
-fn draw_popup(
-    app: &App,
-    frame: &mut Frame<'_>,
-    rect: Rect,
-    text: &str,
-    dim: bool,
-    hovered: bool,
-    clip: Rect,
-) {
-    let p = app.palette;
-    if hovered {
-        frame.rect_clipped(rect, p.hover, RADIUS_ROW, clip);
-    }
-    let area = Rect::new(
-        rect.x + 10.0,
-        rect.y,
-        (rect.w - 10.0 - SETTINGS_GLYPH_PAD).max(0.0),
-        rect.h,
-    );
-    let arrows = (area.right() - 3.0, rect.y + rect.h / 2.0);
-    icons::up_down(frame, arrows, p.text_dim, clip);
-
-    let room = Rect::new(area.x, area.y, (area.w - 16.0).max(0.0), area.h);
-    let text = ellipsize(frame, text, app.fonts.ui, room.w);
-    let w = frame.measure(FontKind::Ui, app.fonts.ui, &text);
-    let color = if dim { p.text_dim } else { p.text_muted };
-    ui_text(frame, app, room.right() - w, room, &text, color, room);
-}
-
 /// 绘制字体名和正在输入的格式化命令：平时是右对齐的一段文本（未设置时显示「系统默认」），
 /// 悬停时铺输入框底色，点击后变成输入框，外圈为强调色（字体名无效时为错误色）。
 ///
@@ -707,6 +726,7 @@ fn draw_field(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect
             (None, t!("settings-command-placeholder"))
         }
         Setting::TerminalShell => (None, t!("settings-terminal-shell-placeholder")),
+        Setting::GitPath => (app.config.git_path.clone(), t!("settings-git-path-auto")),
         _ => (app.config.editor_font.clone(), t!("settings-font-default")),
     };
     // 字体输入框的文字不进入右端的下拉按钮。
@@ -759,9 +779,39 @@ fn draw_field(app: &mut App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect
     // 未设置时显示的「系统默认」「跟随编辑器」是菜单中的一项，与其他取值同色。
     let text = configured.map_or(Cow::Borrowed(placeholder), Cow::Owned);
     let color = p.text_muted;
-    let text = ellipsize(frame, &text, app.fonts.ui, area.w);
-    let w = frame.measure(FontKind::Ui, app.fonts.ui, &text);
-    ui_text(frame, app, area.right() - w, area, &text, color, area);
+    let size = app.fonts.ui;
+    // 字体列表只写第一个字体，其后的后备字体以淡色的「+N」计数；字体名放不下时截去末尾，文件
+    // 路径从中间截短以保留文件名。
+    let list = if font {
+        winc_config::font_list(Some(&text))
+    } else {
+        Vec::new()
+    };
+    let (main, more) = match list.split_first() {
+        Some((first, rest)) if !rest.is_empty() => (*first, format!(" +{}", rest.len())),
+        Some((first, _)) => (*first, String::new()),
+        None => (text.as_ref(), String::new()),
+    };
+    let more_w = frame.measure(FontKind::Ui, size, &more);
+    let room = (area.w - more_w).max(0.0);
+    let path = main.contains(['/', '\\']);
+    let main = if font && !path {
+        truncate_end(frame, main, size, room)
+    } else {
+        ellipsize(frame, main, size, room)
+    };
+    let w = frame.measure(FontKind::Ui, size, &main) + more_w;
+    // 没有下拉按钮时文字的右缘与组内分隔线的右端对齐。
+    let (right, area) = if font {
+        (area.right(), area)
+    } else {
+        (rect.right() - SETTINGS_GLYPH_PAD, rect)
+    };
+    let x = right - w;
+    let end = ui_text(frame, app, x, area, &main, color, area);
+    if !more.is_empty() {
+        ui_text(frame, app, end, area, &more, p.text_dim, area);
+    }
     draw_arrows(app, frame);
     None
 }
@@ -778,20 +828,7 @@ fn draw_switch(app: &App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) {
         Some((setting, clock)) if setting == row.setting => clock.between(1.0 - on, on),
         _ => on,
     };
-    let radius = track.h / 2.0;
-    frame.rect_clipped(track, p.switch_off, radius, clip);
-    if t > 0.0 {
-        let accent = Color {
-            a: p.accent.a * t,
-            ..p.accent
-        };
-        frame.rect_clipped(track, accent, radius, clip);
-    }
-    let knob = track.h - 4.0;
-    let left = track.x + 2.0;
-    let x = left + (track.right() - 2.0 - knob - left) * t;
-    let knob = Rect::new(x, track.y + 2.0, knob, knob);
-    frame.rect_clipped(knob, p.switch_knob, knob.h / 2.0, clip);
+    super::controls::switch(frame, p, track, t, clip);
 }
 
 /// 绘制数值步进控件：「− 13 ＋」。
@@ -839,13 +876,11 @@ fn draw_stepper(app: &App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) 
 fn draw_mode(app: &App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) {
     let p = app.palette;
     let track = row.control;
-    frame.rect_clipped(track, p.hover, RADIUS_ROW + 2.0, clip);
-    let track_bg = super::workspace::panel::over(p.group_bg, p.hover);
-    let (raised, edge) = super::workspace::panel::segment_colors(p, track_bg);
     // 凸起的那一段：换了模式时从原来那一段滑过来（宽度也跟着变），先绘制，字压在上面。
     let index = |choice: ThemeChoice| THEME_CHOICES.iter().position(|c| c.0 == choice);
-    if let Some(to) = index(app.theme_choice).map(|i| theme_segment(track, i)) {
-        let slot = match app.settings.mode_slide {
+    let slot = index(app.theme_choice)
+        .map(|i| theme_segment(track, i))
+        .map(|to| match app.settings.mode_slide {
             Some((from, clock)) => match index(from).map(|i| theme_segment(track, i)) {
                 Some(from) => Rect::new(
                     clock.between(from.x, to.x),
@@ -856,10 +891,8 @@ fn draw_mode(app: &App, frame: &mut Frame<'_>, row: &SettingRow, clip: Rect) {
                 None => to,
             },
             None => to,
-        };
-        frame.rect_clipped(slot, edge, RADIUS_ROW, clip);
-        frame.rect_clipped(slot.inset(0.5, 0.5), raised, RADIUS_ROW - 0.5, clip);
-    }
+        });
+    super::controls::segment_track(frame, p, track, p.group_bg, slot, clip);
     for (i, &(choice, label)) in THEME_CHOICES.iter().enumerate() {
         let label = label();
         let segment = theme_segment(track, i);

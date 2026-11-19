@@ -22,7 +22,7 @@ pub(in crate::view) fn draw_window_controls(app: &App, frame: &mut Frame<'_>) {
     let p = app.palette;
     let window = app.layout.window;
     for (button, control) in app.window_control_rects() {
-        let hovered = app.hover == Hover::WindowControl(control);
+        let hovered = app.pointer.hover == Hover::WindowControl(control);
         let close = control == WindowControl::Close;
         let color = if close && hovered {
             frame.rect_clipped(button, p.error, RADIUS_ROW, window);
@@ -78,7 +78,7 @@ const TAB_DIVIDER: f32 = 14.0;
 /// 宽度贴合文本，介于 [`TAB_WIDTH_MIN`] 和 [`TAB_WIDTH_MAX`] 之间，取整到整像素，文本更长时
 /// 截短；用鼠标关闭标签后，移到关掉的位置上的标签暂用锁定的宽度（见 `TabBar::width_lock`）。
 fn tab_labels(app: &App, frame: &mut Frame<'_>) -> Vec<TabLabel> {
-    let docs = &app.editor.documents;
+    let docs = app.editor.tabs();
     // 只有同名的标签需要标注上级目录：先数出各名字的标签数，名字唯一的标签不再与其余全部标签
     // 逐一比较（每帧都要计算，标签多时是标签数的平方）。
     let names: Vec<_> = docs.iter().map(|d| d.name()).collect();
@@ -159,7 +159,7 @@ fn draw_tabs(app: &mut App, frame: &mut Frame<'_>) {
     // （`App::note_opened_tabs`）。
     let grow: Vec<f32> = app
         .editor
-        .documents
+        .tabs()
         .iter()
         .map(|d| app.tab_grow(d.id))
         .collect();
@@ -194,7 +194,7 @@ fn draw_tabs(app: &mut App, frame: &mut Frame<'_>) {
     let trailing = {
         let last = app
             .editor
-            .documents
+            .tabs()
             .last()
             .map_or(0.0, |d| app.tab_slide(d.id));
         let ghosts = app.tabs.closing.iter().map(|g| {
@@ -251,7 +251,7 @@ fn draw_tabs(app: &mut App, frame: &mut Frame<'_>) {
     let mut lifted = None;
     // 当前、悬停和拖动中的标签有自己的底色，两侧不绘制竖线；拖动中的标签离开了原位，原位两侧的
     // 竖线也不绘制。
-    let hovered = match app.hover {
+    let hovered = match app.pointer.hover {
         Hover::Tab(index, _) => Some(index),
         _ => None,
     };
@@ -287,7 +287,7 @@ fn draw_tabs(app: &mut App, frame: &mut Frame<'_>) {
         });
     }
 
-    for (index, (doc, label)) in app.editor.documents.iter().zip(&labels).enumerate() {
+    for (index, (doc, label)) in app.editor.tabs().iter().zip(&labels).enumerate() {
         let slot = x;
         x += label.width + TAB_GAP;
 
@@ -350,12 +350,19 @@ fn draw_tabs(app: &mut App, frame: &mut Frame<'_>) {
         frame.with_opacity(rest, |frame| fade(frame, right, p.editor_bg, false));
     }
 
-    draw_button(frame, p, new_tab, area, app.hover == Hover::NewTab, false);
+    draw_button(
+        frame,
+        p,
+        new_tab,
+        area,
+        app.pointer.hover == Hover::NewTab,
+        false,
+    );
     icons::plus(frame, center(new_tab), 9.0, p.text_muted, area);
     if let Some(list) = list {
         // 菜单打开时按钮显示为按下状态。
-        let open = app.menu_button == Some(MenuButton::TabList);
-        let hovered = app.hover == Hover::TabList;
+        let open = app.overlays.menu_button == Some(MenuButton::TabList);
+        let hovered = app.pointer.hover == Hover::TabList;
         draw_button(frame, p, list, area, hovered, open);
         let color = if hovered || open {
             p.text
@@ -385,9 +392,9 @@ fn draw_browser_button(app: &App, frame: &mut Frame<'_>) {
     }
     let p = app.palette;
     let present = app.browser_page().is_some();
-    let share = app.module_fx.browser.share(present);
-    let opacity = app.module_fx.browser.opacity(present);
-    let hovered = present && app.hover == Hover::Browser;
+    let share = app.motion.module_fx.browser.share(present);
+    let opacity = app.motion.module_fx.browser.opacity(present);
+    let hovered = present && app.pointer.hover == Hover::Browser;
     // 底色与图标一同淡入淡出，宽度变化途中不显示随按钮移动的底色。
     frame.with_opacity(opacity, |frame| {
         draw_button(frame, p, button, app.layout.top_bar, hovered, false);
@@ -407,16 +414,16 @@ fn draw_preview_button(app: &mut App, frame: &mut Frame<'_>) {
     let group = app.layout.preview;
     let present = app.editor.active().is_some_and(|d| d.can_preview());
     if present {
-        app.module_fx.preview_mode = app.editor.active().map(|d| d.preview_mode());
+        app.motion.module_fx.preview_mode = app.editor.active().map(|d| d.preview_mode());
     }
-    let Some(current) = app.module_fx.preview_mode.filter(|_| group.w > 0.0) else {
+    let Some(current) = app.motion.module_fx.preview_mode.filter(|_| group.w > 0.0) else {
         return;
     };
     let p = app.palette;
-    let share = app.module_fx.preview.share(present);
-    let opacity = app.module_fx.preview.opacity(present);
+    let share = app.motion.module_fx.preview.share(present);
+    let opacity = app.motion.module_fx.preview.opacity(present);
     let segments = crate::layout::preview_segments(group);
-    let hover = app.hover;
+    let hover = app.pointer.hover;
     // 按下底色与图标一同淡入淡出，宽度变化途中不显示随按钮移动的底色。
     frame.with_opacity(opacity, |frame| {
         for (mode, button) in [Source, Split, Preview].into_iter().zip(segments) {
@@ -447,12 +454,14 @@ fn draw_tab(
     let p = app.palette;
     let doc = &app.editor.documents[index];
     let active = app.editor.active == Some(index);
-    let hovered = matches!(app.hover, Hover::Tab(i, _) if i == index);
+    let hovered = matches!(app.pointer.hover, Hover::Tab(i, _) if i == index);
     // 多选里不是当前的标签：底色是当前标签的一半深，文字用当前标签的颜色。
     let marked = !active && app.tabs_multi_selected() && app.tab_selection().contains(&doc.id);
+    // 不在前台的窗格的当前标签：底色同样一半深，文字淡一些，看得出哪个窗格在前台。
+    let behind = active && app.panes.drawing_background;
 
     // 当前的是一块带细边的底（颜色由主题定：带一点强调色，其余是凸起的一块灰），悬停只铺浅色。
-    if marked {
+    if marked || behind {
         frame.rect_clipped(tab, p.tab_fill.alpha(p.tab_fill.a * 0.5), RADIUS_TAB, view);
     } else {
         draw_tab_fill(frame, p, tab, active, hovered, view);
@@ -469,7 +478,7 @@ fn draw_tab(
     } else {
         draw_file_icon(frame, p, icon, &icon_name, view) + 7.0
     };
-    let color = if active || marked {
+    let color = if (active && !behind) || marked {
         p.text
     } else {
         p.text_muted
@@ -490,7 +499,13 @@ fn draw_tab(
         let dot = Rect::new(close.x + 5.0, close.y + 5.0, 6.0, 6.0);
         frame.rect_clipped(dot, p.modified_dot, 3.0, view);
     } else if hovered || active {
-        draw_tab_close(frame, p, close, app.hover == Hover::Tab(index, true), view);
+        draw_tab_close(
+            frame,
+            p,
+            close,
+            app.pointer.hover == Hover::Tab(index, true),
+            view,
+        );
     }
 
     TabHit {

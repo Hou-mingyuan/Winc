@@ -782,3 +782,124 @@ fn collect_returns_relative_slash_separated_paths() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 远端主机上的目录：文件表由远端的一条命令列出，是仓库时遵守其忽略规则，不是仓库时只跳过
+/// 文件树中不显示的名字。
+#[cfg(unix)]
+#[test]
+fn files_on_a_remote_host_are_listed_by_one_command_there() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let local = crate::test_util::scratch("index-remote");
+    for file in [
+        "src/main.rs",
+        "src/deep/lib.rs",
+        "target/out.o",
+        "README.md",
+        ".git-keep",
+    ] {
+        let path = local.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    std::fs::create_dir_all(local.join("node_modules/pkg")).unwrap();
+    std::fs::write(local.join("node_modules/pkg/index.js"), "").unwrap();
+    let target = crate::test_util::loopback("index-remote");
+    let root = winc_backend::virtual_path(&target, local.as_os_str().as_bytes());
+    let listed = |index: &FileIndex| -> Vec<String> {
+        (0..index.len())
+            .map(|i| index.file(i).unwrap().path.to_owned())
+            .collect()
+    };
+
+    // 不是仓库：全部文件，一次往返。
+    let before = winc_backend::remote::requests(&target);
+    let index = FileIndex::collect_now(&root);
+    assert_eq!(winc_backend::remote::requests(&target) - before, 2);
+    let mut all = listed(&index);
+    all.sort();
+    assert_eq!(
+        all,
+        [
+            ".git-keep",
+            "README.md",
+            "node_modules/pkg/index.js",
+            "src/deep/lib.rs",
+            "src/main.rs",
+            "target/out.o"
+        ]
+    );
+    assert_eq!(
+        index.absolute(index.position_of(&root.join("src/main.rs")).unwrap()),
+        Some(root.join("src/main.rs"))
+    );
+
+    // 是仓库：被忽略的文件不收录，未跟踪的照常收录。
+    std::fs::write(local.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&local)
+        .status();
+    if git.is_ok_and(|status| status.success()) {
+        let before = winc_backend::remote::requests(&target);
+        let index = FileIndex::collect_now(&root);
+        assert_eq!(winc_backend::remote::requests(&target) - before, 1);
+        let mut kept = listed(&index);
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                ".git-keep",
+                ".gitignore",
+                "README.md",
+                "src/deep/lib.rs",
+                "src/main.rs"
+            ]
+        );
+    }
+    winc_backend::remote::disconnect(&target);
+}
+
+/// 附加的目录一并收录：路径以目录名开头，按绝对路径查找和还原都对应到所在的目录。
+#[test]
+fn extra_folders_are_indexed_under_their_name() {
+    let base = crate::test_util::scratch("index-extra");
+    let (main, other) = (base.join("main"), base.join("other"));
+    for (dir, file) in [
+        (&main, "src/a.rs"),
+        (&main, "readme.md"),
+        (&other, "lib/b.rs"),
+    ] {
+        let path = dir.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    let idx = FileIndex::collect_now_with(&main, std::slice::from_ref(&other));
+    let mut listed = paths(&idx);
+    listed.sort_unstable();
+    assert_eq!(listed, ["other/lib/b.rs", "readme.md", "src/a.rs"]);
+    assert!(idx.covers(&main, std::slice::from_ref(&other)) && !idx.covers(&main, &[]));
+
+    let at = idx.position_of(&other.join("lib/b.rs")).unwrap();
+    assert_eq!(idx.file(at).unwrap().path, "other/lib/b.rs");
+    assert_eq!(idx.absolute(at).unwrap(), other.join("lib").join("b.rs"));
+    let at = idx.position_of(&main.join("src/a.rs")).unwrap();
+    assert_eq!(idx.absolute(at).unwrap(), main.join("src").join("a.rs"));
+    assert_eq!(idx.position_of(&base.join("elsewhere.rs")), None);
+
+    // 根目录下已有同名的项：前缀加上上级目录的名字，两者不混淆。
+    std::fs::create_dir_all(main.join("other")).unwrap();
+    std::fs::write(main.join("other/c.rs"), "").unwrap();
+    let idx = FileIndex::collect_now_with(&main, std::slice::from_ref(&other));
+    let inner = idx.position_of(&main.join("other/c.rs")).unwrap();
+    let outer = idx.position_of(&other.join("lib/b.rs")).unwrap();
+    assert_eq!(idx.file(inner).unwrap().path, "other/c.rs");
+    let parent = base.file_name().unwrap().to_string_lossy();
+    let labelled = format!("other ({parent})/lib/b.rs");
+    assert_eq!(idx.file(outer).unwrap().path, labelled);
+    assert_eq!(idx.absolute(outer).unwrap(), other.join("lib").join("b.rs"));
+    assert_eq!(
+        idx.absolute(inner).unwrap(),
+        main.join("other").join("c.rs")
+    );
+}

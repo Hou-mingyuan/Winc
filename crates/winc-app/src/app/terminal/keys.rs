@@ -39,13 +39,18 @@ impl App {
     /// 弹出确认框（macOS 上是系统的，其他平台画在窗口里）。
     ///
     /// 剪贴板中没有文字（如只有图片）时按空文字粘贴：程序开启了括号粘贴时收到一次空的括号
-    /// 粘贴，可据此自行读取剪贴板中的图片；未开启时不发送任何内容。
+    /// 粘贴，可据此自行读取剪贴板中的图片；未开启时不发送任何内容。远端主机上的标签例外：
+    /// 那里的程序读不到本机的剪贴板，复制的文件和图片先传过去，再粘贴那里的路径
+    /// （[`App::upload_paste`]）。
     pub(in crate::app) fn terminal_paste(&mut self) {
         let text = self.clipboard_text().unwrap_or_default();
-        let Some(tab) = self.terminal.tab().map(|t| (t.id, t.modes)) else {
+        let Some(tab) = self.terminal.tab().map(|t| (t.id, t.modes, t.cwd.clone())) else {
             return;
         };
-        let (id, modes) = tab;
+        let (id, modes, cwd) = tab;
+        if self.upload_paste(id, &cwd, text.is_empty()) {
+            return;
+        }
         if input::paste_needs_confirm(&text, modes) {
             let message = t!("terminal-paste-confirm", count = text.lines().count());
             if self.window.handle.is_some() {
@@ -120,7 +125,7 @@ impl App {
     pub(crate) fn terminal_scrollbar(&self) -> Option<(Rect, f32, f32)> {
         let tab = self.terminal.tab()?;
         let lh = self.fonts.terminal_line_height;
-        let card = self.layout.terminal;
+        let card = self.terminal_content_card();
         let view = self.terminal_view();
         let track = Rect::new(view.x, view.y, card.right() - view.x, view.h);
         let (position, limit) = tab.scroll_position();
@@ -193,9 +198,11 @@ impl App {
             }
             return;
         }
-        // ⇧PageUp、⇧PageDown 翻回滚缓冲（备用屏上没有回滚缓冲，交给程序）。
+        // Shift+PageUp/PageDown 翻回滚缓冲；备用屏上没有回滚缓冲，交给程序。
         let page = tab.grid_rows().saturating_sub(1).max(1) as isize;
-        if self.modifiers.shift_key() && !tab.modes.has(Modes::ALT_SCREEN) {
+        if self.pointer.modifiers == winit::keyboard::ModifiersState::SHIFT
+            && self.terminal_scroll_keys()
+        {
             match event.logical_key {
                 Key::Named(NamedKey::PageUp) => return self.scroll_terminal(page),
                 Key::Named(NamedKey::PageDown) => return self.scroll_terminal(-page),
@@ -203,6 +210,12 @@ impl App {
             }
         }
         let (modes, keyboard) = (tab.modes, tab.keyboard);
+        let ctrl_v = self.pointer.modifiers == winit::keyboard::ModifiersState::CONTROL
+            && matches!(event.key_without_modifiers(), Key::Character(c)
+                if c.chars().next().is_some_and(|c| latin(c, event.physical_key) == 'v'));
+        if ctrl_v && self.ctrl_v_uploads() {
+            return;
+        }
         if let Some(bytes) = self.encode_terminal_key(event, modes, keyboard) {
             // 输入文字时清除选区，否则 ⌘C 会复制旧内容；方向键和快捷键保留选区。
             let mods = self.terminal_mods();
@@ -210,13 +223,35 @@ impl App {
                 !text.chars().any(char::is_control)
                     && !mods.ctrl
                     && !mods.alt
-                    && !self.modifiers.super_key()
+                    && !self.pointer.modifiers.super_key()
             });
             if typed {
                 self.clear_terminal_selection();
             }
             self.terminal_input(bytes);
         }
+    }
+
+    /// 在正在看的标签里按了 ⌃V：标签在远端主机上、本机剪贴板里有复制的文件或只有图片时，传到
+    /// 那台主机再粘贴路径（见 [`App::upload_paste`]），返回 `true`，不再把 ⌃V 发给程序。
+    ///
+    /// 用 ⌃V 粘贴图片的程序读的是远端的剪贴板，按了也读不到本机的截图；这里让这个习惯的键照样
+    /// 可用。只在有程序运行（[`TermTab::busy`]）、在主屏上、开启了括号粘贴时这样做：shell 的
+    /// 提示符下 ⌃V 是逐字输入下一个键，备用屏上的 vim 是列选择，这些时候照常发给程序。
+    pub(in crate::app) fn ctrl_v_uploads(&mut self) -> bool {
+        let Some(tab) = self.terminal.tab() else {
+            return false;
+        };
+        let (id, cwd, modes) = (tab.id, tab.cwd.clone(), tab.modes);
+        let ready = tab.busy().is_some()
+            && modes.has(Modes::BRACKETED_PASTE)
+            && !modes.has(Modes::ALT_SCREEN)
+            && winc_backend::is_remote(&bytes_path(&cwd));
+        if !ready {
+            return false;
+        }
+        let empty = self.clipboard_text().is_none_or(|text| text.is_empty());
+        self.upload_paste(id, &cwd, empty)
     }
 
     /// 返回编码终端按键和鼠标上报时使用的修饰键。
@@ -227,12 +262,12 @@ impl App {
     /// - 其他平台：Alt 不参与输入字符，一律视为 Meta；winit 在这些平台上不报告左右 Alt 的状态。
     ///   `AltGr` 不计入 Alt，按其输入的字符发送。
     pub(super) fn terminal_mods(&self) -> Mods {
-        let m = self.modifiers;
+        let m = self.pointer.modifiers;
         let meta = m.alt_key()
             && (!cfg!(target_os = "macos")
                 || match self.config.option_as_meta.unwrap_or(OptionAsMeta::Left) {
-                    OptionAsMeta::Left => self.option_side.0,
-                    OptionAsMeta::Right => self.option_side.1,
+                    OptionAsMeta::Left => self.pointer.option_side.0,
+                    OptionAsMeta::Right => self.pointer.option_side.1,
                     OptionAsMeta::Both => true,
                     OptionAsMeta::None => false,
                 });
@@ -245,21 +280,23 @@ impl App {
 
     /// 把一次按键编码成写给终端的字节；这个键在终端里没有意义时返回 `None`。
     fn encode_terminal_key(&self, event: &KeyEvent, modes: Modes, keyboard: u8) -> Option<Vec<u8>> {
-        let m = self.modifiers;
+        let m = self.pointer.modifiers;
         let option = m.alt_key();
         let mods = self.terminal_mods();
 
-        // macOS 上文本框的按键约定：⌘← ⌘→ 到行首行尾，⌘⌫ 删到行首，⌥← ⌥→ 按词移动。
+        // 文本框的按键约定只用于主屏上的行编辑：⌘← ⌘→ 到行首行尾，⌘⌫ 删到行首，⌥← ⌥→ 按词
+        // 移动。备用屏上的程序和启用了键盘协议的程序自行解释这些键，按修饰键原样编码。
+        let editing = !modes.has(Modes::ALT_SCREEN) && keyboard == 0;
         // 其余带 ⌘ 的组合不是快捷键就不发。
         if cfg!(target_os = "macos") && m.super_key() {
             return match &event.logical_key {
-                Key::Named(NamedKey::ArrowLeft) => Some(vec![0x01]),
-                Key::Named(NamedKey::ArrowRight) => Some(vec![0x05]),
-                Key::Named(NamedKey::Backspace) => Some(vec![0x15]),
+                Key::Named(NamedKey::ArrowLeft) if editing => Some(vec![0x01]),
+                Key::Named(NamedKey::ArrowRight) if editing => Some(vec![0x05]),
+                Key::Named(NamedKey::Backspace) if editing => Some(vec![0x15]),
                 _ => None,
             };
         }
-        if option && !mods.ctrl {
+        if option && !mods.ctrl && editing {
             match &event.logical_key {
                 Key::Named(NamedKey::ArrowLeft) => return Some(b"\x1bb".to_vec()),
                 Key::Named(NamedKey::ArrowRight) => return Some(b"\x1bf".to_vec()),
@@ -307,7 +344,12 @@ impl App {
                     return None;
                 };
                 let c = latin(base.chars().next()?, event.physical_key);
-                let c = if mods.shift { shifted(c) } else { c };
+                // 键盘协议要求发送未加 ⇧ 的键码，⇧ 记在修饰位里。
+                let c = if mods.shift && keyboard == 0 {
+                    shifted(c)
+                } else {
+                    c
+                };
                 TermKey::Char(c)
             }
             _ => {

@@ -161,6 +161,21 @@ fn readme_html_becomes_headings_images_and_text() {
     );
 }
 
+/// 没有地址的 `<a id>`、`<a name>` 是锚点：写在段落、标题中时记在其上，单独成块或所在段落
+/// 没有文字时记到下一个段落或标题上；`<a id="…"/>` 不影响后面文字的样式。
+#[test]
+fn html_anchors_land_on_the_next_paragraph_or_heading() {
+    let doc = parse(
+        "<a name=\"Top\"></a>\n\n# 标题\n\n正文 <a id=\"mid\"/>**粗**\n\n<a id=\"x\"></a>\n\n| a |\n|---|\n| <a id=\"cell\"></a>b |\n\n尾\n",
+    );
+    assert!(matches!(&doc.blocks[0], Block::Heading(1, h) if h.ids == ["top"]));
+    let body = paragraph(&doc.blocks[1]);
+    assert_eq!(body.ids, ["mid"]);
+    assert_eq!(spans(body), vec![("正文 ", 0), ("粗", Style::STRONG)]);
+    // 表格前单独成块的锚点和单元格里的锚点都落到表格之后的段落上。
+    assert_eq!(paragraph(&doc.blocks[3]).ids, ["x", "cell"]);
+}
+
 #[test]
 fn footnotes_are_numbered_and_moved_to_the_end() {
     let doc = parse("甲[^b] 乙[^a]\n\n[^a]: A\n\n[^b]: B\n\n尾\n");
@@ -624,4 +639,114 @@ fn a_task_box_without_text_is_already_a_task_item() {
         assert_eq!(items[0].task_source, text.find('[').unwrap(), "{text}");
         assert!(paragraph(&items[0].blocks[0]).text.is_empty(), "{text}");
     }
+}
+
+#[test]
+fn double_equals_highlight_text() {
+    let text = "前面 ==高亮== 后面";
+    let doc = parse(text);
+    let inline = paragraph(&doc.blocks[0]);
+    // 两个 `==` 不显示，中间的文字有底色。
+    assert_eq!(inline.text, "前面 高亮 后面");
+    assert_eq!(
+        spans(inline),
+        vec![("前面 ", 0), ("高亮", Style::MARK), (" 后面", 0)]
+    );
+    // 去掉标记之后，文字仍对应回原文。
+    assert_eq!(
+        source_of(&doc, 0, inline, "后面"),
+        text.find("后面").unwrap()
+    );
+    assert_eq!(
+        source_of(&doc, 0, inline, "高亮"),
+        text.find("高亮").unwrap()
+    );
+}
+
+#[test]
+fn highlight_needs_a_well_formed_pair() {
+    // 只有一个标记、中间是空白、或者标记连成三个 `=` 时都是普通文字。
+    for text in ["a ==b", "a == b ==", "a == == b", "a === b"] {
+        let doc = parse(text);
+        let inline = paragraph(&doc.blocks[0]);
+        assert!(inline.text.contains("=="), "{text}");
+        assert!(
+            inline.runs().all(|(_, style)| !style.has(Style::MARK)),
+            "{text}"
+        );
+    }
+    // 相邻的两段各算一段。
+    let doc = parse("==一== 和 ==二==");
+    let inline = paragraph(&doc.blocks[0]);
+    assert_eq!(
+        spans(inline),
+        vec![("一", Style::MARK), (" 和 ", 0), ("二", Style::MARK)]
+    );
+    // 高亮可以跨行：软换行是空格，硬换行是 `\n`。
+    let doc = parse("==跨\n行==");
+    assert_eq!(
+        spans(paragraph(&doc.blocks[0])),
+        vec![("跨行", Style::MARK)]
+    );
+    let doc = parse("==跨  \n行==");
+    assert_eq!(
+        spans(paragraph(&doc.blocks[0])),
+        vec![("跨\n行", Style::MARK)]
+    );
+    // 标记里面可以再套别的样式。
+    let doc = parse("==**粗**文==");
+    assert_eq!(
+        spans(paragraph(&doc.blocks[0])),
+        vec![("粗", Style::MARK | Style::STRONG), ("文", Style::MARK)]
+    );
+}
+
+#[test]
+fn highlight_skips_code_and_escaped_marks() {
+    // 行内代码里的 `==` 是文字。
+    let doc = parse("`==x==`");
+    let inline = paragraph(&doc.blocks[0]);
+    assert_eq!(inline.text, "==x==");
+    assert_eq!(spans(inline), vec![("==x==", Style::CODE)]);
+    // 转义的 `\==` 是文字，不成对。
+    let doc = parse("a \\==b\\==");
+    let inline = paragraph(&doc.blocks[0]);
+    assert_eq!(inline.text, "a ==b==");
+    assert!(inline.runs().all(|(_, style)| !style.has(Style::MARK)));
+    // 转义的标记不参与配对：其前后的标记仍然成对。
+    let doc = parse("==a\\==b==");
+    assert_eq!(
+        spans(paragraph(&doc.blocks[0])),
+        vec![("a==b", Style::MARK)]
+    );
+    // 两个反斜杠是转义的反斜杠，其后的 `==` 仍是标记。
+    let doc = parse("\\\\==a==");
+    assert_eq!(
+        spans(paragraph(&doc.blocks[0])),
+        vec![("\\", 0), ("a", Style::MARK)]
+    );
+}
+
+#[test]
+fn highlight_leaves_addresses_shown_as_link_text_alone() {
+    // 自动识别的网址和尖括号中的网址：显示的文字就是地址，其中的 `==` 不是标记。
+    for text in ["https://e.com/?q==x==y", "<https://e.com/?q==x==y>"] {
+        let doc = parse(text);
+        let inline = paragraph(&doc.blocks[0]);
+        assert_eq!(inline.text, "https://e.com/?q==x==y", "{text}");
+        assert_eq!(inline.links, ["https://e.com/?q==x==y"], "{text}");
+        assert!(
+            inline.runs().all(|(_, style)| !style.has(Style::MARK)),
+            "{text}"
+        );
+    }
+    // 链接文字不是地址时照常高亮，网址之外的文字不受影响。
+    let doc = parse("[==a==](https://e.com) 与 ==b== https://e.com/?q==x==y");
+    let inline = paragraph(&doc.blocks[0]);
+    assert_eq!(inline.text, "a 与 b https://e.com/?q==x==y");
+    let marked: Vec<&str> = (inline.runs())
+        .filter(|(_, style)| style.has(Style::MARK))
+        .map(|(range, _)| &inline.text[range])
+        .collect();
+    assert_eq!(marked, ["a", "b"]);
 }

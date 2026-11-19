@@ -9,12 +9,16 @@ cmd-find-references = 查找引用
 cmd-go-back = 后退
 cmd-go-forward = 前进
 cmd-settings = 设置
+cmd-release-notes = 更新日志
 cmd-keyboard-shortcuts = 快捷键
 cmd-record-keys = 录制按键
 cmd-new-file = 新建文件
 cmd-new-window = 新建窗口
 cmd-open-file = 打开…
 cmd-open-folder = 打开目录…
+cmd-add-folder = 添加目录到窗口…
+cmd-remote-connect = 远程：连接到 SSH 主机…
+cmd-remote-disconnect = 远程：断开连接
 cmd-open-recent = 打开最近的目录…
 cmd-open-wsl-folder = 打开 WSL 目录
 cmd-save = 保存
@@ -23,6 +27,16 @@ cmd-close-tab = 关闭标签页
 cmd-close-other-tabs = 关闭其他标签页
 cmd-close-all-tabs = 关闭所有标签页
 cmd-reopen-closed = 重新打开关闭的标签页
+cmd-split-right = 向右拆分
+cmd-split-down = 向下拆分
+cmd-move-to-split-right = 移到右侧新窗格
+cmd-move-to-split-down = 移到下方新窗格
+cmd-unsplit = 合并全部窗格
+cmd-next-pane = 下一个窗格
+cmd-previous-pane = 上一个窗格
+cmd-split-terminal = 拆分终端
+cmd-next-terminal-pane = 终端中的下一个窗格
+cmd-previous-terminal-pane = 终端中的上一个窗格
 cmd-next-tab = 下一个标签页
 cmd-previous-tab = 上一个标签页
 cmd-close-folder = 关闭目录
@@ -48,6 +62,7 @@ cmd-markdown-bold = Markdown：切换粗体
 cmd-markdown-italic = Markdown：切换斜体
 cmd-markdown-code = Markdown：切换行内代码
 cmd-markdown-strikethrough = Markdown：切换删除线
+cmd-markdown-highlight = Markdown：切换高亮
 cmd-delete-line = 删除行
 cmd-delete-all-left = 删除到行首
 cmd-indent-lines = 增加缩进
@@ -59,8 +74,8 @@ cmd-copy-lines-down = 向下复制行
 cmd-join-lines = 合并行
 cmd-expand-selection = 扩大选区
 cmd-shrink-selection = 缩小选区
-cmd-add-cursor-above = 在上面添加光标
-cmd-add-cursor-below = 在下面添加光标
+cmd-add-cursor-above = 在上方添加光标
+cmd-add-cursor-below = 在下方添加光标
 cmd-add-next-occurrence = 将选择添加到下一个匹配项
 cmd-skip-to-next-occurrence = 将上次选择移动到下一个匹配项
 cmd-select-all-occurrences = 选择所有匹配项
@@ -128,6 +143,7 @@ cmd-next-result = 下一个搜索结果
 cmd-previous-result = 上一个搜索结果
 cmd-rename-file = 重命名…
 cmd-delete-file = 删除
+cmd-delete-file-permanently = 永久删除
 cmd-open-selected = 打开
 cmd-preview-selected = 打开（焦点保留在文件树）
 cmd-find-in-folder = 在目录中查找…
@@ -157,7 +173,11 @@ cmd-next-diff-file = 下一个文件
 cmd-previous-diff-file = 上一个文件
 cmd-toggle-diff-layout = 切换差异单栏视图
 cmd-git-show-changes = Git：显示差异
+cmd-changes-show-diff = Git：显示选中文件的差异
+cmd-changes-open-source = Git：打开选中的文件
+cmd-changes-rollback = Git：回滚选中的文件
 cmd-git-show-log = Git：显示日志
+cmd-git-go-to-revision = Git：转到提交号、分支或标签…
 cmd-git-show-output = Git：显示输出
 cmd-git-clone = Git：克隆仓库…
 cmd-git-init = Git：初始化仓库
@@ -172,11 +192,17 @@ cmd-git-pull-rebase = Git：拉取并变基
 cmd-git-push = Git：推送
 cmd-git-sync = Git：同步
 cmd-git-stash = Git：储藏更改…
+cmd-git-stage-all = Git：暂存全部更改
+cmd-git-unstage-all = Git：取消暂存全部更改
+cmd-git-stage-file = Git：暂存当前文件
 cmd-git-file-history = Git：显示当前文件的历史
+cmd-git-selection-history = Git：显示所选代码的历史
 cmd-git-blame = Git：逐行追溯
 cmd-show-commit = Git：提交…
 cmd-git-revert-change = Git：回滚光标处的更改
-cmd-toggle-terminal = 显示或隐藏终端
+cmd-toggle-terminal = 聚焦或隐藏终端
+cmd-toggle-terminal-panel = 终端：显示或隐藏面板
+cmd-enable-terminal = 终端：启用内置终端
 cmd-run-configuration = 运行当前配置
 cmd-stop-configuration = 停止当前配置
 cmd-edit-run-configurations = 编辑运行配置
@@ -185,17 +211,28 @@ cmd-new-terminal = 新建终端
 cmd-close-terminal = 终端：关闭标签页
 cmd-next-terminal = 终端：下一个标签页
 cmd-previous-terminal = 终端：上一个标签页
+cmd-terminal-1 = 终端：聚焦第 1 个标签页
+cmd-terminal-2 = 终端：聚焦第 2 个标签页
+cmd-terminal-3 = 终端：聚焦第 3 个标签页
+cmd-terminal-4 = 终端：聚焦第 4 个标签页
+cmd-terminal-5 = 终端：聚焦第 5 个标签页
+cmd-terminal-6 = 终端：聚焦第 6 个标签页
+cmd-terminal-7 = 终端：聚焦第 7 个标签页
+cmd-terminal-8 = 终端：聚焦第 8 个标签页
+cmd-terminal-9 = 终端：聚焦第 9 个标签页
 cmd-find-in-terminal = 终端：查找
 cmd-toggle-terminal-position = 终端：切换面板位置
 cmd-install-shell-command = Shell 命令：安装 winc 命令
 cmd-uninstall-shell-command = Shell 命令：卸载 winc 命令
 shell-command-installed = 已安装 winc 命令：{ $path }
-shell-command-installed-hint = 已安装 winc 命令：{ $path }。如果终端找不到命令，请把 { $dir } 加入 PATH。
+shell-command-installed-hint = 已安装 winc 命令：{ $path }。终端找不到该命令时，请将 { $dir } 加入 PATH。
 shell-command-uninstalled = 已卸载 winc 命令
-shell-command-not-installed = 没有安装 winc 命令
-shell-command-occupied = { $path } 已被其他程序占用，未作改动
+shell-command-not-installed = 尚未安装 winc 命令
+shell-command-occupied = { $path } 已被其他程序占用，未做修改
 shell-command-failed = 无法修改 { $path }：{ $error }
 cmd-maximize-terminal = 终端：最大化面板
+cmd-scroll-terminal-top = 终端：滚动到顶部
+cmd-scroll-terminal-bottom = 终端：滚动到底部
 cmd-rename-terminal = 终端：重命名
 cmd-previous-command = 终端：上一条命令
 cmd-next-command = 终端：下一条命令
@@ -204,13 +241,15 @@ cmd-unfold-output = 终端：展开命令的输出
 cmd-next-error = 终端：下一处错误
 cmd-previous-error = 终端：上一处错误
 cmd-send-to-terminal = 终端：运行选中的代码
+cmd-toggle-read-only-all = 切换全部只读
+cmd-toggle-read-only = 切换只读
 cmd-toggle-preview = 切换预览
 
 ## 执行命令时的提示
 
-cmd-no-selected-file = 没有选中的文件
-cmd-no-file-for-tab = 当前标签页没有对应的文件
-cmd-no-selection = 没有选中的内容
+cmd-no-selected-file = 未选中文件
+cmd-no-file-for-tab = 当前标签页未关联文件
+cmd-no-selection = 未选中任何内容
 cmd-chord-unassigned = { $keys } 未分配任何命令
 cmd-chord-pending = 已按下 { $key }，请按第二个键…
 cmd-one-off-no-new-window = 临时窗口无法新建窗口
@@ -222,16 +261,23 @@ cmd-cli-usage =
 
       winc                  恢复上次打开的目录
       winc .                打开当前目录
-      winc 文件:行[:列]     打开文件并跳到那一行
+      winc 文件:行[:列]     打开文件并转到指定行
+      winc ssh://主机/目录 [ssh://主机/文件:行[:列]]
+                            打开远端主机上的目录和其中的文件（需要启用远程模块）
       winc -                读取标准输入（例如 cargo build 2>&1 | winc -）
-      -w, --wait            等文件的标签都关闭后再退出（例如 git config core.editor "winc -w"）
-      -n, --new-instance    不交给正在运行的 Winc，另开一个进程（例如在 Winc 的终端里运行开发中的版本）
-      -h, --help            显示这些说明
+      -w, --wait            文件的标签页全部关闭后再退出（例如 git config core.editor "winc -w"）
+      -n, --new-instance    不复用正在运行的 Winc，启动新进程（例如在 Winc 的终端中运行开发版本）
+      -h, --help            显示帮助
       -v, --version         显示版本号
 cmd-cli-unknown-option = 无法识别的选项「{ $flag }」
+cmd-cli-bad-link = 无法打开链接「{ $link }」：应为 winc://file/ 加绝对路径
+cmd-cli-bad-ssh = 无法打开「{ $link }」：应为 ssh://[用户@]主机[:端口]/绝对路径
+cmd-cli-ssh-mixed = ssh:// 参数必须指向同一台主机，且不能与本机路径一起使用
+cmd-cli-ssh-one-off = --wait 和 - 不能用于 ssh:// 参数
+cmd-cli-ssh-folders = ssh:// 参数中只能有一个目录，其余应为其中的文件
 cmd-cli-wait-needs-file = --wait 需要指定文件
 cmd-cli-wsl-needs-name = --wsl 需要指定发行版名称
-cmd-cli-wait-needs-openable-file = --wait 需要至少一个可以打开的文件
+cmd-cli-wait-needs-openable-file = --wait 需要至少一个可打开的文件
 cmd-cli-wait-folder = 「{ $path }」是目录，--wait 只能打开文件
 cmd-cli-open-failed = 无法打开「{ $path }」：{ $error }
 cmd-cli-event-loop-failed = 无法创建事件循环：{ $error }
@@ -244,6 +290,7 @@ cmd-when-editor-or-find = 编辑区、查找栏
 cmd-when-replace-input = 替换框
 cmd-when-panel = 搜索视图
 cmd-when-tree = 文件树
+cmd-when-changes = 更改列表
 cmd-when-keys-page = 快捷键搜索
 cmd-when-not-editor = 非编辑区
 cmd-when-terminal = 终端

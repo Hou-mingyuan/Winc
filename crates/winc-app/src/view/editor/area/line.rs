@@ -38,7 +38,7 @@ impl Screen<'_> {
         let (text_rect, lh) = (self.text_rect, self.lh);
         // 第一段的顶边和基线按 `f64` 计算（见 `Screen::line_y`），基线的算法同 `baseline_in`。
         let y = self.line_y(line);
-        let metrics = self.app.mono_metrics;
+        let metrics = self.app.metrics.mono;
         let lead = (lh - (metrics.ascent + metrics.descent)) / 2.0 + metrics.ascent;
         let baseline = (y + f64::from(lead)).round();
         // `head` 为行首最多 `MAX_LINE_CHARS` 个字符：着色只处理这一部分，多数行的内容全在其中。
@@ -48,10 +48,10 @@ impl Screen<'_> {
         let long = chars.len() > MAX_LINE_CHARS || cut_by(content, self.read_cap);
         chars.truncate(MAX_LINE_CHARS);
         let head = &chars[..];
-        // 按整行断开且 `content` 不是整行时，改取屏幕上可见的若干段（行内窗口）；
-        // 其余行绘制 `head`。
+        // 按整行断开且该行超出 `head` 时改取可见的行内窗口，否则绘制 `head`；读到了行尾但超过
+        // `MAX_LINE_CHARS` 个字符的行同样超出 `head`。
         let rows = self.doc.rows_of(line);
-        let window = (rows > 1 && reads_head_only(content))
+        let window = (rows > 1 && long)
             .then(|| {
                 let parts = visible_parts(y, rows, text_rect, lh);
                 self.doc.line_window(line, parts)
@@ -191,9 +191,10 @@ impl Screen<'_> {
                 // 制表符的宽度取决于所在的显示列，不从 0 起时逐个计算。
                 if row.base > 0 {
                     let mut at = row.base;
+                    let mut behind = text::Behind::default();
                     cells[0] = at;
                     for (cell, &c) in cells[1..].iter_mut().zip(row.chars) {
-                        at += text::char_cells(c, at, tab_width);
+                        at += behind.cells(c, at, tab_width);
                         *cell = at;
                     }
                 }
@@ -259,7 +260,7 @@ impl Screen<'_> {
         let (line_start, line_end) = (row.line_start, row.line_end);
         let shown = row.shown_cols();
         if self.show_matches {
-            let current = app.search.current_match();
+            let current = app.bars.search.current_match();
 
             // 只取可见列内的结果；可见段延伸到行尾时取到行尾，包括截断后未显示的部分。
             let to = if shown.end == row.chars.len() {
@@ -267,7 +268,7 @@ impl Screen<'_> {
             } else {
                 line_start + shown.end
             };
-            for &(start, end) in app.search.matches_in(line_start + shown.start, to) {
+            for &(start, end) in app.bars.search.matches_in(line_start + shown.start, to) {
                 let color = if current == Some((start, end)) {
                     p.search_current
                 } else {
@@ -476,7 +477,7 @@ impl Screen<'_> {
             );
             // 按列对齐的表格不支持显示整行。
             if self.columns.is_none() {
-                let hovered = app.hover == Hover::LongLine(row.line);
+                let hovered = app.pointer.hover == Hover::LongLine(row.line);
                 let color = if hovered { p.text } else { p.accent };
                 let show = t!("editor-line-show-whole");
                 let (from, clip) = (x + 8.0, text_rect);
@@ -485,12 +486,33 @@ impl Screen<'_> {
             }
         }
 
+        // 当前行追溯：行尾隔开两个字符宽，用小号淡色字写最后修改这一行的提交。截断、折叠的行
+        // 行尾另有内容，不写。
+        if let Some((line, text)) = &self.line_blame
+            && *line == row.line
+            && row.ends
+            && !row.truncated
+            && !row.collapsed
+        {
+            let x = origin_x + (cells + 2) as f32 * self.cell;
+            let size = app.fonts.ui_small;
+            frame.text(
+                FontKind::Ui,
+                size,
+                x,
+                tail_baseline,
+                text,
+                p.text_dim,
+                text_rect,
+            );
+        }
+
         // 折叠行之后绘制一个含三个点的圆角小块，点击后展开。
         if row.collapsed && row.ends {
             let x = (origin_x + (cells + 1) as f32 * self.cell).round();
             let chip = Rect::new(x, tail_y + 3.0, 22.0, app.fonts.line_height - 6.0);
             frame.rect_clipped(chip, p.selected_inactive, 4.0, text_rect);
-            if app.hover == Hover::Folded(row.line) {
+            if app.pointer.hover == Hover::Folded(row.line) {
                 frame.rect_clipped(chip, p.hover, 4.0, text_rect);
             }
             let cy = (chip.y + chip.h / 2.0 - 1.0).round();
@@ -564,7 +586,8 @@ impl Screen<'_> {
             None => self.cell,
         };
         let baseline = row.baseline + part as f32 * lh;
-        draw_modal_caret(app, frame, (x, y, width), c, baseline, shape, clip);
+        let under = Some((row.chars, pos - row.line_start));
+        draw_modal_caret(app, frame, (x, y, width), under, baseline, shape, clip);
     }
 }
 

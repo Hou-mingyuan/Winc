@@ -12,7 +12,8 @@ impl Document {
         }
     }
 
-    /// 是否在编辑区显示文本：不是图片、不是差异、不是无法打开的文件，且 SVG 没有切换到预览。
+    /// 是否在编辑区显示文本：不是图片、差异、日志、阅读标签或无法打开的文件，且 SVG 没有切换
+    /// 到预览。
     ///
     /// 光标、查找、折叠等只对文本有意义。
     pub fn shows_text(&self) -> bool {
@@ -22,6 +23,7 @@ impl Document {
             && !self.rendered
             && self.diff.is_none()
             && self.log.is_none()
+            && self.reading.is_none()
     }
 
     /// 是否能编辑文本：显示文本（见 [`Document::shows_text`]），或者是 Markdown 的预览（预览
@@ -33,26 +35,21 @@ impl Document {
         self.shows_text() || self.rendered
     }
 
-    /// 是否可以切换到预览：对应磁盘上的 SVG、Markdown、csv 或 tsv 文本文件，且不是大文件。
+    /// 是否可以切换到预览：语言是 SVG、Markdown、CSV 或 TSV 的文本，且不是大文件。
     pub fn can_preview(&self) -> bool {
         self.preview_kind().is_some()
     }
 
     /// 能预览时是哪一种；不能预览时返回 `None`（见 [`Document::can_preview`]）。
+    ///
+    /// 按文档当前的语言判断，与文件名无关：未保存的新文件和扩展名不符的文件选择语言后同样可以预览。
     pub fn preview_kind(&self) -> Option<PreviewKind> {
-        if self.unsupported.is_some() || self.title.is_some() || self.is_large() {
+        if self.unsupported.is_some() || self.title.is_some() {
             return None;
         }
-        let path = self.path.as_deref()?;
-        if winc_preview::image::is_svg(path) {
-            Some(PreviewKind::Svg)
-        } else if winc_preview::markdown::is_markdown(path) {
-            Some(PreviewKind::Markdown)
-        } else if winc_preview::table::is_delimited(path) {
-            Some(PreviewKind::Table)
-        } else {
-            None
-        }
+        let kind = PreviewKind::of(self.highlighter.language())?;
+        // 大文件的原文不在内存中：只有表格可以预览，内容取自磁盘上的文件。
+        (!self.is_large() || kind == PreviewKind::Table).then_some(kind)
     }
 
     /// 是否正在只看预览（SVG 的图、排好版的 Markdown 或 csv 的表格）。

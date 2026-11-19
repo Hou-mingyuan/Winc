@@ -203,3 +203,253 @@ fn names_ending_in_punctuation_are_searched_by_line() {
     assert_eq!(finds("valid?", "def valid? x"), Some(4));
     assert_eq!(finds("valid?", "def valid?x"), None);
 }
+
+/// 嵌入式 C 工程的常见声明：枚举成员、`typedef` 类型、结构体成员、函数指针、全局变量、形参与
+/// 局部变量。
+const EMBEDDED_C: &str = "\
+typedef enum
+{
+    STATE_IDLE = 0,
+    STATE_RUN,          // 运行
+    STATE_MAX
+} app_state_t;
+
+typedef struct {
+    uint8_t  buf[64];
+    uint16_t len;
+    void (*on_rx)(uint8_t byte);
+    unsigned ready : 1;
+} uart_ctx_t;
+
+typedef void (*uart_cb_t)(uint8_t);
+typedef unsigned char u8;
+uint32_t g_tick;
+extern volatile uint32_t g_ticks;
+uint8_t *p_buf;
+char **pp;
+static uart_ctx_t s_ctx;
+static const char *names[] = { \"a\" };
+struct node *next;
+
+static void uart_send(const uint8_t *data, uint16_t size)
+{
+    uart_ctx_t cfg = {0};
+    for (int k = 0; k < size; k++) {
+        cfg.buf[k] = data[k];
+    }
+    if (cfg.len > STATE_RUN) { }
+    configure(
+        STATE_IDLE,
+        size
+    );
+    return cfg;
+}
+";
+
+/// 返回 `name` 在 [`EMBEDDED_C`] 中各处定义的（行号，列号，类别）；`local` 见 [`Finder::new`]。
+fn c_definitions(name: &str, local: bool) -> Vec<(usize, usize, Kind)> {
+    let text = Rope::from_str(EMBEDDED_C);
+    let finder = Finder::new(name, local, false).unwrap();
+    finder
+        .in_text(&text, winc_syntax::detect("a.c"))
+        .into_iter()
+        .map(|(line, d)| (line, d.col, d.kind))
+        .collect()
+}
+
+#[test]
+fn c_declarations_are_definitions() {
+    use Kind::{Binding, Declaration, Parameter};
+    for (name, line, col, kind) in [
+        ("STATE_IDLE", 2, 4, Declaration),
+        ("STATE_RUN", 3, 4, Declaration),
+        ("STATE_MAX", 4, 4, Declaration),
+        ("app_state_t", 5, 2, Declaration),
+        ("buf", 8, 13, Declaration),
+        ("len", 9, 13, Declaration),
+        ("on_rx", 10, 11, Declaration),
+        ("ready", 11, 13, Declaration),
+        ("uart_ctx_t", 12, 2, Declaration),
+        ("uart_cb_t", 14, 15, Declaration),
+        ("u8", 15, 22, Declaration),
+        ("g_tick", 16, 9, Declaration),
+        ("g_ticks", 17, 25, Declaration),
+        ("p_buf", 18, 9, Declaration),
+        ("pp", 19, 7, Declaration),
+        ("s_ctx", 20, 18, Declaration),
+        ("names", 21, 19, Binding),
+        ("next", 22, 13, Declaration),
+    ] {
+        assert_eq!(c_definitions(name, false), [(line, col, kind)], "{name}");
+    }
+    // 只在当前文件内查找时，形参和局部变量也算定义，且是局部的。
+    for (name, line, col, kind) in [
+        ("data", 24, 37, Parameter),
+        ("size", 24, 52, Parameter),
+        ("cfg", 26, 15, Binding),
+        ("k", 27, 13, Binding),
+    ] {
+        let found = c_definitions(name, true);
+        assert_eq!(found, [(line, col, kind)], "{name}");
+        let definition = Definition {
+            col,
+            kind,
+            indented: line != 24,
+        };
+        assert!(definition.is_local(), "{name}");
+        assert!(c_definitions(name, false).is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn c_type_uses_and_statements_are_not_definitions() {
+    // `static uart_ctx_t s_ctx;` 中的 `uart_ctx_t`、`struct node *next;` 中的 `node`。
+    assert_eq!(c_definitions("uart_ctx_t", true).len(), 1);
+    assert!(c_definitions("node", true).is_empty());
+    assert!(c_definitions("uint8_t", true).is_empty());
+    // `configure(` 之后逐行书写的实参不在 `enum` 块内。
+    assert_eq!(
+        c_definitions("STATE_IDLE", true),
+        [(2, 4, Kind::Declaration)]
+    );
+    for line in [
+        "    return cfg;",
+        "    goto out;",
+        "    a * b;",
+        "    x & y;",
+        "import foo;",
+    ] {
+        for name in ["cfg", "out", "b", "y", "foo"] {
+            assert_eq!(finds(name, line), None, "{line}");
+        }
+    }
+    // 只看一行时不检查上下文，单独一个名字的一行按枚举成员算。
+    assert_eq!(finds("STATE_RUN", "    STATE_RUN,"), Some(4));
+    assert_eq!(finds("A", "enum { A, B };"), Some(7));
+    assert_eq!(finds("B", "typedef enum { A = 1, B } ab_t;"), Some(22));
+}
+
+#[test]
+fn member_access_gives_the_receiver_type() {
+    let java = "class LoginController {
+    private final LoginService loginService;
+    @Autowired
+    private Map<String, Handler> handlers;
+    public Result loginVerify(AppToken appToken, String loginToken) {
+        validate(loginToken);
+        var cache = new TokenCache(appToken);
+        cache.put(loginToken);
+        this.loginVerify(appToken, loginToken);
+        handlers.get(loginToken);
+        return Help.ok(loginService.loginVerify(appToken, this.loginService.loginVerify()));
+    }
+}
+";
+    let text = Rope::from_str(java);
+    let at = |line: usize, word: &str, nth: usize| {
+        let content = text.line(line).to_string();
+        let byte = content.match_indices(word).nth(nth).unwrap().0;
+        let col = content[..byte].chars().count();
+        // 光标在名字开头、中间和末尾时结果相同。
+        let found = receiver_type(&text, line, col, word);
+        assert_eq!(receiver_type(&text, line, col + 1, word), found);
+        assert_eq!(
+            receiver_type(&text, line, col + word.chars().count(), word),
+            found
+        );
+        found
+    };
+    assert_eq!(at(10, "loginVerify", 0).as_deref(), Some("LoginService"));
+    assert_eq!(at(10, "loginVerify", 1).as_deref(), Some("LoginService"));
+    assert_eq!(at(7, "put", 0).as_deref(), Some("TokenCache"));
+    assert_eq!(at(9, "get", 0).as_deref(), Some("Map"));
+    assert_eq!(at(10, "ok", 0).as_deref(), Some("Help"));
+    // 指当前对象的接收者、不是成员访问的名字、声明处的名字。
+    assert_eq!(at(8, "loginVerify", 0), None);
+    assert_eq!(at(5, "validate", 0), None);
+    assert_eq!(at(4, "loginVerify", 0), None);
+
+    for (source, word, expected) in [
+        (
+            "let store: &mut Store = open();\nstore.save();\n",
+            "save",
+            Some("Store"),
+        ),
+        (
+            "let store = Store::open();\nstore.save();\n",
+            "save",
+            Some("Store"),
+        ),
+        ("Store::open();\n\n", "open", Some("Store")),
+        ("store = Store()\nstore.save()\n", "save", Some("Store")),
+        (
+            "val store: Store? = null\nstore?.save()\n",
+            "save",
+            Some("Store"),
+        ),
+        (
+            "Store *store = open();\nstore->save();\n",
+            "save",
+            Some("Store"),
+        ),
+        (
+            "store.save()\nconst store = new Store()\n",
+            "save",
+            Some("Store"),
+        ),
+        ("self.save()\nSelf::save()\n", "save", None),
+        ("store = make()\nstore.save()\n", "save", None),
+        ("make().save()\n\n", "save", None),
+    ] {
+        let text = Rope::from_str(source);
+        let line = source
+            .lines()
+            .position(|l| l.contains(&format!("{word}(")))
+            .unwrap();
+        let content = text.line(line).to_string();
+        let col = content.find(word).unwrap();
+        assert_eq!(
+            receiver_type(&text, line, col, word).as_deref(),
+            expected,
+            "{source:?}"
+        );
+    }
+
+    let stem = |name: &str| named_after(Path::new(name), "LoginService");
+    assert_eq!(stem("src/LoginService.java"), Some(true));
+    assert_eq!(stem("src/LoginServiceImpl.java"), Some(false));
+    assert_eq!(stem("src/DefaultLoginService.kt"), Some(false));
+    assert_eq!(stem("src/UserService.java"), None);
+}
+
+#[test]
+fn method_declarations_without_a_body_are_definitions() {
+    for (line, col) in [
+        ("    Token run(String token);", 10),
+        ("    Token run();", 10),
+        (
+            "    List<Token> run(@NotNull final String token, int limit) throws IOException;",
+            16,
+        ),
+        ("    Map<String, List<Token>> run(String... tokens);", 29),
+        ("    std::string run(const std::string& token) const;", 16),
+        ("    Token* run(Token *token);", 11),
+        ("    Token[] run(Token[] tokens);", 12),
+    ] {
+        assert_eq!(finds("run", line), Some(col), "{line}");
+    }
+    // 语句、带实参的对象构造和调用不算。
+    for line in [
+        "    return run(Token token);",
+        "    await run();",
+        "    co_await run();",
+        "    Guard run(mutex);",
+        "    Guard run(mutex, other);",
+        "    Token token = run(String);",
+        "    other.run(Token token);",
+        "    run(Token token);",
+        "Token run(String token);",
+    ] {
+        assert_eq!(finds("run", line), None, "{line}");
+    }
+}

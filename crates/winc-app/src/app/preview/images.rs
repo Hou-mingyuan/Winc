@@ -116,15 +116,17 @@ pub(crate) fn system_glyphs() -> Arc<dyn svg::Glyphs> {
 }
 
 impl App {
-    /// 当前标签换了时，释放既不是当前标签、也不是前一个标签的文档里解码好的图。
+    /// 当前标签换了时，释放既不是当前标签、前一个标签，也不是其他窗格的当前标签的文档里解码
+    /// 好的图。
     fn release_hidden_pictures(&mut self) {
         let active = self.editor.active().map(|d| d.id);
-        let shown = &mut self.images.shown;
+        let shown = &mut self.preview.images.shown;
         if active.is_none() || shown[0] == active {
             return;
         }
         *shown = [active, shown[0]];
-        let keep = *shown;
+        let mut keep = shown.to_vec();
+        keep.extend(self.editor.panes.others.iter().map(|p| p.active));
         for doc in &mut self.editor.documents {
             if !keep.contains(&Some(doc.id)) {
                 doc.release_picture();
@@ -135,11 +137,20 @@ impl App {
 
     /// 当前标签的图片尚未加载时，提交后台加载任务；每次绘制前调用。
     pub(crate) fn advance_images(&mut self) {
+        self.release_hidden_pictures();
+        self.advance_previews();
+    }
+
+    /// 推进当前标签的各种预览：收下后台完成的结果，提交落后的解析、读取和绘制任务。
+    ///
+    /// 拆分后画其他窗格之前也调用：每个窗格有自己的预览状态。
+    pub(crate) fn advance_previews(&mut self) {
+        self.poll_markdown();
+        self.poll_pdf();
         self.advance_split();
         self.advance_markdown();
         self.advance_pdf();
         self.advance_picture_view();
-        self.release_hidden_pictures();
         self.advance_tables();
         let Some(doc) = self.editor.active() else {
             return;
@@ -148,7 +159,7 @@ impl App {
             return;
         }
         let key = (doc.id, doc.revision);
-        if self.images.pending.contains(&key) {
+        if self.preview.images.pending.contains(&key) {
             return;
         }
         // 位图按路径读取；SVG 使用文档当前文本渲染，因此包含未保存的修改。
@@ -170,8 +181,8 @@ impl App {
             };
             Box::new(move || image::load(&path))
         };
-        self.images.pending.insert(key);
-        let (sender, proxy) = (self.images.sender.clone(), self.proxy.clone());
+        self.preview.images.pending.insert(key);
+        let (sender, proxy) = (self.preview.images.sender.clone(), self.link.proxy.clone());
         winc_editor::background::spawn(move || {
             let result = job();
             if sender.send((key.0, key.1, result)).is_ok()
@@ -193,13 +204,13 @@ impl App {
             return;
         };
         let (id, revision) = (doc.id, doc.revision);
-        if self.split.doc != Some(id) {
-            self.split = SplitPreview {
+        if self.preview.split.doc != Some(id) {
+            self.preview.split = SplitPreview {
                 doc: Some(id),
                 ..SplitPreview::default()
             };
         }
-        if self.split.checked == Some(revision) || self.split.pending.is_some() {
+        if self.preview.split.checked == Some(revision) || self.preview.split.pending.is_some() {
             return;
         }
         let Some(rope) = doc.text().rope() else {
@@ -207,8 +218,11 @@ impl App {
         };
         let text = rope.to_string();
         let base = doc.path.as_deref().and_then(|p| p.parent()).map(Into::into);
-        self.split.pending = Some(revision);
-        let (sender, proxy) = (self.images.split_sender.clone(), self.proxy.clone());
+        self.preview.split.pending = Some(revision);
+        let (sender, proxy) = (
+            self.preview.images.split_sender.clone(),
+            self.link.proxy.clone(),
+        );
         winc_editor::background::spawn(move || {
             let base: Option<std::path::PathBuf> = base;
             let result = svg::load(&text, base.as_deref(), Some(system_glyphs()));
@@ -220,12 +234,13 @@ impl App {
         });
     }
 
-    /// 收下分栏预览解析好的一版；文字又改了时下一帧再解析最新的版本。
-    fn accept_split(&mut self, (id, revision, result): Done) {
-        let split = &mut self.split;
-        // 不是正在等的那一版（换过标签，或从预览切过来时已经接手了现成的图）就忽略。
+    /// 收下分栏预览解析好的一版；文字又改了时下一帧再解析最新的版本。不是前台窗格在等的
+    /// 那一版时原样交回。
+    fn accept_split(&mut self, (id, revision, result): Done) -> Option<Done> {
+        let split = &mut self.preview.split;
+        // 不是正在等的那一版（换过标签，或从预览切过来时已经接手了现成的图）就交回。
         if split.doc != Some(id) || split.pending != Some(revision) {
-            return;
+            return Some((id, revision, result));
         }
         split.pending = None;
         split.checked = Some(revision);
@@ -237,6 +252,7 @@ impl App {
             Err(reason) => split.error = Some(reason),
         }
         self.request_redraw();
+        None
     }
 
     /// 提交后台任务，绘制 SVG `picture` 的一部分：整张图为 `size`（宽、高）时的 `region`
@@ -257,13 +273,13 @@ impl App {
         let Source::Vector(drawing) = &picture.source else {
             return;
         };
-        if self.images.drawing.is_some() {
+        if self.preview.images.drawing.is_some() {
             return;
         }
-        self.images.drawing = Some((id, Arc::as_ptr(picture) as usize, size, region, base));
+        self.preview.images.drawing = Some((id, Arc::as_ptr(picture) as usize, size, region, base));
         let (sender, proxy, picture, drawing) = (
-            self.images.rendered_sender.clone(),
-            self.proxy.clone(),
+            self.preview.images.rendered_sender.clone(),
+            self.link.proxy.clone(),
             Arc::clone(picture),
             Arc::clone(drawing),
         );
@@ -283,14 +299,18 @@ impl App {
 
     /// 接收后台完成的结果：加载好的图片放入对应文档，绘制好的 SVG 放入缩放缓存。
     pub(crate) fn poll_images(&mut self) {
-        while let Ok(done) = self.images.receiver.try_recv() {
+        while let Ok(done) = self.preview.images.receiver.try_recv() {
             self.accept_image(done);
         }
-        while let Ok(done) = self.images.split_done.try_recv() {
-            self.accept_split(done);
+        while let Ok(done) = self.preview.images.split_done.try_recv() {
+            self.offer_to_panes(done, Self::accept_split);
         }
-        while let Ok(rendered) = self.images.rendered.try_recv() {
-            self.accept_rendered(rendered);
+        while let Ok(rendered) = self.preview.images.rendered.try_recv() {
+            self.offer_to_panes(rendered, Self::accept_rendered);
+        }
+        // 其他窗格的预览各自收结果，画它们时收下。
+        if self.editor.panes.is_split() {
+            self.request_redraw();
         }
         self.poll_markdown();
         self.poll_pdf();
@@ -298,7 +318,21 @@ impl App {
         self.poll_wallpaper();
     }
 
-    fn accept_rendered(&mut self, (id, picture, raster, base): Rendered) {
+    /// 先交给前台窗格收下 `item`，不要时依次交给其他窗格。
+    fn offer_to_panes<T>(&mut self, item: T, accept: fn(&mut App, T) -> Option<T>) {
+        let Some(mut item) = accept(self, item) else {
+            return;
+        };
+        for pane in self.background_panes() {
+            match self.with_pane(pane, move |app| accept(app, item)) {
+                Some(rest) => item = rest,
+                None => return,
+            }
+        }
+    }
+
+    /// 收下后台绘制好的一块 SVG；不是前台窗格正在显示的图时原样交回。
+    fn accept_rendered(&mut self, (id, picture, raster, base): Rendered) -> Option<Rendered> {
         let px = &raster.pixels;
         let region = [raster.origin.0, raster.origin.1, px.width, px.height];
         let key = (
@@ -308,25 +342,27 @@ impl App {
             region,
             base,
         );
-        if self.images.drawing == Some(key) {
-            self.images.drawing = None;
+        if self.preview.images.drawing == Some(key) {
+            self.preview.images.drawing = None;
         }
         // 文档或图片已经切换时丢弃结果。大小或位置与最新的显示不符的结果仍先使用，
         // 其清晰度高于拉伸旧图；下一帧会按新的大小和位置重新提交绘制。
         let split = self
+            .preview
             .split
             .picture
             .as_ref()
-            .filter(|_| self.split.doc == Some(id));
+            .filter(|_| self.preview.split.doc == Some(id));
         let current = self
             .editor
             .active()
             .filter(|d| d.id == id)
             .and_then(|d| d.picture().or(split));
         if !current.is_some_and(|p| Arc::ptr_eq(p, &picture)) {
-            return;
+            return Some((id, picture, raster, base));
         }
         let cache = self
+            .preview
             .picture_cache
             .take()
             .filter(|c| c.doc == id && Arc::ptr_eq(&c.picture, &picture));
@@ -341,12 +377,13 @@ impl App {
         } else {
             cache.sharp = Some(raster);
         }
-        self.picture_cache = Some(cache);
+        self.preview.picture_cache = Some(cache);
         self.request_redraw();
+        None
     }
 
     fn accept_image(&mut self, (id, revision, result): Done) {
-        self.images.pending.remove(&(id, revision));
+        self.preview.images.pending.remove(&(id, revision));
         if let Some(index) = self.editor.index_of(id)
             && self.editor.documents[index].set_picture(revision, result)
         {
@@ -394,7 +431,7 @@ impl App {
     /// 当前标签换成 `mode` 显示（标签栏右端的三段切换）。
     pub(in crate::app) fn set_preview_mode(&mut self, mode: PreviewMode) {
         // 换了显示方式，键盘先回到文字（只看预览时本来就对着预览）。
-        self.markdown.focused = false;
+        self.preview.markdown.focused = false;
         let top = self.leave_markdown_mode(mode);
         let Some(doc) = self.editor.active_mut() else {
             return;
@@ -402,7 +439,7 @@ impl App {
         // 分栏和预览解析的是同一段文字：版本没变时把已经解析好的图交过去，不再解析一遍，
         // 只按新的大小重画。
         let (id, revision) = (doc.id, doc.revision);
-        let split = &self.split;
+        let split = &self.preview.split;
         let from_split = split
             .picture
             .clone()
@@ -421,9 +458,10 @@ impl App {
             }
             PreviewMode::Split => {
                 if let Some(picture) = from_preview
-                    && !(self.split.doc == Some(id) && self.split.checked == Some(revision))
+                    && !(self.preview.split.doc == Some(id)
+                        && self.preview.split.checked == Some(revision))
                 {
-                    self.split = SplitPreview {
+                    self.preview.split = SplitPreview {
                         doc: Some(id),
                         picture: Some(picture),
                         checked: Some(revision),

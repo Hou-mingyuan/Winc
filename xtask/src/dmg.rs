@@ -79,6 +79,16 @@ pub fn app(target: Option<&str>, prebuilt: bool) -> Result<(PathBuf, String), St
     .map_err(io)?;
     std::fs::write(contents.join("PkgInfo"), "APPL????").map_err(io)?;
     write_services_menu(&contents.join("Resources"))?;
+    // 远端的服务进程是 Linux 的程序，不是本应用的可执行代码：放在 Resources 中，由应用的签名
+    // 一并封存。没有构建过（`cargo xtask server`）时不带，这个应用包不能连接远端主机。
+    let mut servers = 0;
+    for (_, name) in crate::server::PROGRAMS {
+        let built = crate::server::dir().join(name);
+        if built.is_file() {
+            std::fs::copy(&built, contents.join("Resources").join(name)).map_err(io)?;
+            servers += 1;
+        }
+    }
     // 图标必须在签名之前放进去：签名会封存 Resources 里的全部文件。
     let icon = contents.join("Resources").join(format!("{ICON_NAME}.icns"));
     app_icon(&bundle, &icon)?;
@@ -94,6 +104,9 @@ pub fn app(target: Option<&str>, prebuilt: bool) -> Result<(PathBuf, String), St
     run(Command::new("codesign")
         .args(["--verify", "--strict"])
         .arg(&app))?;
+    if servers < crate::server::PROGRAMS.len() {
+        println!("没有构建远端的服务进程（cargo xtask server）：这个应用包不能连接远端主机");
+    }
     if !updates.enabled() {
         println!(
             "没有配置更新通道和公钥（WINC_UPDATE_CHANNELS、WINC_UPDATE_PUBLIC_KEY）：这个应用包不检查更新"
@@ -626,6 +639,9 @@ fn write_services_menu(resources: &Path) -> Result<(), String> {
 /// 有了这一项，文件和文件夹才能拖到程序坞的图标上，「打开方式」里也才列出 Winc。等级是
 /// `Alternate`，不占用其他应用的默认打开方式。
 ///
+/// `CFBundleURLTypes` 声明 `winc` 协议：打开 `winc://file/<绝对路径>[:行[:列]]` 链接时系统交给
+/// Winc（应用委托的 `application:openURLs:`）。
+///
 /// `NSServices` 声明一项服务「在 Winc 中打开」（见 [`SERVICE_TITLE`]），出现在访达右键菜单的
 /// 「服务」中，只针对文本文件（`public.text`）和文件夹。声明了 `NSRequiredContext`，安装后即
 /// 启用；用户可在「系统设置 → 键盘 → 键盘快捷键 → 服务」中关闭。服务由应用委托处理（消息名
@@ -661,6 +677,17 @@ fn info_plist(version: &str, updates: &sparkle::UpdateConfig, arch: &str) -> Str
 			<key>LSItemContentTypes</key>
 			<array>
 				<string>public.folder</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>{BUNDLE_ID}</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>winc</string>
 			</array>
 		</dict>
 	</array>

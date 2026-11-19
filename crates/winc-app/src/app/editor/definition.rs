@@ -119,6 +119,11 @@ pub struct DefinitionSearch {
     at_caret: bool,
     /// 找的是用法而不是定义时，光标所在的那一行（行号从 0 起）：定义本身在这一行，结果中排除。
     usages_of: Option<usize>,
+    /// 成员访问的接收者类型名和当前文件中的同名定义；
+    /// 不是成员访问或接收者的类型定义在当前文件中时为 `None`。
+    ///
+    /// 结果中有以该类型命名的文件时只取这些文件，否则一并列出当前文件中的定义。
+    receiver: Option<(String, Option<Place>)>,
     /// 发起查找时的文档和光标位置（由 `start_place_search` 填入）。
     ///
     /// 搜索结束时用户已经换了标签或挪了光标，就不再弹浮窗、提示或跳转：
@@ -229,12 +234,33 @@ impl App {
             .max_by_key(|(line, _)| *line)
             .or_else(|| elsewhere.first())
             .copied();
-        if let Some((line, col)) = nearest {
+        let root = self.editor.root().map(Path::to_path_buf);
+        // `service.name(…)`：接收者的类型定义在其他文件中时，
+        // 当前文件中的同名方法不是目标，改为在项目中查找。
+        let foreign = root.as_ref().and(doc.text().rope()).and_then(|text| {
+            let type_name = definition::receiver_type(text, caret_line, caret_col, &name)?;
+            let own = path
+                .as_deref()
+                .and_then(|p| definition::named_after(p, &type_name))
+                == Some(true)
+                || Finder::new(&type_name, false, false)
+                    .is_some_and(|finder| !finder.in_text(text, language).is_empty());
+            (!own).then_some((type_name, text))
+        });
+        let receiver = foreign.map(|(type_name, text)| {
+            let file = path.clone().unwrap_or_default();
+            let relative = self.relative_name();
+            let local = nearest.map(|(at, col)| local_place(&file, &relative, text, at, col, len));
+            (type_name, local)
+        });
+        if let Some((line, col)) = nearest
+            && receiver.is_none()
+        {
             self.jump_to(line, col, len);
             return;
         }
 
-        let Some(root) = self.editor.root().map(Path::to_path_buf) else {
+        let Some(root) = root else {
             return self.no_definition(&name, !here.is_empty());
         };
         let query = definition::query(&name, ignore_case);
@@ -247,6 +273,7 @@ impl App {
             from: path.unwrap_or_default(),
             at_caret: !here.is_empty(),
             usages_of: None,
+            receiver,
             origin: None,
         };
         self.start_place_search(search, &root, &query);
@@ -294,17 +321,13 @@ impl App {
         self.request_redraw();
     }
 
-    /// 返回当前文档相对于已打开目录的路径；没有路径或不在目录中时返回文档名。
+    /// 返回当前文档与项目搜索结果同样写法的相对路径；没有路径或没有打开目录时返回文档名。
     fn relative_name(&self) -> String {
         let Some(doc) = self.editor.active() else {
             return String::new();
         };
-        match (doc.path.as_deref(), self.editor.root()) {
-            (Some(path), Some(root)) => path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .display()
-                .to_string(),
+        match (doc.path.as_deref(), self.editor.workspace.as_ref()) {
+            (Some(path), Some(workspace)) => workspace.labelled_path(path),
             _ => doc.name().into_owned(),
         }
     }
@@ -336,17 +359,19 @@ impl App {
             from: doc.path.clone().unwrap_or_default(),
             at_caret: true,
             usages_of: Some(line),
+            receiver: None,
             origin: None,
         };
         self.start_place_search(search, &root, &query);
     }
 
-    /// 在 `root` 下后台开始搜索 `query`，搜索进展由 [`Self::poll_definitions`] 处理。
+    /// 在 `root` 和附加目录下后台开始搜索 `query`，搜索进展由 [`Self::poll_definitions`] 处理。
     ///
     /// 未保存的文档按内存中的内容搜索。
     fn start_place_search(&mut self, mut search: DefinitionSearch, root: &Path, query: &Query) {
+        search.engine.set_extra_folders(self.extra_folders());
         let dirty = self.dirty_ropes();
-        let proxy = self.proxy.clone();
+        let proxy = self.link.proxy.clone();
         let wake = move || {
             if let Some(proxy) = &proxy {
                 let _ = proxy.send_event(UserEvent::Definitions);
@@ -354,10 +379,10 @@ impl App {
         };
         search.engine.start(root, query, dirty, wake);
         search.origin = self.editor.active().map(|d| (d.id, d.selection.head));
-        self.definitions = Some(search);
+        self.jumps.definitions = Some(search);
         // 测试中没有事件循环，同步等待搜索结束。
-        if self.proxy.is_none()
-            && let Some(search) = &mut self.definitions
+        if self.link.proxy.is_none()
+            && let Some(search) = &mut self.jumps.definitions
         {
             search.engine.wait();
         }
@@ -369,14 +394,14 @@ impl App {
     /// 搜索结束后在后台线程中剔除不算数的命中（测试中没有事件循环，同步进行），全部完成后：只有
     /// 一处结果就跳转，有多处则列出供选择，没有则在状态栏提示。
     pub(in crate::app) fn poll_definitions(&mut self) {
-        let Some(mut search) = self.definitions.take() else {
+        let Some(mut search) = self.jumps.definitions.take() else {
             return;
         };
         if let Some(receiver) = &search.filtering {
             match receiver.try_recv() {
                 Ok(results) => search.engine.results = results,
                 Err(mpsc::TryRecvError::Empty) => {
-                    self.definitions = Some(search);
+                    self.jumps.definitions = Some(search);
                     return;
                 }
                 // 后台线程异常退出：结果已交给它，按没有结果处理。
@@ -385,14 +410,14 @@ impl App {
         } else {
             search.engine.poll();
             if search.engine.is_running() {
-                self.definitions = Some(search);
+                self.jumps.definitions = Some(search);
                 return;
             }
             let results = std::mem::take(&mut search.engine.results);
             let dirty: HashMap<PathBuf, Rope> = self.dirty_ropes().into_iter().collect();
             let filter = Arc::clone(&search.filter);
             let usages = search.usages_of.is_some();
-            match self.proxy.clone() {
+            match self.link.proxy.clone() {
                 None => search.engine.results = filter_results(&filter, usages, results, &dirty),
                 Some(proxy) => {
                     let (sender, receiver) = mpsc::channel();
@@ -401,7 +426,7 @@ impl App {
                         let _ = proxy.send_event(UserEvent::Definitions);
                     });
                     search.filtering = Some(receiver);
-                    self.definitions = Some(search);
+                    self.jumps.definitions = Some(search);
                     return;
                 }
             }
@@ -459,8 +484,25 @@ impl App {
             if items.iter().any(|p| search.filter.is_related(&p.path)) {
                 items.retain(|p| search.filter.is_related(&p.path));
             }
+            let exact = |p: &Place, type_name: &str| definition::named_after(&p.path, type_name);
+            let type_name = search.receiver.as_ref().map(|(name, _)| name.as_str());
+            if let Some(name) = type_name
+                && items.iter().any(|p| exact(p, name).is_some())
+            {
+                items.retain(|p| exact(p, name).is_some());
+            } else if let Some((_, Some(local))) = &search.receiver {
+                // 没有以接收者类型命名的文件时类型推断可能有误，一并列出当前文件中的定义。
+                items.push(local.clone());
+            }
             items.sort_by(|a, b| {
-                let key = |p: &Place| definition::rank(&p.path, search.language, &dir);
+                let key = |p: &Place| {
+                    let named = type_name.and_then(|name| exact(p, name)) != Some(true);
+                    (
+                        named,
+                        p.path != *from,
+                        definition::rank(&p.path, search.language, &dir),
+                    )
+                };
                 key(a)
                     .cmp(&key(b))
                     .then_with(|| a.relative.cmp(&b.relative))
@@ -526,15 +568,17 @@ impl App {
         );
         let origin = self.relative_name();
         self.finish_name_input();
-        self.picker.places_out = None;
-        self.name_hint = None;
-        self.picker.places_wheel = 0.0;
-        self.picker.places_in = self.clock(POPUP_IN);
-        self.picker.branch_rows = None;
-        self.picker.location_rows = None;
-        self.picker.folders = false;
-        self.picker.vim_list = None;
-        self.picker.places = Some(Places {
+        self.overlays.picker.places_out = None;
+        self.jumps.name_hint = None;
+        self.overlays.picker.places_wheel = 0.0;
+        self.overlays.picker.places_in = self.clock(POPUP_IN);
+        self.overlays.picker.branch_rows = None;
+        self.overlays.picker.location_rows = None;
+        self.overlays.picker.folders = false;
+        self.overlays.picker.languages = false;
+        self.overlays.picker.vim_list = None;
+        self.overlays.picker.remote = None;
+        self.overlays.picker.places = Some(Places {
             kind,
             name,
             items,
@@ -542,9 +586,9 @@ impl App {
             anchor,
             widest_label: Default::default(),
         });
-        self.picker.open = true;
-        self.picker.doc = self.editor.active().map(|d| d.id);
-        self.picker.input.set_text("");
+        self.overlays.picker.open = true;
+        self.overlays.picker.doc = self.editor.active().map(|d| d.id);
+        self.overlays.picker.input.set_text("");
         self.focus = Focus::Picker;
         self.picker_refresh();
         self.relayout();
@@ -553,11 +597,11 @@ impl App {
 
     /// 按输入框的文字筛选列表：路径或所在行的内容包含输入的文字（不区分大小写）即保留。
     pub(in crate::app) fn places_refresh(&mut self) {
-        let query = self.picker.input.text().trim().to_lowercase();
-        let Some(places) = &self.picker.places else {
+        let query = self.overlays.picker.input.text().trim().to_lowercase();
+        let Some(places) = &self.overlays.picker.places else {
             return;
         };
-        self.picker.hits = places
+        self.overlays.picker.hits = places
             .items
             .iter()
             .enumerate()
@@ -572,11 +616,11 @@ impl App {
 
     /// 处理列表中的回车：关闭面板并跳转到所选的一处。
     pub(in crate::app) fn places_accept(&mut self) {
-        let Some(&i) = self.picker.hits.get(self.picker.selected) else {
+        let Some(&i) = self.overlays.picker.hits.get(self.overlays.picker.selected) else {
             return;
         };
         // 所选的一项不存在时面板保持打开，列表也留在原处。
-        let Some(mut places) = self.picker.places.take_if(|p| i < p.items.len()) else {
+        let Some(mut places) = self.overlays.picker.places.take_if(|p| i < p.items.len()) else {
             return;
         };
         let place = places.items.swap_remove(i);
@@ -603,13 +647,13 @@ impl App {
             return;
         };
 
-        self.global.case_sensitive = true;
-        self.global.whole_word = true;
-        self.global.regex = false;
-        self.global.query.remember();
-        self.global.query.set_text(&name);
+        self.panels.global.case_sensitive = true;
+        self.panels.global.whole_word = true;
+        self.panels.global.regex = false;
+        self.panels.global.query.remember();
+        self.panels.global.query.set_text(&name);
         self.set_sidebar_view(SidebarView::Search);
-        if !self.sidebar.visible {
+        if !self.panels.sidebar.visible {
             self.set_sidebar(true);
         }
         self.global_changed(true);
@@ -655,8 +699,8 @@ fn filter_results(
 
 /// 剔除一个文件中不算数的命中。
 ///
-/// 有未保存修改的文件按 `dirty` 中的内容判断，其余从磁盘读。读不到或不是 UTF-8 的文件保留全部
-/// 命中：行列可能与搜索时的解码对不上，宁可多列也不误删。
+/// 有未保存修改的文件按 `dirty` 中的内容判断，其余从磁盘读取并识别编码，与项目搜索相同；读不到
+/// 的文件保留全部命中。
 fn filter_file(
     filter: &Filter,
     usages: bool,
@@ -665,9 +709,9 @@ fn filter_file(
 ) {
     let text = match dirty.get(&file.path) {
         Some(rope) => rope.clone(),
-        None => match std::fs::read(&file.path).map(String::from_utf8) {
-            Ok(Ok(text)) => Rope::from_str(&text),
-            _ => return,
+        None => match winc_backend::fs::read(&file.path) {
+            Ok(bytes) => Rope::from_str(&winc_editor::encoding::decode_unknown(&bytes).0),
+            Err(_) => return,
         },
     };
     let language = usages::language_of(&file.path, &text);

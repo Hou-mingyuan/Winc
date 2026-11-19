@@ -516,6 +516,10 @@ struct Shared {
     shell: Shell,
     /// 已通过 xcrun 查询过的程序及其结果，每个程序只查询一次。
     xcrun: Mutex<Vec<(String, Option<PathBuf>)>>,
+    /// 在 WSL 发行版中查找程序的最近一次结果：（发行版，程序名，路径）。
+    ///
+    /// 设置页不等待查询（[`Formatter::peek`]），由这里回答；格式化时每次重新查找并更新。
+    wsl: Mutex<Vec<(String, String, Option<PathBuf>)>>,
 }
 
 impl Default for Formatter {
@@ -534,6 +538,7 @@ impl Formatter {
         Formatter(Arc::new(Shared {
             shell,
             xcrun: Mutex::new(Vec::new()),
+            wsl: Mutex::new(Vec::new()),
         }))
     }
 
@@ -612,11 +617,37 @@ impl Formatter {
 
     /// 与 [`Formatter::resolve`] 相同，但不等待：还不知道装了哪个时返回 `None`（设置页使用）。
     pub fn peek(&self, plan: &Plan) -> Option<Result<Plan, FormatError>> {
-        // 查询发行版要启动进程，这里不等待。
-        if crate::wsl::locate_here(&plan.file).is_some() {
-            return plan.settle(|_| None);
+        // 查询发行版要启动进程，这里不等待：回答此前查到的结果，没有查过时为 `None`，由调用方
+        // 在后台线程上调用 [`Formatter::resolve`] 之后再问。
+        if let Some(place) = crate::wsl::locate_here(&plan.file) {
+            return plan.settle(|name| self.wsl_asked(&place.distro, name).map(|p| p.is_some()));
         }
         plan.settle(|name| self.has(name))
+    }
+
+    /// 返回此前在发行版 `distro` 中查找程序 `name` 的结果；没有查过时返回 `None`。
+    fn wsl_asked(&self, distro: &str, name: &str) -> Option<Option<PathBuf>> {
+        let asked = self.0.wsl.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = asked.iter().find(|(d, n, _)| d == distro && n == name);
+        found.map(|(_, _, path)| path.clone())
+    }
+
+    /// 记下在发行版 `distro` 中查找程序 `name` 的结果。
+    fn wsl_found(&self, distro: &str, name: &str, path: Option<&Path>) {
+        let mut asked = self.0.wsl.lock().unwrap_or_else(PoisonError::into_inner);
+        asked.retain(|(d, n, _)| !(d == distro && n == name));
+        asked.push((
+            distro.to_owned(),
+            name.to_owned(),
+            path.map(Path::to_path_buf),
+        ));
+    }
+
+    /// 丢弃在发行版中查到的结果：之后的 [`Formatter::peek`] 重新等待查询，新安装的工具得以
+    /// 发现。
+    pub fn forget_wsl(&self) {
+        let mut asked = self.0.wsl.lock().unwrap_or_else(PoisonError::into_inner);
+        asked.clear();
     }
 
     /// 返回要运行的程序所在的路径；找不到时返回 `None`。
@@ -632,8 +663,19 @@ impl Formatter {
     }
 
     /// 返回格式化 `file` 时要运行的程序：`file` 位于 WSL 发行版中时在发行版内查找，返回发行版内的
-    /// 路径；其余情况同 [`Formatter::locate`]。
+    /// 路径；位于远端主机上时在那台主机上查找，返回那里的路径；其余情况同 [`Formatter::locate`]。
     fn locate_for(&self, file: &Path, program: &Program) -> Option<PathBuf> {
+        if let Some(at) = winc_backend::locate(file) {
+            return match program {
+                // 命令里写的绝对路径是那台主机上的路径。
+                Program::Project { path, .. } | Program::Path(path) => {
+                    let native = winc_backend::native_lossy(path).into_owned();
+                    let on_host = winc_backend::virtual_path(&at.target, native.as_bytes());
+                    is_executable(&on_host).then(|| PathBuf::from(native))
+                }
+                Program::Search(name) => crate::remote_env::find_program(file, name),
+            };
+        }
         let Some(place) = crate::wsl::locate_here(file) else {
             return self.locate(program);
         };
@@ -644,7 +686,9 @@ impl Formatter {
                 .map(|program| PathBuf::from(program.path)),
             Program::Search(name) => {
                 let path = crate::wsl::login_path(&place.distro);
-                crate::wsl::find_program(&place.distro, path.as_deref(), name)
+                let found = crate::wsl::find_program(&place.distro, path.as_deref(), name);
+                self.wsl_found(&place.distro, name, found.as_deref());
+                found
             }
         }
     }
@@ -706,11 +750,14 @@ impl Formatter {
             }
         })?;
 
-        // 发行版内的工具只接受发行版内的路径。
+        // 发行版内的工具只接受发行版内的路径，远端主机上的工具只接受那台主机上的路径。
+        let remote = winc_backend::is_remote(&plan.file);
         let place = crate::wsl::locate_here(&plan.file);
-        let file = place
-            .as_ref()
-            .map_or_else(|| plan.file.clone(), |place| PathBuf::from(&place.path));
+        let file = match &place {
+            Some(place) => PathBuf::from(&place.path),
+            None if remote => PathBuf::from(winc_backend::native_lossy(&plan.file).into_owned()),
+            None => plan.file.clone(),
+        };
         let dir = plan.file.parent().unwrap_or(Path::new("/"));
         let edition = plan
             .args
@@ -727,7 +774,7 @@ impl Formatter {
         // 仍存在的目录。
         let cwd = dir
             .ancestors()
-            .find(|d| d.is_dir())
+            .find(|d| winc_backend::fs::is_dir(d))
             .unwrap_or(Path::new("/"));
 
         let mut command = match place.zip(crate::wsl::locate_here(cwd)) {
@@ -736,6 +783,16 @@ impl Formatter {
                 let path = crate::wsl::login_path(&place.distro);
                 crate::wsl::enter_login(&mut command, &place.distro, &cwd.path, path.as_deref());
                 command.env("WSLENV", crate::wsl::FORMAT_ENV).arg(&program);
+                command
+            }
+            // 远端的工具在那台主机上运行（工作目录在远端时由 `process::run` 交给远端）：不带
+            // 本机的环境，`PATH` 用那台主机上登录 shell 的，工具由此找到它依赖的程序。
+            None if remote => {
+                let mut command = std::process::Command::new(&program);
+                command.current_dir(cwd);
+                if let Some(path) = crate::remote_env::login_path(cwd) {
+                    command.env("PATH", path);
+                }
                 command
             }
             None => {
@@ -1030,7 +1087,7 @@ impl Document {
         changes: Vec<Change>,
         top: usize,
     ) -> Option<usize> {
-        if self.text.rope() != Some(sent) || self.readonly {
+        if self.text.rope() != Some(sent) || self.readonly_reason().is_some() {
             return None;
         }
         if changes.is_empty() {

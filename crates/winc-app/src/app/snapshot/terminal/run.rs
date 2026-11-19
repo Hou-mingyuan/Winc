@@ -256,9 +256,16 @@ fn the_menu_selects_and_the_file_is_watched() {
     app.relayout();
     let menu = run_button(&mut app, RunButton::Menu).unwrap();
     click(&mut app, menu);
-    assert_eq!(app.menu_button, Some(crate::app::MenuButton::RunConfigs));
     assert_eq!(
-        app.context_menu.as_ref().expect("弹出了菜单").entries,
+        app.overlays.menu_button,
+        Some(crate::app::MenuButton::RunConfigs)
+    );
+    assert_eq!(
+        app.overlays
+            .context_menu
+            .as_ref()
+            .expect("弹出了菜单")
+            .entries,
         [
             MenuEntry::Item(MenuCommand::RunSelect(0), true),
             MenuEntry::Item(MenuCommand::RunSelect(1), true),
@@ -427,7 +434,7 @@ fn the_stop_button_appears_only_while_running() {
     app.new_terminal_tab_in(Vec::new());
     paint(&mut app);
     assert!(hit(&app, stop).is_none());
-    let position = hit(&app, HeaderHit::Position).unwrap();
+    let position = hit(&app, HeaderHit::Maximize).unwrap();
     let idle = hit(&app, start).unwrap();
     assert_eq!(position.x - idle.right(), crate::theme::TAB_GAP);
 
@@ -438,6 +445,46 @@ fn the_stop_button_appears_only_while_running() {
     let moved = hit(&app, start).unwrap();
     assert_eq!(running.x - moved.right(), crate::theme::TAB_GAP);
     clean(&dir);
+}
+
+/// 竖向模式的运行操作靠左，面板操作靠右；运行状态变化不移动配置名和运行按钮。
+#[test]
+fn vertical_tabs_keep_run_controls_on_the_left_and_panel_controls_on_the_right() {
+    for right in [false, true] {
+        let (mut app, dir, _log) = app_with_configs("run-vertical-header");
+        app.config.terminal_vertical_tabs = Some(true);
+        app.config.terminal_right = Some(right);
+        app.new_terminal_tab_in(Vec::new());
+        paint(&mut app);
+        let hit = |app: &App, target| {
+            app.hits
+                .terminal
+                .iter()
+                .find(|(_, hit)| *hit == target)
+                .unwrap()
+                .0
+        };
+        let menu = hit(&app, HeaderHit::Run(RunButton::Menu));
+        let start = hit(&app, HeaderHit::Run(RunButton::Start));
+        let maximize = hit(&app, HeaderHit::Maximize);
+        let card = app.layout.terminal;
+        assert!(menu.x < card.x + 32.0);
+        assert!(maximize.x > card.x + card.w / 2.0);
+        assert!(start.x > menu.right());
+        run_current(&mut app);
+        paint(&mut app);
+        assert_eq!(hit(&app, HeaderHit::Run(RunButton::Menu)), menu);
+        assert_eq!(hit(&app, HeaderHit::Run(RunButton::Start)), start);
+        assert_eq!(hit(&app, HeaderHit::Maximize), maximize);
+        let stop = hit(&app, HeaderHit::Run(RunButton::Stop));
+        assert!(stop.x > start.right() && stop.right() < maximize.x);
+        click(&mut app, (menu.x + menu.w / 2.0, menu.y + menu.h / 2.0));
+        assert_eq!(
+            app.overlays.menu_button,
+            Some(crate::app::MenuButton::RunConfigs)
+        );
+        clean(&dir);
+    }
 }
 
 /// 停止按钮淡入、淡出，运行按钮跟着滑动；消失的过程中已经点不了。
@@ -499,13 +546,14 @@ fn the_menu_shows_commands_and_what_is_running() {
     clean(&dir);
 }
 
-/// F5 在编辑区运行，⇧F5 停止；焦点在终端时按键交给其中的程序。
+/// VS Code 方案中 ⌃F5 在编辑区运行，⇧F5 停止；焦点在终端时按键交给其中的程序。
 #[test]
-fn f5_runs_except_inside_the_terminal() {
+fn ctrl_f5_runs_except_inside_the_terminal() {
+    crate::app::snapshot::use_vscode_keys();
     use crate::keymap::KeyCode::F;
     let (mut app, dir, _log) = app_with_configs("run-keys");
     app.focus = Focus::Editor;
-    assert!(press(&mut app, &[], F(5)));
+    assert!(press(&mut app, &["ctrl"], F(5)));
     app.relayout();
     assert!(app.run_config_running());
     let id = app.terminal.tabs[0].id;
@@ -514,7 +562,7 @@ fn f5_runs_except_inside_the_terminal() {
 
     app.terminal_message(FromHelper::Exited { tab: id, code: 129 });
     app.focus = Focus::Terminal;
-    assert!(!press(&mut app, &[], F(5)), "终端里的程序收到这个键");
+    assert!(!press(&mut app, &["ctrl"], F(5)), "终端里的程序收到这个键");
     app.relayout();
     assert_eq!(app.terminal.tabs[0].id, id);
     clean(&dir);
@@ -529,6 +577,8 @@ fn configurations_load_when_the_first_window_opens() {
         state.set_session(winc_config::Session {
             folder,
             run: Some("web".into()),
+            folders: Vec::new(),
+            name: None,
             ..winc_config::Session::default()
         });
     });

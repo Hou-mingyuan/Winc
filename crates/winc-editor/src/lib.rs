@@ -5,6 +5,9 @@
 //!
 //! 模块分工见各模块的 `//!`：`document`、`editing`、`workspace`、`navigation`、`git`、`tools`。
 
+// 测试直接在本机的临时目录中准备和检查文件。
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod background;
 pub mod backup;
 pub mod diff_view;
@@ -12,6 +15,8 @@ mod document;
 mod editing;
 pub mod git;
 mod navigation;
+pub mod panes;
+pub mod proxy;
 mod tools;
 mod workspace;
 
@@ -20,14 +25,14 @@ mod test_util;
 
 pub use document::content::Content;
 pub use document::disk::{
-    DiskRead, DiskSync, DiskTake, DiskTaken, EncodingRead, EncodingReread, Opened, Reread, SaveJob,
-    Saved,
+    DiskRead, DiskSync, DiskTake, DiskTaken, EncodingRead, EncodingReread, HandedSave, Opened,
+    Reread, SaveJob, Saved,
 };
 pub use document::encoding::Encoding;
 pub use document::large::LargeText;
 pub use document::{
     COPY_LIMIT, DiskChange, Document, DocumentId, EDIT_LIMIT, LARGE_FILE, OpenError, PictureState,
-    PreviewKind, PreviewMode, TableState, TableView, Unsupported, looks_binary,
+    PreviewKind, PreviewMode, Reading, TableState, TableView, Unsupported, looks_binary,
 };
 pub use document::{editorconfig, encoding};
 pub use editing::command::Command;
@@ -39,15 +44,16 @@ pub use editing::search::{MAX_MATCHES, Search, TextSearch};
 pub use editing::{paste, scopes};
 pub use navigation::bookmarks::{BookmarkMap, Bookmarks};
 pub use navigation::{bookmarks, definition, keypath, symbols, usages};
-pub use tools::{format, shell, wsl};
+pub use tools::{format, host, remote_env, shell, wsl};
+pub use workspace::copying::Copying;
 pub use workspace::picker::{FileIndex, IndexedFile, MAX_RESULTS as PICKER_MAX_RESULTS};
 pub use workspace::project_search::{
     FileResult, LineMatch, MAX_RESULTS, MAX_THREADS as MAX_SEARCH_THREADS, ProjectSearch, Query,
     ReplacePreview, replace_in_document, replace_in_file,
 };
 pub use workspace::tree::{
-    DirEntry, DirListing, DirScan, EXPAND_DIRS, Entry, EntryKind, Workspace, copy_entry, list_dir,
-    natural_cmp, segment_name,
+    DirEntry, DirListing, DirScan, EXPAND_DIRS, Entry, EntryKind, Workspace, copy_entry, create_at,
+    list_dir, move_at, natural_cmp, rename_at, segment_name,
 };
 pub use workspace::watch::{Changes, Watcher};
 
@@ -56,12 +62,17 @@ use std::path::{Path, PathBuf};
 
 /// 编辑器状态：打开的文档（每个对应一个标签）和工作区。
 pub struct Editor {
-    /// 已打开的文档，按标签栏中的顺序排列。
+    /// 已打开的文档：前一段是前台窗格的标签，按标签栏中的顺序排列（见 [`Self::tabs`]）；其后是
+    /// 只在其他窗格里打开的文档。
     pub documents: Vec<Document>,
-    /// 活动标签在 `documents` 中的下标（从 0 起）。
+    /// 活动标签在 `documents` 中的下标（从 0 起），在前台窗格的标签之内。
     pub active: Option<usize>,
+    /// 编辑区的窗格。
+    pub panes: panes::Panes,
     /// 打开的工作区（目录）；没有打开目录时为 `None`。
     pub workspace: Option<Workspace>,
+    /// 是否把全部文档设为只读。
+    all_locked: bool,
     /// 默认的制表符显示宽度（列）。
     ///
     /// 只作用于未设置制表符宽度的文档；文档可经状态栏或 `.editorconfig` 覆盖，见
@@ -86,7 +97,9 @@ impl Default for Editor {
         Self {
             documents: Vec::new(),
             active: None,
+            panes: panes::Panes::default(),
             workspace: None,
+            all_locked: false,
             tab_width: 4,
             diff_unified: false,
             bookmarks: BookmarkMap::new(),
@@ -167,11 +180,10 @@ impl Editor {
             .iter()
             .position(|d| d.path.as_deref() == Some(canonical.as_path()))
         {
-            return index;
+            return self.bring(index);
         }
         let id = self.allocate_id();
-        self.documents.push(Document::pending(id, canonical));
-        self.documents.len() - 1
+        self.insert_tab(Document::pending(id, canonical))
     }
 
     /// 第 `index` 个标签尚未读取（[`Document::pending`]）时在当前线程读入文件，返回是否已读取。
@@ -251,6 +263,47 @@ impl Editor {
         self.show_readonly(title, |id| Document::output(id, title, text))
     }
 
+    /// 更新标题为 `title` 的输出标签，不切换标签：`more` 有值时接在末尾（光标和滚动位置不动），
+    /// 否则把内容换成 `text`。没有这个标签时不做事，返回是否有这个标签。
+    ///
+    /// 用于输出在标签开着的时候有了新内容：标签已经关闭时不再打开。
+    pub fn refresh_output(&mut self, title: &str, more: Option<&str>, text: &str) -> bool {
+        let found = (self.documents.iter_mut())
+            .find(|d| d.path.is_none() && d.title.as_deref() == Some(title));
+        let Some(slot) = found else {
+            return false;
+        };
+        match more {
+            Some(more) => slot.append_output(more),
+            None => {
+                let fresh = Document::output(slot.id, title, text);
+                replace_document(slot, fresh);
+            }
+        }
+        true
+    }
+
+    /// 在只读的阅读标签中显示 `reading`，标签标题为 `title`，并切换到该标签。
+    ///
+    /// 已存在标题相同且没有对应文件的标签时，替换其内容而不新开标签。返回标签序号（从 0 起）。
+    pub fn show_reading(&mut self, title: &str, reading: Reading) -> usize {
+        self.show_readonly(title, |id| Document::reading(id, title, reading))
+    }
+
+    /// 把阅读标签 `id` 的内容换成 `reading`，标题不变，不切换标签；返回是否有这个标签。
+    ///
+    /// 用于后台取回的内容到达时：标签在此期间已经关闭时不再打开。
+    pub fn update_reading(&mut self, id: DocumentId, reading: Reading) -> bool {
+        let found = (self.documents.iter_mut()).find(|d| d.id == id && d.reading.is_some());
+        let Some(slot) = found else {
+            return false;
+        };
+        let title = slot.title.clone().unwrap_or_default();
+        let fresh = Document::reading(id, &title, reading);
+        replace_document(slot, fresh);
+        true
+    }
+
     /// 在标签 `slot` 中显示并排差异（替换原有内容）并切换到该标签，返回标签序号（从 0 起）。
     ///
     /// `slot` 已经关闭或不是差异标签时按 [`Editor::show_diff`] 查找或新建。逐个预览多个文件的
@@ -325,12 +378,11 @@ impl Editor {
                 let slot = &mut self.documents[index];
                 let fresh = make(slot.id);
                 replace_document(slot, fresh);
-                index
+                self.bring(index)
             }
             None => {
                 let id = self.allocate_id();
-                self.documents.push(make(id));
-                self.documents.len() - 1
+                self.insert_tab(make(id))
             }
         };
         self.active = Some(index);
@@ -346,22 +398,46 @@ impl Editor {
             .iter()
             .position(|d| d.log.is_some() && d.title.as_deref() == Some(title))
         {
+            let index = self.bring(index);
             self.active = Some(index);
             return (index, false);
         }
         let id = self.allocate_id();
-        self.documents
-            .push(Document::log(id, title, git::log::LogView::new()));
-        let index = self.documents.len() - 1;
+        let index = self.insert_tab(Document::log(id, title, git::log::LogView::new()));
         self.active = Some(index);
         (index, true)
+    }
+
+    /// 把新文档作为前台窗格的最后一个标签，沿用窗口的只读状态，返回它的标签序号（从 0 起）。
+    fn insert_tab(&mut self, mut document: Document) -> usize {
+        document.set_all_locked(self.all_locked);
+        document.claim_view(self.panes.focused);
+        let index = self.panes.shown;
+        self.documents.insert(index, document);
+        self.panes.shown += 1;
+        if let Some(active) = self.active.as_mut().filter(|a| **a >= index) {
+            *active += 1;
+        }
+        index
+    }
+
+    /// 窗口是否把全部文档设为只读。
+    pub fn all_locked(&self) -> bool {
+        self.all_locked
+    }
+
+    /// 把全部文档设为只读或恢复，之后打开的文档也一样；各文档自己的只读不变。
+    pub fn set_all_locked(&mut self, locked: bool) {
+        self.all_locked = locked;
+        for document in &mut self.documents {
+            document.set_all_locked(locked);
+        }
     }
 
     /// 新建一个未命名的空文档并切换到对应标签，返回标签序号（从 0 起）。
     pub fn new_untitled(&mut self) -> usize {
         let id = self.allocate_id();
-        self.documents.push(Document::empty(id));
-        let index = self.documents.len() - 1;
+        let index = self.insert_tab(Document::empty(id));
         self.active = Some(index);
         index
     }
@@ -371,10 +447,44 @@ impl Editor {
     /// 关闭活动标签后，活动标签切换到右侧相邻的标签；右侧没有标签时切换到左侧。文档的书签
     /// 存入 [`Self::bookmarks`]，折叠的块存入 [`Self::folds`]。
     pub fn close(&mut self, index: usize) -> Option<Document> {
-        if index >= self.documents.len() {
+        if index >= self.panes.shown {
+            return None;
+        }
+        self.panes.shown -= 1;
+        // 其他窗格里还开着：只从前台窗格去掉，文档留着。
+        if self.panes.elsewhere(self.documents[index].id) {
+            let mut document = self.documents.remove(index);
+            document.forget_view(self.panes.focused);
+            self.documents.push(document);
+            self.after_close(index);
             return None;
         }
 
+        let document = self.forget(index);
+        self.after_close(index);
+        Some(document)
+    }
+
+    /// 关闭文档 `id`，不管它是哪些窗格的标签。其他窗格因此没有标签时连窗格一起去掉；前台窗格
+    /// 没有标签时由调用方处理（见 [`Self::drop_empty_pane`]）。文档不存在时返回 `None`。
+    pub fn close_everywhere(&mut self, id: DocumentId) -> Option<Document> {
+        let panes: Vec<panes::PaneId> = (self.panes.others.iter())
+            .filter(|p| p.tabs.contains(&id))
+            .map(|p| p.id)
+            .collect();
+        for pane in panes {
+            self.remove_from_pane(pane, id);
+        }
+        let index = self.index_of(id)?;
+        if index < self.panes.shown {
+            return self.close(index);
+        }
+        Some(self.forget(index))
+    }
+
+    /// 从 `documents` 去掉第 `index` 个文档，书签存入 [`Self::bookmarks`]，折叠的块存入
+    /// [`Self::folds`]。
+    fn forget(&mut self, index: usize) -> Document {
         let document = self.documents.remove(index);
         if let Some(path) = &document.path
             && !document.bookmarks().is_empty()
@@ -387,22 +497,26 @@ impl Editor {
         {
             keep_folds(&mut self.folds, path, document.folded());
         }
+        document
+    }
 
+    /// 前台窗格的第 `index` 个标签去掉以后，活动标签换到右侧相邻的，右侧没有时换到左侧。
+    fn after_close(&mut self, index: usize) {
+        let shown = self.panes.shown;
         self.active = match self.active {
-            _ if self.documents.is_empty() => None,
+            _ if shown == 0 => None,
             Some(active) if active > index => Some(active - 1),
-            Some(active) if active == index => Some(index.min(self.documents.len() - 1)),
+            Some(active) if active == index => Some(index.min(shown - 1)),
             other => other,
         };
-
-        Some(document)
     }
 
     /// 把第 `from` 个标签移动到第 `to` 个的位置，活动标签仍然指向同一个文档。
     ///
     /// `from` 或 `to` 越界，或二者相等时不做任何改动。
     pub fn move_document(&mut self, from: usize, to: usize) {
-        if from >= self.documents.len() || to >= self.documents.len() || from == to {
+        let shown = self.panes.shown;
+        if from >= shown || to >= shown || from == to {
             return;
         }
 
@@ -588,14 +702,24 @@ pub struct LoadedFile {
 ///
 /// `fresh` 与 `slot` 使用相同的 `DocumentId`。界面层按（`DocumentId`，`revision`）缓存查找
 /// 结果、粘滞滚动、括号配对和后台解码的图片，因此新文档的 `revision` 必须大于旧文档的，
-/// 否则新内容会命中旧内容的缓存。
+/// 否则新内容会命中旧内容的缓存。用户设置的只读随标签保留。
 fn replace_document(slot: &mut Document, mut fresh: Document) {
     fresh.revision += slot.revision + 1;
+    fresh.set_locked(slot.is_locked());
+    fresh.set_all_locked(slot.all_locked());
+    fresh.adopt_parked(slot);
     *slot = fresh;
 }
 
 /// 返回用于显示的名称：路径的最后一段；没有最后一段（如根目录）时返回整个路径。
 pub fn display_name(path: &Path) -> Cow<'_, str> {
+    // 远端路径：名字按远端的写法显示，根目录显示为 `目标:/`。
+    if let Some(remote) = winc_backend::locate(path) {
+        return match remote.name() {
+            [] => winc_backend::display(path).unwrap_or_default().into(),
+            name => String::from_utf8_lossy(name).into_owned().into(),
+        };
+    }
     path.file_name()
         .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy())
 }
@@ -603,12 +727,13 @@ pub fn display_name(path: &Path) -> Cow<'_, str> {
 /// 返回用于显示的路径。
 ///
 /// 位于 `root` 之下时返回相对路径；位于用户主目录（环境变量 `HOME`）之下时返回 `~/…`；
-/// 其余情况返回完整路径。
+/// 其余情况返回完整路径。远端主机上的路径不在 `root` 之下时写成 `目标:/路径`。
 pub fn display_path(path: &Path, root: Option<&Path>) -> String {
-    if let Some(root) = root
-        && let Ok(relative) = path.strip_prefix(root)
-    {
-        return relative.display().to_string();
+    if let Some(relative) = root.and_then(|root| winc_backend::relative_lossy(path, root)) {
+        return relative;
+    }
+    if let Some(remote) = winc_backend::display(path) {
+        return remote;
     }
 
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)

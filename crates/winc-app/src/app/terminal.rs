@@ -15,8 +15,11 @@ mod locate;
 mod pointer;
 pub(crate) mod run;
 pub(crate) mod shells;
+mod shortcuts;
+mod split;
 pub(crate) mod strip;
 mod tab;
+pub(crate) mod upload;
 
 use helper::*;
 
@@ -46,7 +49,7 @@ pub(crate) use link::TermLink;
 pub(crate) use pointer::BlockHit;
 #[cfg(all(test, unix))]
 pub(crate) use tab::{Point, Selection, Unit};
-pub(crate) use tab::{SETTLE, TabEnd, TermTab, ViewRow};
+pub(crate) use tab::{SETTLE, TabEnd, TermSplit, TermTab, ViewRow};
 
 /// 面板在下面时的默认高度（逻辑像素，含标签栏）。
 pub(crate) const DEFAULT_HEIGHT: f32 = 242.0;
@@ -115,6 +118,8 @@ pub(crate) enum HeaderHit {
     ShellMenu,
     /// 把面板挪到编辑区右边，或者挪回下面。
     Position,
+    /// 最大化面板，或者还原（⌘⇧↩）。
+    Maximize,
     /// 运行配置的按钮。
     Run(run::RunButton),
     /// 查找条的一部分。
@@ -146,10 +151,10 @@ pub(crate) struct TerminalPanel {
     pub width: f32,
     /// 出现、收起、换位置的动画。
     pub motion: Option<PanelMotion>,
-    /// 最大化（⌘⇧↩）：面板占到排版允许的最大，编辑区只留最小的高度（宽度）。
+    /// 最大化（⌘⇧↩）：面板铺满编辑区一栏，编辑区不占地方。随现场保存。
     pub maximized: bool,
-    /// 最大化、还原时大小的渐变：（开始时的高度或宽度，时钟）。
-    pub grow: Option<(f32, Clock)>,
+    /// 最大化、还原的过渡：面板在平常的大小和整栏之间伸缩。
+    pub grow: Option<Clock>,
     /// 测试里没有窗口、没有时钟：设置后面板的动画都停在这一时刻。
     #[cfg(test)]
     pub frozen: Option<Duration>,
@@ -162,6 +167,11 @@ pub(crate) struct TerminalPanel {
     pub active: usize,
     /// 等辅助进程准备好、知道面板尺寸以后要新建的标签：各自的工作目录（空的是默认目录）。
     pub want: Vec<Vec<u8>>,
+    /// 下一个排进 `want` 的是拆分出的终端：加进前台终端编号为它的标签（见 `want_into`）。
+    pub split_into: Option<u16>,
+    /// `want` 里各个拆分出的终端要加进的标签（前台终端的编号），和 `want` 一一对应；`None` 或
+    /// 数量不足的部分各成一个标签。
+    pub want_into: Vec<Option<u16>>,
     /// `want` 里各标签的名字（恢复现场、重新启动时带上用户起的名字），和 `want` 一一对应；
     /// 数量不足的部分视为没有名字。
     want_names: Vec<String>,
@@ -179,6 +189,10 @@ pub(crate) struct TerminalPanel {
     pub pending_input: Option<Vec<u8>>,
     /// 辅助进程意外退出了：标签和最后一屏还留着，等用户重新启动。
     pub crashed: bool,
+    /// 正在询问是否加载的 Python 环境目录；回答之前等着建的标签不建。
+    pub python_asking: Option<PathBuf>,
+    /// 本次运行中回答了不加载的 Python 环境目录；不写入状态文件，下次启动时重新询问。
+    pub python_declined: Vec<PathBuf>,
     /// 按住 ⌘ 时鼠标下的链接。
     pub link: Option<TermLink>,
     /// 有标签在等新尺寸的一帧、面板又变了时：什么时候不再等（见 [`App::sync_terminal`]）。
@@ -253,12 +267,49 @@ impl TerminalPanel {
         }
     }
 
+    /// 编号为 `id` 的终端所在的标签（含拆分出的终端）。
     fn index_of(&self, id: u16) -> Option<usize> {
-        self.tabs.iter().position(|t| t.id == id)
+        (self.tabs.iter()).position(|t| t.panes().any(|pane| pane.id == id))
     }
 
+    /// 编号为 `id` 的终端，可以是拆分出的。
     fn by_id(&mut self, id: u16) -> Option<&mut TermTab> {
-        self.tabs.iter_mut().find(|t| t.id == id)
+        let index = self.index_of(id)?;
+        let tab = &mut self.tabs[index];
+        if tab.id == id {
+            return Some(tab);
+        }
+        let split = tab.split.as_mut()?;
+        split.others.iter_mut().find(|t| t.id == id)
+    }
+
+    /// 取出第 `index` 个标签的各个终端，按排列顺序，以及前台终端的位置。
+    pub(crate) fn take_group(&mut self, index: usize) -> (Vec<TermTab>, usize) {
+        take_group(&mut self.tabs, index)
+    }
+
+    /// 把各个终端 `all` 放回第 `index` 个标签，第 `at` 个在前台。
+    pub(crate) fn put_group(&mut self, index: usize, all: Vec<TermTab>, at: usize) {
+        put_group(&mut self.tabs, index, all, at);
+    }
+
+    /// 去掉编号为 `id` 的终端；它所在的标签还有其他终端时由相邻的补上。返回它所在的标签序号，
+    /// 以及标签是否整个没了。
+    pub(crate) fn remove_terminal(&mut self, id: u16) -> Option<(usize, bool)> {
+        let index = self.index_of(id)?;
+        let (mut all, at) = self.take_group(index);
+        let pos = all.iter().position(|t| t.id == id)?;
+        all.remove(pos);
+        if all.is_empty() {
+            return Some((index, true));
+        }
+        let at = if pos < at {
+            at - 1
+        } else {
+            at.min(all.len() - 1)
+        };
+        self.put_group(index, all, at);
+        Some((index, false))
     }
 
     /// 向辅助进程要 `tab` 的历史行 `range`，记下要来干什么。
@@ -289,6 +340,29 @@ impl TerminalPanel {
             .iter()
             .any(|&(_, t, p)| (t, p) == (tab, purpose))
     }
+}
+
+/// 取出 `tabs` 中第 `index` 个标签的各个终端，按排列顺序，以及前台终端的位置。
+pub(crate) fn take_group(tabs: &mut Vec<TermTab>, index: usize) -> (Vec<TermTab>, usize) {
+    let mut focused = tabs.remove(index);
+    match focused.split.take() {
+        None => (vec![focused], 0),
+        Some(split) => {
+            let TermSplit { mut others, at } = *split;
+            others.insert(at, focused);
+            (others, at)
+        }
+    }
+}
+
+/// 把各个终端 `all` 放回 `tabs` 的第 `index` 个标签，第 `at` 个在前台。
+pub(crate) fn put_group(tabs: &mut Vec<TermTab>, index: usize, mut all: Vec<TermTab>, at: usize) {
+    let at = at.min(all.len().saturating_sub(1));
+    let mut focused = all.remove(at);
+    if !all.is_empty() {
+        focused.split = Some(Box::new(TermSplit { others: all, at }));
+    }
+    tabs.insert(index, focused);
 }
 
 /// 面板标签栏的高度（逻辑像素）：`card` 从顶栏那一行开始时（面板在右边）用 `TOP_BAR`，
@@ -401,8 +475,9 @@ impl App {
     pub(super) fn terminal_session(&self) -> Option<TerminalSession> {
         let t = &self.terminal;
         // 还没建出来的（面板收着时恢复的）也算。
-        // 运行配置的标签不恢复。
-        let shells = || t.tabs.iter().filter(|tab| tab.run.is_none());
+        // 运行配置的标签不恢复；拆分出的终端各记成一个标签。
+        let shells =
+            || (t.tabs.iter().flat_map(|tab| tab.split_order())).filter(|tab| tab.run.is_none());
         let tabs: Vec<PathBuf> = shells()
             .map(|tab| bytes_path(&tab.cwd))
             .chain(t.want.iter().map(|cwd| bytes_path(cwd)))
@@ -411,8 +486,10 @@ impl App {
         let names = shells().map(|tab| tab.name.clone()).chain(pending);
         let pending = (0..t.want.len()).map(|i| t.want_shells.get(i).cloned().flatten());
         let commands = shells().map(|tab| tab.shell.clone()).chain(pending);
-        let before = t.tabs.iter().take(t.active).filter(|tab| tab.run.is_some());
-        let active = t.active - before.count();
+        let focused = t.tab().map(|tab| tab.id);
+        let active = shells()
+            .position(|tab| Some(tab.id) == focused)
+            .unwrap_or(0);
         (!tabs.is_empty()).then(|| TerminalSession {
             active: t.want_active.unwrap_or(active),
             tabs,
@@ -421,6 +498,7 @@ impl App {
             open: t.open,
             height: t.height,
             width: t.width,
+            maximized: t.maximized,
         })
     }
 
@@ -428,18 +506,30 @@ impl App {
     ///
     /// 终端里已经有标签了不动；面板上次收着时等打开面板再建。
     pub(super) fn restore_terminal(&mut self, session: &TerminalSession) {
+        let root = self.editor.root().map(PathBuf::from);
         let t = &mut self.terminal;
         let enabled = self.config.terminal_enabled.unwrap_or(false);
         if !enabled || !t.tabs.is_empty() || !t.want.is_empty() {
             return;
         }
-        let tabs = session.tabs.iter();
-        t.want = tabs.map(|p| os_bytes(p.as_os_str())).collect();
+        // 目录按打开的目录所在的主机换算：现场中远端终端的目录可以只有那台主机上的路径，
+        // 不换算会在本机启动 shell。
+        let dirs: Vec<PathBuf> = (session.tabs.iter())
+            .map(|dir| match &root {
+                Some(root) => helper::terminal_path(root, dir.clone()),
+                None => dir.clone(),
+            })
+            .collect();
+        t.want = dirs.iter().map(|p| os_bytes(p.as_os_str())).collect();
         t.want_names.clone_from(&session.names);
-        let saved = session.shells.iter();
+        // 远端目录的 shell 是那台主机上的路径，无法在本机检查；建标签时按那台主机上检测到的
+        // shell 确认。
+        let saved = session.shells.iter().zip(&dirs);
         t.want_shells = saved
-            .map(|command| {
-                Some(command.clone()).filter(|c| !c.is_empty() && shells::still_usable(c))
+            .map(|(command, dir)| {
+                let usable =
+                    |c: &String| winc_backend::locate(dir).is_some() || shells::still_usable(c);
+                Some(command.clone()).filter(|c| !c.is_empty() && usable(c))
             })
             .collect();
         t.want_active = Some(session.active);
@@ -449,6 +539,7 @@ impl App {
         if session.width > 0.0 {
             t.width = session.width;
         }
+        t.maximized = session.maximized;
         if session.open {
             self.set_terminal_open(true);
             self.start_terminal();
@@ -459,7 +550,7 @@ impl App {
     ///
     /// 面板直接到位，没有打开动画；测量启动时间时不恢复。
     pub(in crate::app) fn restore_terminal_for_window(&mut self) {
-        if self.bench.silent() {
+        if self.frame.bench.silent() {
             return;
         }
         let session = self
@@ -488,10 +579,12 @@ impl App {
         t.want.clear();
         t.want_names.clear();
         t.want_shells.clear();
+        t.want_into.clear();
         t.want_active = None;
         t.active = 0;
         t.client = None;
         t.ready = false;
+        t.crashed = false;
         for id in ids {
             self.forget_terminal_tab(id);
         }
@@ -527,7 +620,7 @@ impl App {
     /// 终端中是否有程序在运行、关闭前需要确认；设置中关闭了确认（`terminal.confirmClose`）时为假。
     pub(crate) fn terminal_busy(&self) -> bool {
         self.config.terminal_confirm_close != Some(false)
-            && self.terminal.tabs.iter().any(|t| t.busy().is_some())
+            && (self.terminal.tabs.iter().flat_map(TermTab::panes)).any(|t| t.busy().is_some())
     }
 
     /// 退出、关闭窗口、换目录或关闭目录（`request`）前，终端中仍有程序在运行时先确认
@@ -542,7 +635,9 @@ impl App {
         if self.config.terminal_confirm_close == Some(false) {
             return false;
         }
-        let busy: Vec<&str> = self.terminal.tabs.iter().filter_map(|t| t.busy()).collect();
+        let busy: Vec<&str> = (self.terminal.tabs.iter().flat_map(TermTab::panes))
+            .filter_map(|t| t.busy())
+            .collect();
         let (name, count) = match &busy[..] {
             [] => return false,
             &[one] => (Some(one), 1),
@@ -638,7 +733,8 @@ impl App {
             });
     }
 
-    /// 状态栏上的终端按钮、标签栏右端的收起按钮：面板开着就收起，收着就打开（没有标签时开一个）。
+    /// 状态栏上的终端按钮、标签栏右端的收起按钮和 ⌘J：面板开着就收起，收着就打开（没有标签时
+    /// 开一个）。与焦点位置无关，收起时焦点在面板外的留在原处。
     pub(super) fn click_terminal_button(&mut self) {
         if self.terminal.open {
             self.set_terminal_open(false);
@@ -671,20 +767,39 @@ impl App {
 
     /// 最大化或还原面板（⌘⇧↩）。
     ///
-    /// 大小逐渐变化，shell 逐帧重排，与拖动分隔条时相同；面板收着
-    /// 时打开并直接最大化。
+    /// 大小逐渐变化，shell 逐帧重排，与拖动分隔条时相同；面板收着时打开并直接最大化。最大化后
+    /// 编辑区看不见，焦点放进面板。
     pub(super) fn toggle_terminal_maximized(&mut self) {
         if !self.terminal.open {
             self.terminal.maximized = true;
             self.open_terminal_panel();
         } else {
-            let l = self.layout.terminal;
-            let from = if self.terminal_right() { l.w } else { l.h };
             self.terminal.maximized = !self.terminal.maximized;
-            self.terminal.grow = self.panel_clock(SIDEBAR_ANIMATION).map(|c| (from, c));
+            self.start_terminal_grow();
+            if self.terminal.maximized && !self.focus.in_terminal() {
+                self.focus = Focus::Terminal;
+            }
         }
+        self.reset_blink();
         self.relayout();
         self.request_redraw();
+    }
+
+    /// 开始最大化、还原的过渡：面板在平常的大小和整栏之间伸缩，方向由 `maximized` 决定。
+    ///
+    /// 上一段过渡还没走完时（例如拖动时吸附又松开）从当前的位置往回走。
+    pub(in crate::app) fn start_terminal_grow(&mut self) {
+        self.terminal.grow = match self.terminal.grow.filter(|clock| !clock.done()) {
+            Some(clock) => Some(clock.reversed()),
+            None => self.panel_clock(SIDEBAR_ANIMATION),
+        };
+    }
+
+    /// 要在编辑区里打开或切换文件：面板最大化着时先还原，让出编辑区。
+    pub(in crate::app) fn make_room_for_editor(&mut self) {
+        if self.terminal.open && self.terminal.maximized {
+            self.toggle_terminal_maximized();
+        }
     }
 
     /// 切换面板的位置（编辑区右边或下面），写回配置文件并重新排版。
@@ -717,6 +832,10 @@ impl App {
 
     /// 在 `cwd` 用 `shell` 新建一个终端标签（`None` 是默认 shell）。
     pub(super) fn new_terminal_tab_with(&mut self, cwd: Vec<u8>, shell: Option<String>) {
+        // 辅助进程退出了：先恢复原有标签，否则新标签会被当作已退出的标签显示。
+        if self.terminal.crashed {
+            self.restart_terminal_tab();
+        }
         if !self.terminal.open {
             // 打开面板时没有标签、也没有恢复的标签要建，会先放一个默认的：换成这个默认标签。
             // 恢复的那些标签（面板收着时退出的）留着，这个默认标签加在后面。
@@ -726,11 +845,14 @@ impl App {
                 self.terminal.want.clear();
                 self.terminal.want_names.clear();
                 self.terminal.want_shells.clear();
+                self.terminal.want_into.clear();
             }
         }
         let t = &mut self.terminal;
         t.want_shells.resize(t.want.len(), None);
         t.want_shells.push(shell);
+        t.want_into.resize(t.want.len(), None);
+        t.want_into.push(t.split_into.take());
         t.want.push(cwd);
         // 新建的这一个就是要看的，不再切回恢复时记着的那一个。
         self.terminal.want_active = None;
@@ -740,49 +862,92 @@ impl App {
         self.request_redraw();
     }
 
-    /// 关掉一个标签（⌘W、标签上的 ×）。
+    /// 关掉编号是 `keep` 的标签以外的各个标签；其中仍有程序在运行的同样先确认。
+    pub(in crate::app) fn close_other_terminal_tabs(&mut self, keep: u16) {
+        let others: Vec<u16> = (self.terminal.tabs.iter())
+            .map(|tab| tab.id)
+            .filter(|&id| id != keep)
+            .collect();
+        for id in others {
+            if let Some(index) = self.terminal.index_of(id) {
+                self.close_terminal_tab(index);
+            }
+        }
+    }
+
+    /// 关掉一个标签和它拆分出的各个终端（标签上的 ×、标签的菜单）。
     ///
     /// 里面还有程序在运行时先确认（`terminal.confirmClose`）。
     pub(super) fn close_terminal_tab(&mut self, index: usize) {
         let Some(tab) = self.terminal.tabs.get(index) else {
             return;
         };
-        let busy = tab
-            .busy()
-            .filter(|_| self.config.terminal_confirm_close != Some(false));
+        let busy = tab.panes().find_map(TermTab::busy).map(str::to_owned);
+        self.confirm_terminal_close(tab.id, busy, true);
+    }
+
+    /// 关掉当前标签里前台的那个终端（⌘W、终端里的菜单）；标签里只有它时标签也关掉。
+    pub(super) fn close_terminal_pane(&mut self) {
+        let Some(tab) = self.terminal.tab() else {
+            return;
+        };
+        let busy = tab.busy().map(str::to_owned);
+        self.confirm_terminal_close(tab.id, busy, false);
+    }
+
+    /// `busy` 是还在运行的程序：按设置先确认，再关掉终端 `id`（`whole` 为真时连同它所在的
+    /// 整个标签）。
+    fn confirm_terminal_close(&mut self, id: u16, busy: Option<String>, whole: bool) {
+        let busy = busy.filter(|_| self.config.terminal_confirm_close != Some(false));
         if let Some(busy) = busy
             && self.window.handle.is_some()
         {
-            let id = tab.id;
             let message = t!("terminal-close-confirm", name = busy);
             let detail = t!("terminal-close-confirm-detail");
             self.show_confirm(&message, detail, t!("common-close"), move |ok| {
-                ok.then_some(UserEvent::TerminalClose(id))
+                ok.then_some(UserEvent::TerminalClose(id, whole))
             });
             return;
         }
-        self.close_terminal_tab_now(index);
+        self.confirmed_terminal_close(id, whole);
     }
 
-    /// 确认框上确认了关掉编号是 `id` 的标签。
-    pub(crate) fn confirmed_terminal_close(&mut self, id: u16) {
-        if let Some(index) = self.terminal.index_of(id) {
-            self.close_terminal_tab_now(index);
+    /// 确认框上确认了关掉终端 `id`；`whole` 为真时连同它所在的整个标签。
+    pub(crate) fn confirmed_terminal_close(&mut self, id: u16, whole: bool) {
+        match self.terminal.index_of(id) {
+            Some(index) if whole => self.close_terminal_tab_now(index),
+            Some(_) => self.close_terminal_now(id),
+            None => {}
         }
     }
 
-    /// 关掉一个标签：挂断它的 shell。
+    /// 关掉第 `index` 个标签里的各个终端。
+    fn close_terminal_tab_now(&mut self, index: usize) {
+        let Some(tab) = self.terminal.tabs.get(index) else {
+            return;
+        };
+        let ids: Vec<u16> = tab.panes().map(|pane| pane.id).collect();
+        for id in ids {
+            self.close_terminal_now(id);
+        }
+    }
+
+    /// 关掉终端 `id`（可以是拆分出的），挂断它的 shell；标签里没有别的终端时标签也关掉。
     ///
     /// 最后一个也关了时收起面板，焦点回编辑区。
-    fn close_terminal_tab_now(&mut self, index: usize) {
-        if index >= self.terminal.tabs.len() {
+    fn close_terminal_now(&mut self, id: u16) {
+        let Some(index) = self.terminal.index_of(id) else {
             return;
+        };
+        if self.terminal.tabs[index].pane_count() == 1 {
+            self.animate_terminal_close(index);
         }
-        self.animate_terminal_close(index);
         let t = &mut self.terminal;
-        let tab = t.tabs.remove(index);
+        let Some((index, gone)) = t.remove_terminal(id) else {
+            return;
+        };
         if let Some(client) = &t.client {
-            client.send(&ToHelper::Close { tab: tab.id });
+            client.send(&ToHelper::Close { tab: id });
         }
         // 最后一个关掉了（也没有等着建的）：辅助进程自己会退出，连接马上放掉（关掉它的
         // stdin）。之后新建的标签由下一个辅助进程建，不发给正在退出的这一个（发了也收不到，
@@ -791,10 +956,11 @@ impl App {
         if last {
             t.client = None;
             t.ready = false;
+            t.crashed = false;
         }
-        self.forget_terminal_tab(tab.id);
+        self.forget_terminal_tab(id);
         let t = &mut self.terminal;
-        if t.active > index || t.active >= t.tabs.len() {
+        if gone && (t.active > index || t.active >= t.tabs.len()) {
             t.active = t.active.saturating_sub(1);
         }
         if last {
@@ -839,17 +1005,6 @@ impl App {
             }
             self.terminal.active = index;
             self.terminal.tabs[index].unseen = None;
-            // F8 的跳转属于原来那个标签：如果保留，在这里按 ↩ 会去打开那边的报错，不交给 shell。
-            let id = self.terminal.tabs[index].id;
-            if self.terminal.errors.as_ref().is_some_and(|e| e.tab != id) {
-                self.terminal.errors = None;
-            }
-            self.terminal.link = None;
-            self.terminal.find = None;
-            self.terminal.requests.retain(|r| r.2 != Request::Find);
-            if self.focus == Focus::TerminalFind {
-                self.focus = Focus::Terminal;
-            }
             self.terminal_activated();
             self.request_redraw();
         }
@@ -868,8 +1023,40 @@ impl App {
         }
     }
 
+    /// 正在看的标签变了：丢掉属于其他标签的查找、报错跳转和链接。
+    ///
+    /// 保留它们时查找条会显示在另一个标签上，↩ 会去打开原标签的报错，不交给 shell。
+    pub(in crate::app::terminal) fn drop_other_tab_state(&mut self) {
+        let id = self.terminal.tab().map(|tab| tab.id);
+        let t = &mut self.terminal;
+        if t.find.as_ref().is_some_and(|find| Some(find.tab) != id) {
+            t.find = None;
+            t.requests.retain(|r| r.2 != Request::Find);
+            if self.focus == Focus::TerminalFind {
+                self.focus = Focus::Terminal;
+            }
+        }
+        let t = &mut self.terminal;
+        if t.errors
+            .as_ref()
+            .is_some_and(|errors| Some(errors.tab) != id)
+        {
+            t.errors = None;
+        }
+        if t.link.as_ref().is_some_and(|link| Some(link.tab) != id) {
+            t.link = None;
+        }
+        // 面板开着时正在看的标签就在眼前，未读点不需要保留。
+        if t.open
+            && let Some(tab) = t.tabs.get_mut(t.active)
+        {
+            tab.unseen = None;
+        }
+    }
+
     /// 换了正在看的标签：把它攒着的额度发出去，马上拿到最新的一帧。
     fn terminal_activated(&mut self) {
+        self.drop_other_tab_state();
         let t = &mut self.terminal;
         let (Some(client), Some(tab)) = (&t.client, t.tabs.get_mut(t.active)) else {
             return;

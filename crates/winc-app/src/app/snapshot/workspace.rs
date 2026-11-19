@@ -3,8 +3,10 @@
 
 use super::*;
 
+pub(super) mod folders;
 pub(super) mod loading;
 pub(super) mod outline;
+mod panes;
 pub(super) mod picker;
 pub(super) mod recent;
 pub(super) mod search;
@@ -13,5 +15,5 @@ pub(super) mod session;
 pub(super) mod tab_selection;
 pub(super) mod tabs;
 pub(super) mod tree;
-pub(super) mod tree_drag;
+mod tree_drag;
 pub(super) mod watch;

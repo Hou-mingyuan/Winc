@@ -16,8 +16,8 @@ use winc_preview::table::{Area, Sheet, Table, column_name};
 use winc_render::{FontKind, Frame, Rect};
 
 use crate::app::App;
-use crate::theme::{RADIUS_POPUP, RADIUS_ROW};
-use crate::view::{fit, ui_baseline};
+use crate::theme::RADIUS_ROW;
+use crate::view::{ScrollArea, fit, ui_baseline};
 
 /// 单元格左右的留白（逻辑像素，经验值）。
 const PAD: f32 = 8.0;
@@ -65,7 +65,7 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
     };
 
     let p = app.palette;
-    app.table_layout.area = area;
+    app.preview.table_layout.area = area;
     frame.rect(area, p.editor_bg);
     let bar = (table.sheets.len() > 1 || sheet.truncated)
         .then(|| Rect::new(area.x, area.bottom() - BAR, area.w, BAR));
@@ -76,7 +76,7 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
     let size = app.fonts.ui;
     let row_h = (size * 2.0).round();
     let numbers_w =
-        frame.measure(FontKind::Ui, size, &sheet.rows.len().max(1).to_string()) + 2.0 * PAD;
+        frame.measure(FontKind::Ui, size, &sheet.row_count().max(1).to_string()) + 2.0 * PAD;
     let numbers_w = numbers_w.max(40.0).round();
     let widths = column_widths(
         app,
@@ -100,29 +100,38 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
     let numbers = Rect::new(grid.x, body.y, numbers_w, body.h);
     let content = (
         edges.last().copied().unwrap_or(0.0),
-        sheet.rows.len() as f32 * row_h,
+        sheet.row_count() as f32 * row_h,
     );
-    let max_scroll = ((content.0 - body.w).max(0.0), (content.1 - body.h).max(0.0));
+    let tall = sheet.row_count() as f64 * f64::from(row_h);
+    let max_scroll = (
+        (content.0 - body.w).max(0.0),
+        (tall - f64::from(body.h)).max(0.0),
+    );
     let (sx, sy) = (
         scroll.0.clamp(0.0, max_scroll.0),
         scroll.1.clamp(0.0, max_scroll.1),
     );
-    let layout = &mut app.table_layout;
+    let layout = &mut app.preview.table_layout;
     layout.max_scroll = max_scroll;
     layout.body = body;
     layout.header = header;
     layout.numbers = numbers;
     layout.row_h = row_h;
-    layout.size = (sheet.rows.len(), sheet.columns);
-    // 区域在窗口中的矩形（逻辑像素）：左上角的横纵坐标由列边界和行号换算。
+    layout.size = (sheet.row_count(), sheet.columns);
+    // 第 `row` 行上边缘的纵坐标（窗口坐标）：先用 `f64` 求出相对视口的位置，行数很多时不失精度。
+    let row_y = |row: usize| body.y + (row as f64 * f64::from(row_h) - sy) as f32;
+    // 区域在窗口中的矩形（逻辑像素）：左上角的横纵坐标由列边界和行号换算。列号超出表格时取
+    // 最右的边界，区域的宽度为 0。
+    let edge = |column: usize| edges.get(column).or(edges.last()).copied().unwrap_or(0.0);
     let area_rect = |a: &Area| {
-        let x = body.x + edges[a.left] - sx;
-        let y = body.y + a.top as f32 * row_h - sy;
+        let x = body.x + edge(a.left) - sx;
+        // 行数很多时纵坐标超出 `f32` 能精确表示的范围，先用 `f64` 求出相对视口的位置。
+        let y = row_y(a.top);
         Rect::new(
             x,
             y,
-            edges[a.right + 1] - edges[a.left],
-            (a.bottom - a.top + 1) as f32 * row_h,
+            edge(a.right + 1) - edge(a.left),
+            (a.bottom.saturating_sub(a.top) + 1) as f32 * row_h,
         )
     };
 
@@ -134,8 +143,9 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
         .skip_while(|&(_, x, w)| x + w <= body.x)
         .take_while(|&(_, x, _)| x < body.right())
         .collect();
-    let first = (sy / row_h).floor() as usize;
-    let last = (((sy + body.h) / row_h).ceil() as usize).min(sheet.rows.len());
+    let (top, row) = (sy, f64::from(row_h));
+    let first = (top / row).floor() as usize;
+    let last = (((top + f64::from(body.h)) / row).ceil() as usize).min(sheet.row_count());
     let visible = match (columns.first(), columns.last()) {
         (Some(l), Some(r)) if first < last => Some(Area {
             top: first,
@@ -159,10 +169,10 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
     let current = sheet
         .merge_at(head.0, head.1)
         .unwrap_or(Area::spanning(head, head));
-    let has_cells = sheet.columns > 0 && !sheet.rows.is_empty();
+    let has_cells = sheet.columns > 0 && sheet.row_count() > 0;
     let selected_rect = has_cells.then(|| {
         area_rect(&Area {
-            bottom: selected.bottom.min(sheet.rows.len().saturating_sub(1)),
+            bottom: selected.bottom.min(sheet.row_count().saturating_sub(1)),
             right: selected.right.min(sheet.columns - 1),
             ..selected
         })
@@ -176,7 +186,7 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
 
     // 单元格和格线；合并区域中的格之后整个画。
     for row in first..last {
-        let y = body.y + row as f32 * row_h - sy;
+        let y = row_y(row);
         for &(column, x, w) in &columns {
             let text = sheet.cell(row, column);
             if text.is_empty() || merges.iter().any(|m| m.contains(row, column)) {
@@ -193,7 +203,8 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
         );
     }
     for &(_, x, w) in &columns {
-        let line = Rect::new(x + w - 1.0, grid.y, 1.0, row_h + body.h.min(content.1 - sy));
+        let below = (tall - sy).min(f64::from(body.h)) as f32;
+        let line = Rect::new(x + w - 1.0, grid.y, 1.0, row_h + below);
         frame.rect_clipped(
             line,
             p.separator,
@@ -236,7 +247,7 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
     }
     frame.rect(numbers, p.sidebar_bg);
     for row in first..last {
-        let y = body.y + row as f32 * row_h - sy;
+        let y = row_y(row);
         let cell = Rect::new(grid.x, y, numbers_w, row_h);
         let picked = (selected.top..=selected.bottom).contains(&row);
         draw_label(
@@ -272,14 +283,15 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
 
     // 当前格的卡片：只选了一格（或一个合并区域）、文字没有显示全时浮在格子旁边；拖着选的
     // 时候、按 Esc 收起以后不显示。
-    app.table_layout.card = Rect::default();
+    app.preview.table_layout.card = Rect::default();
     let text = if has_cells {
         sheet.cell(current.top, current.left)
     } else {
         ""
     };
     let cell = area_rect(&current);
-    let show_card = selected == current
+    let show_card = has_cells
+        && selected == current
         && !card_closed
         && !text.is_empty()
         && !app.table_dragging()
@@ -295,8 +307,18 @@ pub(in crate::view) fn draw(app: &mut App, frame: &mut Frame<'_>, index: usize, 
         draw_cell_card(app, frame, (body, cell), (id, key), text, card_scroll);
     }
 
-    app.table_layout.edges = edges;
-    app.table_layout.sheets.clear();
+    let content = (body.w + max_scroll.0, body.h + max_scroll.1 as f32);
+    let area = ScrollArea::Table;
+    crate::view::draw_scrollbar(app, frame, area, id.0, body, sy as f32, content.1);
+    let thumb = crate::layout::hscrollbar_thumb(body, sx, content.0);
+    let area = ScrollArea::TableHorizontal;
+    let look = app.scrollbar_look(area, id.0, sx, thumb.map(|_| body));
+    if let Some(thumb) = thumb {
+        crate::view::draw_thumb(frame, app.palette, thumb, look);
+    }
+
+    app.preview.table_layout.edges = edges;
+    app.preview.table_layout.sheets.clear();
     if let Some(bar) = bar {
         draw_bar(app, frame, bar, &table, sheet_index);
     }
@@ -355,7 +377,7 @@ fn draw_cell_card(
         return;
     }
     let key = (id, table, sheet, at, w.to_bits(), size.to_bits());
-    let lines = match app.table_layout.card_lines.take() {
+    let lines = match app.preview.table_layout.card_lines.take() {
         Some((cached, lines)) if cached == key => lines,
         _ => wrap(frame, text, size, w - 2.0 * CARD_PAD),
     };
@@ -375,13 +397,10 @@ fn draw_cell_card(
     let card = Rect::new(x.round(), y.round(), w.round(), h);
     let max_scroll = (content - (h - 2.0 * CARD_PAD)).max(0.0);
     let scroll = scroll.clamp(0.0, max_scroll);
-    app.table_layout.card = card;
-    app.table_layout.card_max = max_scroll;
+    app.preview.table_layout.card = card;
+    app.preview.table_layout.card_max = max_scroll;
 
-    let covered = frame.covered(card, RADIUS_POPUP);
-    frame.shadow(card, RADIUS_POPUP, 12.0, 4.0, p.shadow, Some(covered));
-    frame.rect_clipped(card, p.popup_border, RADIUS_POPUP, body);
-    frame.rect_clipped(card.inset(1.0, 1.0), p.popup_bg, RADIUS_POPUP - 1.0, body);
+    crate::view::draw_floating_bar(frame, p, card, body);
     let clip = card.inset(1.0, CARD_PAD - 4.0).intersect(body);
     for (i, line) in lines.iter().enumerate() {
         let top = card.y + CARD_PAD + i as f32 * line_h - scroll;
@@ -400,7 +419,7 @@ fn draw_cell_card(
         let thumb = Rect::new(track.right() - 3.0, y, 3.0, thumb_h);
         frame.rect_clipped(thumb, p.scrollbar, 1.5, card);
     }
-    app.table_layout.card_lines = Some((key, lines));
+    app.preview.table_layout.card_lines = Some((key, lines));
 }
 
 /// 单元格 `cell` 中的文字 `text` 是否没有显示全：有多行，或者第一行放不下。
@@ -544,7 +563,7 @@ fn draw_bar(app: &mut App, frame: &mut Frame<'_>, bar: Rect, table: &Table, curr
         tabs.push(tab);
         x += w + 4.0;
     }
-    app.table_layout.sheets = tabs;
+    app.preview.table_layout.sheets = tabs;
 }
 
 /// 返回各列的宽度（逻辑像素），按前 [`MEASURED_ROWS`] 行中最宽的文字确定。
@@ -557,15 +576,15 @@ fn column_widths(
     key: (DocumentId, usize, usize),
     sheet: &Sheet,
 ) -> Vec<f32> {
-    if let Some((cached, widths)) = &app.table_layout.widths
+    if let Some((cached, widths)) = &app.preview.table_layout.widths
         && *cached == key
     {
         return widths.clone();
     }
     let size = app.fonts.ui;
     let mut widths = vec![COLUMN_MIN; sheet.columns];
-    for (r, row) in sheet.rows.iter().take(MEASURED_ROWS).enumerate() {
-        for (column, text) in row.iter().enumerate() {
+    for r in 0..sheet.row_count().min(MEASURED_ROWS) {
+        for (column, text) in sheet.row(r).enumerate() {
             let first = text.lines().next().unwrap_or_default();
             let spans = sheet.merge_at(r, column).is_some_and(|m| m.right > m.left);
             if first.is_empty() || spans {
@@ -575,7 +594,7 @@ fn column_widths(
             widths[column] = widths[column].max(w.min(COLUMN_MAX).ceil());
         }
     }
-    app.table_layout.widths = Some((key, widths.clone()));
+    app.preview.table_layout.widths = Some((key, widths.clone()));
     widths
 }
 

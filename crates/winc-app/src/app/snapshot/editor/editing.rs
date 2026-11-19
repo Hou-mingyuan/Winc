@@ -98,7 +98,7 @@ fn copying_without_a_selection_copies_and_pastes_whole_lines() {
     app.select(15, 15);
     app.copy(false);
     assert_eq!(
-        app.copied.as_deref(),
+        app.clipboard.copied.as_deref(),
         Some("    let config = load_config();\n")
     );
 
@@ -111,7 +111,7 @@ fn copying_without_a_selection_copies_and_pastes_whole_lines() {
     // 有选区时复制选区内容，粘贴时按普通文本在光标处插入。
     app.select(4, 7);
     app.copy(false);
-    assert_eq!(app.copied.as_deref(), Some("let"));
+    assert_eq!(app.clipboard.copied.as_deref(), Some("let"));
     app.select(0, 0);
     app.paste();
     assert!(line(&app, 0).starts_with("let    let"));
@@ -133,7 +133,7 @@ fn right_clicking_the_text_offers_format_cut_copy_paste() {
     // 在第 `line` 行第 `col` 列（均从 0 起）处按右键。
     let right_click_text = |app: &mut App, line: usize, col: usize| {
         let t = app.layout.text;
-        let x = t.x + TEXT_PAD + col as f32 * app.cell;
+        let x = t.x + TEXT_PAD + col as f32 * app.metrics.cell;
         right_click(app, (x, t.y + (line as f32 + 0.5) * app.fonts.line_height));
     };
     let selection = |app: &App| {
@@ -148,7 +148,7 @@ fn right_clicking_the_text_offers_format_cut_copy_paste() {
     // 在选区内右键：保留选区，菜单命令作用于该选区。
     app.select(20, 26);
     right_click_text(&mut app, 1, 10);
-    let menu = app.context_menu.as_ref().unwrap();
+    let menu = app.overlays.context_menu.as_ref().unwrap();
     assert!(matches!(menu.target, MenuTarget::Editor(_)));
     assert_eq!(
         menu_commands(&app),
@@ -169,7 +169,7 @@ fn right_clicking_the_text_offers_format_cut_copy_paste() {
     );
     assert_eq!(selection(&app), (20, 26));
     app.run_menu_command(Copy);
-    assert_eq!(app.copied.as_deref(), Some("config"));
+    assert_eq!(app.clipboard.copied.as_deref(), Some("config"));
 
     // 该行添加书签后，菜单项变为「删除书签」。
     right_click_text(&mut app, 1, 10);
@@ -191,7 +191,7 @@ fn right_clicking_the_text_offers_format_cut_copy_paste() {
     right_click_text(&mut app, 0, 3);
     assert_eq!(selection(&app), (3, 3));
     app.run_menu_command(Cut);
-    assert_eq!(app.copied.as_deref(), Some("fn main() {\n"));
+    assert_eq!(app.clipboard.copied.as_deref(), Some("fn main() {\n"));
     assert_eq!(line(&app, 0), "    let config = load_config();");
 
     // 粘贴整行：插入到光标所在行的上方。
@@ -205,7 +205,7 @@ fn right_clicking_the_text_offers_format_cut_copy_paste() {
     paint(&mut app);
     let bar = app.layout.search;
     right_click(&mut app, (bar.x + bar.w / 2.0, bar.y + bar.h / 2.0));
-    assert!(app.context_menu.is_none());
+    assert!(app.overlays.context_menu.is_none());
 
     // 只读文档：格式化、修复、剪切、粘贴不可用，转到定义、查找引用和复制仍可用。
     app.editor.active_mut().unwrap().readonly = true;
@@ -250,7 +250,7 @@ fn auto_save_writes_on_switching_tabs_and_leaving_the_window() {
         .position(|d| d.path.as_deref() == Some(&*a));
 
     // 开启自动保存：切换离开时保存，且不在状态栏提示。
-    app.config.auto_save = Some(true);
+    app.config.auto_save = Some(winc_config::AutoSave::OnFocusChange);
     app.status.message = None;
     app.activate_tab(a_index.unwrap());
     app.run(Command::Insert("y".into()));
@@ -311,6 +311,143 @@ fn auto_save_writes_on_switching_tabs_and_leaving_the_window() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 焦点离开编辑区（切到终端）时保存当前文档，查找条不算离开；「停止输入后」在最后一次修改
+/// 一秒后保存，再修改时重新计时，没有保存成功的文档不反复重试。
+#[test]
+fn auto_save_writes_when_the_editor_loses_focus_and_after_typing_stops() {
+    use std::time::{Duration, Instant};
+    use winc_config::AutoSave;
+    let dir = winc_config::files::canonicalize(sample_folder("auto-save-focus")).unwrap();
+    let mut app = app_with(&dir, false);
+    let a = dir.join("a.txt");
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap();
+    let now = Instant::now();
+
+    app.config.auto_save = Some(AutoSave::OnFocusChange);
+    app.open_path(&a);
+    app.focus = Focus::Editor;
+    app.run(Command::Insert("x".into()));
+    assert_eq!(app.auto_save_tick(now), None);
+    app.focus = Focus::Search;
+    app.auto_save_tick(now);
+    assert!(!read(&a).starts_with('x'));
+    app.focus = Focus::Editor;
+    app.auto_save_tick(now);
+    app.focus = Focus::Terminal;
+    app.auto_save_tick(now);
+    assert!(read(&a).starts_with('x'));
+
+    app.config.auto_save = Some(AutoSave::AfterDelay);
+    app.focus = Focus::Editor;
+    app.run(Command::Insert("y".into()));
+    let second = Duration::from_secs(1);
+    assert_eq!(app.auto_save_tick(now), Some(now + second));
+    let later = now + second / 2;
+    app.run(Command::Insert("z".into()));
+    assert_eq!(app.auto_save_tick(later), Some(later + second));
+    assert_eq!(app.auto_save_tick(now + second), Some(later + second));
+    assert!(read(&a).starts_with('x'));
+    assert_eq!(app.auto_save_tick(later + second), None);
+    assert!(read(&a).starts_with("xyz"), "{}", read(&a));
+
+    // 没有路径的新文档保存不了：到期一次以后不再计时。
+    app.new_file();
+    app.run(Command::Insert("new".into()));
+    assert!(app.auto_save_tick(now).is_some());
+    assert_eq!(app.auto_save_tick(now + 2 * second), None);
+    assert_eq!(app.auto_save_tick(now + 3 * second), None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 保存被系统拒绝（目录和文件都不可写）：提示条上有「以管理员身份重试…」，写成后文档算已保存。
+///
+/// 测试中写入进程不请求授权、直接写入，这里先放开文件的权限，代替管理员身份。
+#[cfg(unix)]
+#[test]
+fn a_save_the_system_refuses_can_be_retried_as_administrator() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let dir = sample_folder("save-as-admin");
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let file = locked.join("hosts");
+    std::fs::write(&file, "old\n").unwrap();
+    let mut app = app_with(&file, false);
+    let id = app.editor.active().unwrap().id;
+    // 只有组可写：文件不算只读，但本人写不进；目录也写不进，不能新建再改名。
+    mode(&file, 0o464);
+    mode(&locked, 0o555);
+    // 以 root 运行时系统不拒绝，没有可测的。
+    if std::fs::OpenOptions::new().write(true).open(&file).is_err() {
+        app.run(Command::Insert("new ".into()));
+        assert!(!app.save_document(id, None));
+        assert_eq!(app.notice.action, Some(NoticeAction::SaveAsAdmin(id)));
+
+        mode(&file, 0o664);
+        app.run_notice_action();
+        assert!(!app.editor.document(id).unwrap().is_dirty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new old\n");
+        assert!(app.notice.text.is_none(), "{:?}", app.notice.text);
+    }
+    mode(&locked, 0o755);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 以管理员身份保存之前同样检查外部修改：文件已被其他程序改过时不写，提示冲突。
+#[test]
+fn saving_as_administrator_keeps_outside_changes() {
+    let dir = sample_folder("save-as-admin-conflict");
+    let file = dir.join("notes.txt");
+    std::fs::write(&file, "old\n").unwrap();
+    let mut app = app_with(&file, false);
+    let id = app.editor.active().unwrap().id;
+    app.run(Command::Insert("mine ".into()));
+    std::fs::write(&file, "theirs, and longer\n").unwrap();
+    app.save_as_admin(id);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "theirs, and longer\n"
+    );
+    assert!(app.editor.document(id).unwrap().is_dirty());
+    let notice = app.notice.text.clone().unwrap_or_default();
+    assert!(notice.contains("文件已被其他程序修改"), "{notice}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 回归（#277）：`Ctrl+/` 在只有块注释的语言里没有反应。CSS 改为包成块注释；纯文本没有注释
+/// 写法，在状态栏说明。
+#[test]
+fn the_comment_shortcut_wraps_css_and_explains_plain_text() {
+    let dir = sample_folder("comment-fallback");
+    std::fs::write(dir.join("style.css"), "a { color: red; }\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+    let text = |app: &App| {
+        app.editor
+            .active()
+            .unwrap()
+            .text_range(0, usize::MAX)
+            .unwrap()
+    };
+
+    let mut app = app_with(&dir.join("style.css"), false);
+    app.run_action(Action::ToggleComment);
+    assert_eq!(text(&app), "/* a { color: red; } */\n");
+    app.run_action(Action::ToggleComment);
+    assert_eq!(text(&app), "a { color: red; }\n");
+
+    app.open_path(&dir.join("notes.txt"));
+    app.run_action(Action::ToggleComment);
+    assert_eq!(text(&app), "hello\n");
+    assert_eq!(
+        app.status.message.as_deref(),
+        Some("Plain Text 没有注释写法")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn editorconfig_sets_indentation_and_tidies_on_save() {
     let dir = winc_config::files::canonicalize(sample_folder("editorconfig")).unwrap();
@@ -349,7 +486,7 @@ fn editorconfig_sets_indentation_and_tidies_on_save() {
     );
 
     // 自动保存：光标所在行可能正在输入，不删除该行的行尾空白。
-    app.config.auto_save = Some(true);
+    app.config.auto_save = Some(winc_config::AutoSave::OnFocusChange);
     let ids: Vec<DocumentId> = app.editor.documents.iter().map(|d| d.id).collect();
     app.auto_save(&ids);
     assert_eq!(read(), "def run():\n    return 1\nx = 2  \n");
@@ -386,7 +523,7 @@ fn status_bar_changes_indentation_and_line_endings() {
     // 宽度选项在子菜单中。
     let at = status_point(&app, StatusItem::Indent);
     app.on_mouse_move(at.0, at.1);
-    assert_eq!(app.hover, Hover::Status(StatusItem::Indent));
+    assert_eq!(app.pointer.hover, Hover::Status(StatusItem::Indent));
     click(&mut app, at);
     assert_eq!(
         menu_commands(&app)[..2],
@@ -404,7 +541,7 @@ fn status_bar_changes_indentation_and_line_endings() {
     assert_eq!(doc(&app).indent(), Indent::Spaces(2));
     assert_eq!(
         indent_label(doc(&app).indent(), 4),
-        "空格: 2",
+        "空格：2",
         "状态栏的缩进标签显示空格数"
     );
 
@@ -445,10 +582,10 @@ fn status_bar_changes_indentation_and_line_endings() {
     assert!(doc(&app).is_dirty());
     app.run_action(crate::keymap::Action::ChangeEndOfLine);
     assert!(matches!(
-        app.context_menu.as_ref().map(|m| &m.target),
+        app.overlays.context_menu.as_ref().map(|m| &m.target),
         Some(crate::app::input::context_menu::MenuTarget::LineEnding(_))
     ));
-    app.context_menu = None;
+    app.overlays.context_menu = None;
 
     // 仅供查看的输出标签（格式化输出）的状态栏上，可点击的项只有设置按钮。
     app.editor.show_output("格式化输出", "x\n");
@@ -477,7 +614,8 @@ fn the_scrollbar_marks_other_occurrences_of_the_selection() {
     std::fs::write(&file, &text).unwrap();
     let mut app = app_with(&file, false);
     let marks = |app: &App| {
-        app.ruler_cache
+        app.caches
+            .ruler_cache
             .as_ref()
             .and_then(|(_, l)| l.as_deref().map(<[usize]>::to_vec))
     };
@@ -492,12 +630,12 @@ fn the_scrollbar_marks_other_occurrences_of_the_selection() {
     app.select(at, at + 5);
     paint(&mut app);
     assert_eq!(marks(&app), Some(vec![10, 200, 300, 390]));
-    let key = app.ruler_cache.as_ref().unwrap().0.clone();
+    let key = app.caches.ruler_cache.as_ref().unwrap().0.clone();
 
     // 选区不变、滚动：不重新计算。
     app.editor.active_mut().unwrap().scroll_line = 100.0;
     paint(&mut app);
-    assert_eq!(app.ruler_cache.as_ref().unwrap().0, key);
+    assert_eq!(app.caches.ruler_cache.as_ref().unwrap().0, key);
 
     // 选中的文字只出现一次（第 300 行的 `totally`）：不标记。
     let at = app.editor.active().unwrap().text().line_start(300) + 4;
@@ -532,7 +670,7 @@ fn bookmarks_jump_list_and_survive_closing_and_restarting() {
 
     // 没有书签时无法跳转，状态栏给出提示。
     app.run_action(Action::NextBookmark);
-    assert_eq!(app.status.message.as_deref(), Some("此文件中没有书签"));
+    assert_eq!(app.status.message.as_deref(), Some("此文件中暂无书签"));
 
     // 在第 1、3 行（从 0 起）添加书签；第 2 行切换两次，即添加后又移除。
     go(&mut app, 3);
@@ -557,12 +695,12 @@ fn bookmarks_jump_list_and_survive_closing_and_restarting() {
 
     // 列出书签：卡片中有两行，回车跳转到选中的书签。
     app.run_action(Action::ListBookmarks);
-    assert!(app.picker.open);
-    assert_eq!(app.picker.hits.len(), 2);
+    assert!(app.overlays.picker.open);
+    assert_eq!(app.overlays.picker.hits.len(), 2);
     paint(&mut app);
-    app.picker.selected = 0;
+    app.overlays.picker.selected = 0;
     app.places_accept();
-    assert!(!app.picker.open);
+    assert!(!app.overlays.picker.open);
     assert_eq!(line_of(&app), 1);
 
     // 关闭标签后重新打开：书签仍在。
@@ -680,7 +818,7 @@ fn csv_columns_line_up_for_clicks_and_moving_up_and_down() {
     // 点击落在对齐产生的空白中时，光标停在距离更近的字符边界上。
     let t = app.layout.text;
     let doc = app.editor.active().unwrap();
-    let x = t.x + TEXT_PAD - doc.scroll_x + 8.5 * app.cell;
+    let x = t.x + TEXT_PAD - doc.scroll_x + 8.5 * app.metrics.cell;
     let y = t.y + 0.5 * app.fonts.line_height;
     assert_eq!(
         app.pos_at(x, y),
@@ -740,7 +878,7 @@ fn word_wrap_folds_long_lines_to_the_editor_width() {
     // 编辑区变窄（侧栏变宽）：长行断为更多段；滚动位置顶部的文本行保持不变。宽度减少文本区的
     // 一半：减少固定宽度时，某些字体下断出的段数恰好不变。
     app.editor.active_mut().unwrap().scroll_line = 2.0;
-    app.sidebar.width += app.layout.text.w / 2.0;
+    app.panels.sidebar.width += app.layout.text.w / 2.0;
     paint(&mut app);
     let doc = app.editor.active().unwrap();
     assert!(doc.rows_of(1) > rows);
@@ -886,7 +1024,7 @@ fn lines_read_up_to_the_right_edge_keep_the_highlight_state() {
         paint(&mut app);
         assert!(app.editor.active().unwrap().is_large());
         let (text, lh) = (app.layout.text, app.fonts.line_height);
-        let renderer = app.renderer.take().unwrap();
+        let renderer = app.frame.renderer.take().unwrap();
         let scale = renderer.scale_factor();
         let image = renderer.image().unwrap();
         let (x0, x1) = (
@@ -901,7 +1039,7 @@ fn lines_read_up_to_the_right_edge_keep_the_highlight_state() {
         let pixels: Vec<u32> = (y0..y1)
             .flat_map(|y| image.pixels[y * width + x0..y * width + x1].to_vec())
             .collect();
-        app.renderer = Some(renderer);
+        app.frame.renderer = Some(renderer);
         pixels
     };
     let far = second_row(
@@ -934,8 +1072,8 @@ fn finding_a_match_beyond_the_shown_part_of_a_line_keeps_text_on_screen() {
 
     let find = |app: &mut App| {
         app.open_search(false);
-        app.find.input.set_text("needle");
-        app.search.query = "needle".into();
+        app.bars.find.input.set_text("needle");
+        app.bars.search.query = "needle".into();
         app.search_changed();
         app.status.message = None;
         app.find_next(false);
@@ -948,7 +1086,7 @@ fn finding_a_match_beyond_the_shown_part_of_a_line_keeps_text_on_screen() {
     assert_eq!(col, 60_008);
     assert!(doc.shows_whole_line(line) && !doc.shows_whole_line(line + 1));
     // 匹配在文本区内：滚动位置在匹配的左侧不到一屏处。
-    let x = 60_008.0 * app.cell;
+    let x = 60_008.0 * app.metrics.cell;
     let scroll = doc.scroll_x;
     assert!(
         scroll < x && scroll > x - app.layout.text.w && scroll <= max_x,
@@ -956,7 +1094,7 @@ fn finding_a_match_beyond_the_shown_part_of_a_line_keeps_text_on_screen() {
     );
     // 匹配处画有文字，点击该处落在匹配上。
     let t = app.layout.text;
-    let at = t.x + TEXT_PAD + x - scroll + 0.4 * app.cell;
+    let at = t.x + TEXT_PAD + x - scroll + 0.4 * app.metrics.cell;
     let row = (doc.row_of(line) as f64 - doc.scroll_line) as f32 + 0.5;
     let pos = app.pos_at(at, t.y + row * app.fonts.line_height).unwrap();
     assert_eq!(pos, app.editor.active().unwrap().selection.from());
@@ -1008,7 +1146,7 @@ fn lines_past_sixteen_million_rows_each_take_their_own_row() {
     paint(&mut app);
 
     let (gutter, text, lh) = (app.layout.gutter, app.layout.text, app.fonts.line_height);
-    let image = app.renderer.as_ref().unwrap().image().unwrap();
+    let image = app.frame.renderer.as_ref().unwrap().image().unwrap();
     let width = image.width as usize;
     let px = |v: f32| (v * SCALE) as usize;
     // 行号栏中每一行都画有行号。
@@ -1042,7 +1180,7 @@ fn long_lines_expand_by_clicking_or_by_the_setting() {
     // 文本区第 `row` 行右半边是否画有内容。
     let inked = |app: &App, row: usize| {
         let (t, lh) = (app.layout.text, app.fonts.line_height);
-        let image = app.renderer.as_ref().unwrap().image().unwrap();
+        let image = app.frame.renderer.as_ref().unwrap().image().unwrap();
         let px = |v: f32| (v * SCALE) as usize;
         let (y0, y1) = (
             px(t.y + row as f32 * lh + 2.0),
@@ -1075,12 +1213,15 @@ fn long_lines_expand_by_clicking_or_by_the_setting() {
 
     // 展开的行可以滚动到行尾：行尾画有文字，点击处与字符对应；未展开的行在该处没有内容。
     let wide = app.text_max_scroll_x();
-    assert!(wide > narrow + 19_000.0 * app.cell, "{narrow} {wide}");
-    let near_end = wide - 20.0 * app.cell;
+    assert!(
+        wide > narrow + 19_000.0 * app.metrics.cell,
+        "{narrow} {wide}"
+    );
+    let near_end = wide - 20.0 * app.metrics.cell;
     scroll_to(&mut app, near_end);
     assert!(inked(&app, 0) && !inked(&app, 2));
     let (t, lh) = (app.layout.text, app.fonts.line_height);
-    let x = t.x + TEXT_PAD + 29_990.0 * app.cell - app.editor.active().unwrap().scroll_x;
+    let x = t.x + TEXT_PAD + 29_990.0 * app.metrics.cell - app.editor.active().unwrap().scroll_x;
     assert_eq!(app.pos_at(x, t.y + 0.5 * lh), Some(29_990));
 
     // 设置打开后所有的行都显示整行，不再有截断说明。
@@ -1116,13 +1257,13 @@ fn the_far_end_of_a_whole_line_is_drawn_in_place() {
     let mut app = app_with(&path, false);
     app.config.whole_lines = Some(true);
     paint(&mut app);
-    app.editor.active_mut().unwrap().scroll_x = (col - 20) as f32 * app.cell;
+    app.editor.active_mut().unwrap().scroll_x = (col - 20) as f32 * app.metrics.cell;
     paint(&mut app);
 
-    let (t, lh, cell) = (app.layout.text, app.fonts.line_height, app.cell);
+    let (t, lh, cell) = (app.layout.text, app.fonts.line_height, app.metrics.cell);
     let scroll = f64::from(app.editor.active().unwrap().scroll_x);
     let expected = f64::from(t.x + TEXT_PAD) + col as f64 * f64::from(cell) - scroll;
-    let image = app.renderer.as_ref().unwrap().image().unwrap();
+    let image = app.frame.renderer.as_ref().unwrap().image().unwrap();
     let px = |v: f32| (v * SCALE) as usize;
     let (y0, y1) = (px(t.y + 2.0), px(t.y + lh - 2.0));
     let width = image.width as usize;
@@ -1137,5 +1278,68 @@ fn the_far_end_of_a_whole_line_is_drawn_in_place() {
     // 点击该字符的左半边，落在它之前。
     let pos = app.pos_at(expected as f32 + 0.3 * cell, t.y + 0.5 * lh);
     assert_eq!(pos, Some(col));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 自动换行时，超过 `MAX_LINE_CHARS` 个字符而不足 `MAX_LINE_BYTES` 字节的行可以通过点击「显示整行」
+/// 或设置展开：截断说明消失，行尾可以绘制，点击位置与字符对应。
+#[test]
+fn wrapped_long_lines_expand_by_clicking_or_by_the_setting() {
+    use winc_core::text::{MAX_LINE_BYTES, MAX_LINE_CHARS};
+    let dir = sample_folder("long-lines-wrapped");
+    // 两种样本都在两个上限之间：3 万个 ASCII 字符、1.2 万个汉字。
+    let ascii = format!("{}{}", "a".repeat(10_000), "b".repeat(20_000));
+    let cjk = format!("{}{}", "甲".repeat(10_000), "乙".repeat(2_000));
+    for (name, long, last) in [("a.txt", &ascii, 'b'), ("c.txt", &cjk, '乙')] {
+        assert!(long.chars().count() > MAX_LINE_CHARS && long.len() + 3 < MAX_LINE_BYTES);
+        for by_setting in [false, true] {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("{long}\nshort\n")).unwrap();
+            let mut app = app_with(&path, false);
+            app.run_action(Action::ToggleWordWrap);
+            paint(&mut app);
+            let notices = |app: &App| app.hits.long_lines.iter().map(|h| h.1).collect::<Vec<_>>();
+            // 滚动到该行的最后几段。
+            let to_end = |app: &mut App| {
+                let doc = app.editor.active_mut().unwrap();
+                doc.scroll_line = (doc.rows_of(0) as f64 - 3.0).max(0.0);
+                paint(app);
+            };
+            to_end(&mut app);
+            assert_eq!(notices(&app), [0], "{name}");
+            let folded = app.editor.active().unwrap().rows_of(0);
+
+            if by_setting {
+                app.config.whole_lines = Some(true);
+                paint(&mut app);
+            } else {
+                let (rect, _) = app.hits.long_lines[0];
+                click(&mut app, (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0));
+                paint(&mut app);
+            }
+            let doc = app.editor.active().unwrap();
+            assert!(doc.shows_whole_line(0) && doc.rows_of(0) > folded, "{name}");
+            to_end(&mut app);
+            assert!(notices(&app).is_empty(), "{name} {by_setting}");
+
+            // 最后一段的首字符位于行尾部分：点击后光标落在该字符之前。
+            let doc = app.editor.active().unwrap();
+            let rows = doc.rows_of(0);
+            let breaks = doc.line_breaks(0);
+            let start = breaks.start_of(rows - 1);
+            assert!(start > MAX_LINE_CHARS, "{name}: {start}");
+            let (t, lh) = (app.layout.text, app.fonts.line_height);
+            let top = app.editor.active().unwrap().scroll_line;
+            let y = t.y + ((rows - 1) as f64 - top) as f32 * lh + 0.5 * lh;
+            let pos = app.pos_at(t.x + TEXT_PAD + 1.0, y).unwrap();
+            assert_eq!(pos, start, "{name}");
+            let doc = app.editor.active().unwrap();
+            assert_eq!(doc.text().char_at(pos), Some(last), "{name}");
+            // 选中最后一段到行尾：选区按整行的内容测量。
+            let end = doc.text().line_end(0);
+            app.editor.active_mut().unwrap().selection = winc_core::Selection::new(pos, end);
+            paint(&mut app);
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

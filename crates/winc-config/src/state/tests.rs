@@ -52,6 +52,7 @@ fn sample() -> State {
                 )],
                 folds: vec![(PathBuf::from("/a/项目/README.md"), vec![(0, 12), (3, 7)])],
                 pdf_places: vec![(PathBuf::from("/a/项目/手册.pdf"), (12, 0.375))],
+                book_places: vec![(PathBuf::from("/a/项目/小说.epub"), (340, 0.5))],
                 terminal: Some(TerminalSession {
                     tabs: vec![PathBuf::from("/a/项目"), PathBuf::from("/a/项目/src")],
                     names: vec![String::new(), "服务".into()],
@@ -60,9 +61,40 @@ fn sample() -> State {
                     open: true,
                     height: 320.0,
                     width: 0.0,
+                    maximized: true,
                 }),
                 run: Some("后端".into()),
+                folders: vec![PathBuf::from("/tmp/extra"), PathBuf::from("/tmp/另一个")],
+                name: Some("后端组".into()),
+                readonly: vec![PathBuf::from("/a/项目/main.rs")],
+                readonly_all: true,
                 sidebar_hidden: true,
+                window: Some(WindowFrame {
+                    position: Some((0.0, 25.0)),
+                    width: 1440.0,
+                    height: 875.0,
+                    scale: 2.0,
+                    maximized: true,
+                }),
+                panes: Some(SessionPanes {
+                    tree: PaneNode::Split {
+                        column: false,
+                        share: 0.25,
+                        first: Box::new(PaneNode::Pane(0)),
+                        second: Box::new(PaneNode::Pane(1)),
+                    },
+                    panes: vec![
+                        SessionPane {
+                            tabs: vec![0],
+                            active: Some(0),
+                        },
+                        SessionPane {
+                            tabs: vec![1, 0],
+                            active: None,
+                        },
+                    ],
+                    focused: 1,
+                }),
             },
             Session {
                 folder: PathBuf::from("/b"),
@@ -72,21 +104,39 @@ fn sample() -> State {
                 outline: Vec::new(),
                 folds: Vec::new(),
                 pdf_places: Vec::new(),
+                book_places: Vec::new(),
                 terminal: None,
                 run: None,
+                folders: Vec::new(),
+                name: None,
+                readonly: Vec::new(),
+                readonly_all: false,
                 sidebar_hidden: false,
+                window: None,
+                panes: None,
             },
         ],
         last: Some(PathBuf::from("/a/项目")),
         others: vec![PathBuf::from("/b")],
         commit_tree: true,
+        commit_sort: "status".into(),
+        commit_all_repositories: Some(true),
+        log_branches: Some(false),
+        log_columns: Some(vec!["date".into(), "hash".into()]),
+        commit_messages: vec!["修复登录\n\n说明".into(), "first".into()],
+        commit_check_todo: true,
+        commit_reformat: true,
+        sign_off_repos: vec![PathBuf::from("/a/项目")],
         pdf_thumbnails_hidden: true,
+        markdown_toc_pinned: true,
         vim_marks: vec![('A', PathBuf::from("/a/项目/x.rs"), 12, 3)],
         vim_commands: vec!["%s/a/b/g".into(), "w".into()],
         vim_searches: vec!["\\<词\\>".into()],
         stay_outside_applications: true,
         panel_width: Some(360.0),
         preview_mode: Some("split".into()),
+        version: Some("0.1.626".into()),
+        setup_pending: true,
         window: Some(WindowFrame {
             position: Some((-1280.0, 40.0)),
             width: 900.5,
@@ -97,9 +147,24 @@ fn sample() -> State {
         badges: Vec::new(),
         tool_choices: vec![(PathBuf::from("/a/项目"), true)],
         trusted_repos: vec![(PathBuf::from("/a/项目"), u64::MAX - 1)],
+        remote_keys: Vec::new(),
     };
+    state.set_remote_key("me@devbox:2200", "~/.ssh/工作 key");
+    state.set_remote_key("build", "/keys/build");
     state.assign_badges();
     state
+}
+
+#[test]
+fn a_key_file_is_kept_per_remote_host_until_cleared() {
+    let mut state = sample();
+    assert_eq!(state.remote_key("build"), Some("/keys/build"));
+    assert_eq!(state.remote_key("me@devbox"), None);
+    state.set_remote_key("build", "/keys/other");
+    assert_eq!(state.remote_key("build"), Some("/keys/other"));
+    state.set_remote_key("build", "");
+    assert_eq!(state.remote_key("build"), None);
+    assert_eq!(state.remote_key("me@devbox:2200"), Some("~/.ssh/工作 key"));
 }
 
 #[test]
@@ -161,11 +226,14 @@ fn bad_input_means_no_history() {
 #[test]
 fn recent_list_moves_to_front_and_is_capped() {
     let mut state = State::default();
-    for i in 0..15 {
+    for i in 0..MAX_RECENT + 5 {
         state.remember(Path::new(&format!("/p{i}")));
     }
     assert_eq!(state.recent.len(), MAX_RECENT);
-    assert_eq!(state.recent[0], PathBuf::from("/p14"));
+    assert_eq!(
+        state.recent[0],
+        PathBuf::from(format!("/p{}", MAX_RECENT + 4))
+    );
 
     state.remember(Path::new("/p10"));
     assert_eq!(state.recent[0], PathBuf::from("/p10"));
@@ -191,7 +259,7 @@ fn recent_list_moves_to_front_and_is_capped() {
 #[test]
 fn recent_folders_keep_their_own_badge_colors() {
     let mut state = State::default();
-    for i in 0..MAX_RECENT {
+    for i in 0..BADGE_COLORS {
         state.remember(Path::new(&format!("/projects/p{i}")));
     }
 
@@ -202,7 +270,7 @@ fn recent_folders_keep_their_own_badge_colors() {
     let mut all = colors(&state);
     all.sort_unstable();
     all.dedup();
-    assert_eq!(all.len(), MAX_RECENT);
+    assert_eq!(all.len(), BADGE_COLORS);
 
     // 重新打开已有目录：移到最前面，该目录与其他目录的颜色都不变。
     let before = state.badge_color(Path::new("/projects/p3"));
@@ -217,11 +285,14 @@ fn recent_folders_keep_their_own_badge_colors() {
         assert_eq!(state.badge_color(&folder), color);
     }
 
-    // 新目录替换最旧的目录并获得其释放的颜色；序列化后再读回，颜色保持不变。
+    // 新目录把第十个目录挤出前十并获得它让出的颜色；该目录仍在列表中，按名字取色。序列化
+    // 后再读回，颜色保持不变。
     let oldest = state.recent.last().cloned().unwrap();
     let freed = state.badge_color(&oldest);
     state.remember(Path::new("/projects/new"));
     assert_eq!(state.badge_color(Path::new("/projects/new")), freed);
+    assert_eq!(state.recent.get(BADGE_COLORS), Some(&oldest));
+    assert_eq!(state.badge_color(&oldest), preferred_color(&oldest));
     assert_eq!(colors(&State::parse(&state.to_json())), colors(&state));
 
     // 旧文件缺少颜色、手工改成重复或越界时，读入后颜色被理顺为互不相同。
@@ -249,9 +320,16 @@ fn sessions_are_kept_per_folder() {
         outline: Vec::new(),
         folds: Vec::new(),
         pdf_places: Vec::new(),
+        book_places: Vec::new(),
         terminal: None,
         run: None,
+        folders: Vec::new(),
+        name: None,
+        readonly: Vec::new(),
+        readonly_all: false,
         sidebar_hidden: false,
+        window: None,
+        panes: None,
     });
     assert_eq!(state.sessions.len(), 2);
     assert_eq!(state.sessions[0].folder, PathBuf::from("/b"));
@@ -263,7 +341,7 @@ fn sessions_are_kept_per_folder() {
             ..Session::default()
         });
     }
-    assert_eq!(state.sessions.len(), MAX_RECENT);
+    assert_eq!(state.sessions.len(), MAX_SESSIONS);
 
     // 旧格式只记单个 `session`，读入后作为上次退出时的现场。
     let old = "{\"recent\": [\"/a\"], \"session\": {\"folder\": \"/a\", \"files\": [\"/a/x\"]}}";
@@ -329,4 +407,21 @@ fn window_frames_need_a_usable_size_and_may_have_no_position() {
     );
     assert_eq!(read(r#"{"window":{"width":800,"height":600}}"#), None);
     assert_eq!(read(r#"{"window":"nothing"}"#), None);
+}
+
+/// 提交过的信息：相同的移到最前，最多留 `MAX_COMMIT_MESSAGES` 条。
+#[test]
+fn commit_messages_keep_the_newest_without_repeats() {
+    let mut state = State::default();
+    for i in 0..MAX_COMMIT_MESSAGES + 5 {
+        state.remember_commit_message(&format!("m{i}"));
+    }
+    state.remember_commit_message("m10");
+    state.remember_commit_message("");
+    assert_eq!(state.commit_messages.len(), MAX_COMMIT_MESSAGES);
+    assert_eq!(state.commit_messages[0], "m10");
+    assert_eq!(
+        state.commit_messages.iter().filter(|m| *m == "m10").count(),
+        1
+    );
 }

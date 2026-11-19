@@ -77,7 +77,7 @@ pub(super) fn joined_text(text: &str) -> (String, Vec<usize>) {
 
 /// 构造一个文件的结果；没有匹配时返回 `None`。
 pub(super) fn file_result(
-    root: &Path,
+    (root, extra): (&Path, &[(String, PathBuf)]),
     path: &Path,
     matches: Vec<LineMatch>,
     lossy: bool,
@@ -86,16 +86,9 @@ pub(super) fn file_result(
         return None;
     }
 
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    let relative = relative
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
-
     Some(FileResult {
         path: path.to_path_buf(),
-        relative,
+        relative: crate::workspace::tree::labelled_path(root, extra, path),
         matches,
         lossy,
     })

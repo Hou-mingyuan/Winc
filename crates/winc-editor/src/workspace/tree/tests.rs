@@ -1,6 +1,8 @@
 //! 文件树 [`Workspace`] 的测试：按变化只重读受影响的目录、改名与移动保持展开、复制不覆盖、
 //! 选中跟随行变化、自然排序与按需展开的缓存，以及连续单子目录的合并显示和递归展开。
 
+use std::fs;
+
 use super::*;
 
 #[test]
@@ -660,4 +662,178 @@ fn expanding_recursively_does_not_follow_symlinks() {
     assert!(!ws.expand_recursively(0));
     let link = ws.rows().iter().find(|e| e.name == "loop").unwrap();
     assert!(!link.expanded);
+}
+
+/// 不能等待读取的线程（界面线程）上的远端目录：文件树先按空目录显示，缺少的目录交给后台读取
+/// 后换入；重读时读不了的目录保持原样，同样交给后台。
+#[cfg(unix)]
+#[test]
+fn folders_that_cannot_be_read_on_this_thread_are_filled_in_later() {
+    use std::os::unix::ffi::OsStrExt;
+    use winc_backend::remote;
+
+    let local = crate::test_util::scratch("ws-remote");
+    fs::create_dir_all(local.join("only/inner")).unwrap();
+    fs::write(local.join("only/inner/a.rs"), "").unwrap();
+    fs::write(local.join("b.rs"), "").unwrap();
+    let target = crate::test_util::loopback("ws-remote");
+    let root = winc_backend::virtual_path(&target, local.as_os_str().as_bytes());
+
+    // 限制只作用于当前线程，放在单独的线程上，不影响其他测试。
+    std::thread::spawn(move || {
+        remote::forbid_blocking();
+        let names = |ws: &Workspace| -> Vec<String> {
+            ws.rows().iter().map(|e| e.label().into_owned()).collect()
+        };
+        // 交给「后台」：这里就地执行，执行期间允许等待。
+        let fetch = |ws: &mut Workspace| {
+            let mut rounds = 0;
+            while let Some(scan) = ws.take_missing() {
+                let listing = remote::allow_blocking(|| scan.run());
+                assert!(ws.apply_scan(listing));
+                rounds += 1;
+            }
+            rounds
+        };
+
+        let mut ws = Workspace::open(&root).unwrap();
+        assert!(names(&ws).is_empty());
+        assert_eq!(fetch(&mut ws), 1);
+        assert_eq!(names(&ws), ["only", "b.rs"]);
+        // 同一个目录在读好之前只交出一次。
+        ws.toggle(0);
+        let scan = ws.take_missing().unwrap();
+        ws.toggle(0);
+        ws.toggle(0);
+        assert!(ws.take_missing().is_none());
+        assert!(ws.apply_scan(remote::allow_blocking(|| scan.run())));
+        // 合并显示的下一级目录在换入后才知道需要，再读一轮。
+        assert_eq!(fetch(&mut ws), 1);
+        assert_eq!(names(&ws), ["only/inner", "a.rs", "b.rs"]);
+
+        // 重读：读不了不等于目录已不存在，文件树和展开状态保持，变化在后台读取后出现。
+        fs::write(local.join("only/inner/c.rs"), "").unwrap();
+        ws.refresh();
+        assert_eq!(names(&ws), ["only/inner", "a.rs", "b.rs"]);
+        assert_eq!(fetch(&mut ws), 1);
+        assert_eq!(names(&ws), ["only/inner", "a.rs", "c.rs", "b.rs"]);
+
+        // 连接断开后重读：同样保持原样。
+        remote::disconnect(&target);
+        ws.refresh();
+        while let Some(scan) = ws.take_missing() {
+            ws.apply_scan(remote::allow_blocking(|| scan.run()));
+        }
+        assert_eq!(names(&ws), ["only/inner", "a.rs", "c.rs", "b.rs"]);
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn a_folder_in_a_wsl_distro_is_named_with_the_distro() {
+    let place = |path: &str| crate::wsl::locate(Path::new(path)).unwrap();
+    let project = place(r"\\wsl.localhost\Ubuntu-26.04\home\me\project");
+    assert_eq!(
+        in_distro("project", &project),
+        "project [WSL: Ubuntu-26.04]"
+    );
+    // 发行版的根目录没有名字，显示为 `/`。
+    let root = place(r"\\wsl$\Debian");
+    assert_eq!(in_distro("Debian", &root), "/ [WSL: Debian]");
+}
+
+/// 附加文件夹以后最上一层是各个文件夹，各自收起、展开；移除后回到只列根目录的内容。
+#[test]
+fn extra_folders_are_listed_as_top_level_rows() {
+    let base = crate::test_util::scratch("ws-folders");
+    fs::create_dir_all(base.join("main/src")).unwrap();
+    fs::write(base.join("main/src/a.rs"), "").unwrap();
+    fs::write(base.join("main/readme.md"), "").unwrap();
+    fs::create_dir_all(base.join("other/only/deep")).unwrap();
+    fs::write(base.join("other/only/deep/b.rs"), "").unwrap();
+    let mut ws = Workspace::open(&base.join("main")).unwrap();
+    let main = ws.root.clone();
+    let rows = |ws: &Workspace| -> Vec<(String, usize)> {
+        (ws.rows().iter())
+            .map(|e| (e.label().into_owned(), e.depth))
+            .collect()
+    };
+    let row = |name: &str, depth: usize| (name.to_owned(), depth);
+    assert_eq!(rows(&ws), [row("src", 0), row("readme.md", 0)]);
+    assert!(!ws.is_folder_row(&main));
+
+    let other = ws.add_folder(&base.join("other")).unwrap();
+    assert_eq!(ws.extra_folders(), std::slice::from_ref(&other));
+    assert!(ws.is_folder_row(&main) && ws.is_folder_row(&other));
+    // 文件夹自己的行不与唯一的子目录合并，其下的连续单子目录照常合并。
+    assert_eq!(
+        rows(&ws),
+        [
+            row("main", 0),
+            row("src", 1),
+            row("readme.md", 1),
+            row("other", 0),
+            row("only", 1),
+        ]
+    );
+    assert_eq!(ws.folder_of(&other.join("only/deep/b.rs")), Some(&*other));
+    assert_eq!(ws.folder_of(&base.join("elsewhere")), None);
+
+    // 定位到附加文件夹中的文件：展开到它并选中。
+    ws.reveal(&other.join("only/deep/b.rs"));
+    assert_eq!(
+        ws.selected_entry().unwrap().path,
+        other.join("only/deep/b.rs")
+    );
+    assert!(rows(&ws).contains(&row("b.rs", 2)));
+
+    // 收起根目录的一行：只隐藏它的内容。
+    let top = ws.row_of(&main).unwrap();
+    ws.toggle(top);
+    assert_eq!(rows(&ws)[..2], [row("main", 0), row("other", 0)]);
+    ws.toggle(top);
+
+    // 新建、改名都限制在所在的文件夹内。
+    let made = ws.create(&other, "new.txt", EntryKind::File).unwrap();
+    assert_eq!(made, other.join("new.txt"));
+    assert!(ws.rename(&made, "../escape.txt").is_err());
+
+    // 文件夹本身不能改名，也不能移进另一个文件夹。
+    assert!(ws.rename(&other, "renamed").is_err() && other.is_dir());
+    assert!(ws.move_into(&main, &other).is_err() && main.is_dir());
+    assert!(ws.move_into(&other, &main.join("src")).is_err() && other.is_dir());
+
+    // 已在某个文件夹之内、包含某个文件夹的目录不能再加入；根目录不能移除。
+    assert!(ws.add_folder(&main.join("src")).is_err());
+    assert!(ws.add_folder(&base).is_err());
+    assert!(ws.add_folder(&other).is_err());
+    assert!(!ws.remove_folder(&main));
+
+    assert!(ws.remove_folder(&other));
+    assert!(ws.extra_folders().is_empty() && !ws.is_folder_row(&main));
+    assert_eq!(rows(&ws), [row("src", 0), row("readme.md", 0)]);
+    assert!(ws.selected_entry().is_none());
+}
+
+/// 同名的文件夹在名字后注明上级目录，不同名的不注明。
+#[test]
+fn folders_with_the_same_name_show_their_parents() {
+    let base = crate::test_util::scratch("ws-same-name");
+    for dir in ["main", "services/api", "tools/api"] {
+        fs::create_dir_all(base.join(dir)).unwrap();
+    }
+    let mut ws = Workspace::open(&base.join("main")).unwrap();
+    ws.add_folder(&base.join("services/api")).unwrap();
+    let names = |ws: &Workspace| -> Vec<String> {
+        (ws.rows().iter().filter(|e| e.depth == 0))
+            .map(|e| e.label().into_owned())
+            .collect()
+    };
+    assert_eq!(names(&ws), ["main", "api"]);
+    ws.add_folder(&base.join("tools/api")).unwrap();
+    assert_eq!(names(&ws), ["main", "api (services)", "api (tools)"]);
+    let first = ws.extra_folders()[0].clone();
+    ws.remove_folder(&first);
+    assert_eq!(names(&ws), ["main", "api"]);
 }

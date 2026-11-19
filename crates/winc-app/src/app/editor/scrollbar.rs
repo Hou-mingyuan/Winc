@@ -41,6 +41,8 @@ pub(crate) enum ScrollArea {
     Commit,
     /// 文件视图底部大纲的符号列表。
     Outline,
+    /// Git 日志左侧的分支面板。
+    LogBranches,
     /// 设置页的内容，包括快捷键列表。
     Settings,
     /// 终端面板的回滚缓冲。
@@ -53,11 +55,17 @@ pub(crate) enum ScrollArea {
     Pdf,
     /// PDF 预览的缩略图栏。
     PdfStrip,
+    /// Markdown 预览左侧展开的标题列表。
+    MarkdownToc,
+    /// 表格预览的竖直滚动条。
+    Table,
+    /// 表格预览的水平滚动条。
+    TableHorizontal,
 }
 
 impl ScrollArea {
     /// 全部区域，遍历时用。
-    const ALL: [ScrollArea; 15] = [
+    const ALL: [ScrollArea; 19] = [
         ScrollArea::Editor,
         ScrollArea::EditorHorizontal,
         ScrollArea::DiffLeftHorizontal,
@@ -67,12 +75,16 @@ impl ScrollArea {
         ScrollArea::Panel,
         ScrollArea::Commit,
         ScrollArea::Outline,
+        ScrollArea::LogBranches,
         ScrollArea::Settings,
         ScrollArea::Terminal,
         ScrollArea::Markdown,
         ScrollArea::MarkdownTable,
         ScrollArea::Pdf,
         ScrollArea::PdfStrip,
+        ScrollArea::MarkdownToc,
+        ScrollArea::Table,
+        ScrollArea::TableHorizontal,
     ];
 
     /// 该区域可以拖动的滚动条；不能拖动时为 `None`。
@@ -87,12 +99,16 @@ impl ScrollArea {
             ScrollArea::Panel => Some(Scrollbar::Panel),
             ScrollArea::Commit => Some(Scrollbar::Commit),
             ScrollArea::Outline => Some(Scrollbar::Outline),
+            ScrollArea::LogBranches => Some(Scrollbar::LogBranches),
             ScrollArea::Settings => Some(Scrollbar::Settings),
             ScrollArea::Terminal => Some(Scrollbar::Terminal),
             ScrollArea::Markdown => Some(Scrollbar::Markdown),
             ScrollArea::MarkdownTable => Some(Scrollbar::MarkdownTable),
             ScrollArea::Pdf => Some(Scrollbar::Pdf),
             ScrollArea::PdfStrip => Some(Scrollbar::PdfStrip),
+            ScrollArea::MarkdownToc => Some(Scrollbar::MarkdownToc),
+            ScrollArea::Table => Some(Scrollbar::Table),
+            ScrollArea::TableHorizontal => Some(Scrollbar::TableHorizontal),
         }
     }
 
@@ -104,6 +120,7 @@ impl ScrollArea {
                 | ScrollArea::DiffRightHorizontal
                 | ScrollArea::TreeHorizontal
                 | ScrollArea::MarkdownTable
+                | ScrollArea::TableHorizontal
         )
     }
 }
@@ -147,12 +164,37 @@ struct Reveal {
     heat: Tween,
 }
 
+/// 编辑区窗格里的滚动条：拆分后每个窗格各有一份显示状态。
+pub(crate) const PANE_AREAS: [ScrollArea; 11] = [
+    ScrollArea::Editor,
+    ScrollArea::EditorHorizontal,
+    ScrollArea::DiffLeftHorizontal,
+    ScrollArea::DiffRightHorizontal,
+    ScrollArea::Markdown,
+    ScrollArea::MarkdownTable,
+    ScrollArea::Pdf,
+    ScrollArea::PdfStrip,
+    ScrollArea::MarkdownToc,
+    ScrollArea::Table,
+    ScrollArea::TableHorizontal,
+];
+
 /// 各区域滚动条的显示状态，以及鼠标所在的滚动条。
 #[derive(Debug, Default)]
 pub(crate) struct Scrollbars {
     reveals: [Reveal; ScrollArea::ALL.len()],
     /// 鼠标所在的滚动条：位于某个区域靠右边缘（水平滚动条为下边缘）[`SCROLLBAR_HIT`] 的范围内。
     hovered: Option<ScrollArea>,
+}
+
+impl Scrollbars {
+    /// 和 `other` 交换 `areas` 的显示状态。
+    pub(crate) fn exchange(&mut self, other: &mut Scrollbars, areas: &[ScrollArea]) {
+        for &area in areas {
+            let at = area as usize;
+            std::mem::swap(&mut self.reveals[at], &mut other.reveals[at]);
+        }
+    }
 }
 
 /// 滚动条滑块此刻的样子。
@@ -181,7 +223,8 @@ impl App {
     /// 开始绘制新的一帧：清除上一帧记下的可滚动区域，由本帧绘制的滚动条重新登记。
     pub(crate) fn begin_scrollbars(&mut self) {
         self.text_content_w = 0.0;
-        for reveal in &mut self.scrollbars.reveals {
+        self.preview.markdown.catch_up.pending = false;
+        for reveal in &mut self.scroll.bars.reveals {
             reveal.area = None;
         }
     }
@@ -200,8 +243,8 @@ impl App {
     ) -> ThumbLook {
         let now = Instant::now();
         let active = area.bar().is_some_and(|bar| self.scrollbar_active(bar));
-        let held = self.scrollbars.hovered == Some(area) || active;
-        let reveal = &mut self.scrollbars.reveals[area as usize];
+        let held = self.scroll.bars.hovered == Some(area) || active;
+        let reveal = &mut self.scroll.bars.reveals[area as usize];
 
         let changed = reveal.seen.is_some_and(|(o, _)| o != owner);
         let scrolled = matches!(reveal.seen, Some((o, s)) if o == owner && s != scroll);
@@ -228,7 +271,7 @@ impl App {
         let opacity = self.retarget(opacity, if visible { 1.0 } else { 0.0 }, duration);
         let heat = self.retarget(heat, if active { 1.0 } else { 0.0 }, SCROLLBAR_HEAT);
 
-        let reveal = &mut self.scrollbars.reveals[area as usize];
+        let reveal = &mut self.scroll.bars.reveals[area as usize];
         reveal.opacity = opacity;
         reveal.heat = heat;
         ThumbLook {
@@ -259,7 +302,7 @@ impl App {
     /// 设置浮层打开时只认设置页的滚动条，浮层下方的区域不响应。
     pub(in crate::app) fn update_scrollbar_hover(&mut self, x: f32, y: f32) {
         let settings = self.settings.open;
-        let dialog = self.form_dialog.is_some();
+        let dialog = self.overlays.form_dialog.is_some();
         let hovered = ScrollArea::ALL.into_iter().find(|&area| {
             if dialog || settings != (area == ScrollArea::Settings) {
                 return false;
@@ -271,7 +314,7 @@ impl App {
             if area == ScrollArea::Commit && self.over_commit_overflow_row(y) {
                 return false;
             }
-            self.scrollbars.reveals[area as usize]
+            self.scroll.bars.reveals[area as usize]
                 .area
                 .is_some_and(|r| {
                     r.contains(x, y)
@@ -283,8 +326,8 @@ impl App {
                 })
         });
 
-        if hovered != self.scrollbars.hovered {
-            self.scrollbars.hovered = hovered;
+        if hovered != self.scroll.bars.hovered {
+            self.scroll.bars.hovered = hovered;
             self.request_redraw();
         }
     }
@@ -294,7 +337,7 @@ impl App {
         let mut wake: Option<Instant> = None;
         let mut redraw = false;
 
-        for reveal in &mut self.scrollbars.reveals {
+        for reveal in &mut self.scroll.bars.reveals {
             let Some(since) = reveal.since else {
                 continue;
             };
@@ -316,7 +359,8 @@ impl App {
 
     /// 是否有滚动条正在淡入、淡出或变色，需要逐帧重绘。
     pub(in crate::app) fn scrollbars_animating(&self) -> bool {
-        self.scrollbars
+        self.scroll
+            .bars
             .reveals
             .iter()
             .any(|reveal| reveal.opacity.running() || reveal.heat.running())
