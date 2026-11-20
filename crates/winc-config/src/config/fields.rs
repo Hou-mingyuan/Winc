@@ -180,6 +180,7 @@ const EDITOR: &[Field] = &[
     bool_field!("wordWrap", word_wrap),
     bool_field!("wholeLines", whole_lines),
     bool_field!("minimap", minimap),
+    bool_field!("smoothScrolling", smooth_scrolling),
     bool_field!("outline", outline),
     Field {
         key: "renderWhitespace",
@@ -308,6 +309,12 @@ const TREE: &[Field] = &[
 const MARKDOWN: &[Field] = &[
     bool_field!("remoteImages", markdown_remote_images),
     bool_field!("lineNumbers", markdown_line_numbers),
+    bool_field!("shortcuts", markdown_shortcuts),
+    bool_field!("focusMode", markdown_focus),
+    bool_field!("typewriterMode", markdown_typewriter),
+    bool_field!("selectionToolbar", markdown_selection_toolbar),
+    string_field!("imageFolder", markdown_image_folder),
+    string_field!("imageName", markdown_image_name),
     Field {
         key: "textWidth",
         read: |config, value, name, problems| {

@@ -1,11 +1,16 @@
 //! 辅助进程 `winc-pty`：启动、重启和停止，同步面板尺寸和配色，收它发来的帧和回滚缓冲。
 
 use super::*;
+use crate::app::NoticeKind;
 
 impl App {
     /// 竖向终端列表的区域，包含新建入口和终端条目。
     pub(crate) fn terminal_tab_list(&self) -> Option<Rect> {
-        let card = self.layout.terminal;
+        self.terminal_tab_list_in(self.layout.terminal)
+    }
+
+    /// 面板在 `card` 时竖向终端列表的区域。
+    fn terminal_tab_list_in(&self, card: Rect) -> Option<Rect> {
         let shown = self
             .terminal
             .strip
@@ -37,7 +42,12 @@ impl App {
 
     /// 终端内容使用的面板范围，含顶部工具栏的高度，扣除竖向标签列表。
     pub(crate) fn terminal_content_card(&self) -> Rect {
-        let card = self.terminal_whole_card();
+        self.terminal_content_card_in(self.layout.terminal)
+    }
+
+    /// 面板在 `card` 时终端内容使用的范围（见 [`Self::terminal_content_card`]）。
+    pub(crate) fn terminal_content_card_in(&self, card: Rect) -> Rect {
+        let card = self.terminal_whole_card_in(card);
         let Some(tab) = self.terminal.tab().filter(|t| t.pane_count() > 1) else {
             return card;
         };
@@ -47,11 +57,12 @@ impl App {
 
     /// 面板中除去竖排标签列表的部分，拆分前的整块。
     pub(crate) fn terminal_whole_card(&self) -> Rect {
-        let card = self.layout.terminal;
+        self.terminal_whole_card_in(self.layout.terminal)
+    }
+
+    fn terminal_whole_card_in(&self, card: Rect) -> Rect {
         Rect {
-            w: self
-                .terminal_tab_list()
-                .map_or(card.w, |list| list.x - card.x),
+            w: (self.terminal_tab_list_in(card)).map_or(card.w, |list| list.x - card.x),
             ..card
         }
     }
@@ -766,7 +777,13 @@ impl App {
                         // 选区要的行都回来了：复制这个标签的选区。还缺的是辅助进程那边已经
                         // 不再保留的，跳过即可。
                         if purpose == Request::Copy && !t.waiting(id, Request::Copy) {
-                            let text = t.by_id(id).and_then(|tab| tab.selected_text_lossy());
+                            let text = t.by_id(id).and_then(|tab| {
+                                let text = tab.selected_text_lossy();
+                                if std::mem::take(&mut tab.clear_after_copy) {
+                                    tab.selection = None;
+                                }
+                                text
+                            });
                             if let Some(text) = text {
                                 self.set_clipboard(text, false);
                                 self.flash(winc_i18n::t!("terminal-selection-copied"));
@@ -871,7 +888,7 @@ impl App {
                         self.relayout();
                     }
                 }
-                self.notify(message);
+                self.notify(NoticeKind::Error, message);
             }
         }
     }

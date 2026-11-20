@@ -747,10 +747,17 @@ impl App {
             Setting::StatusBar => self.config.status_bar != Some(false),
             Setting::RestoreWindow => self.config.restore_window != Some(false),
             Setting::Animations => self.animations_on(),
+            Setting::SmoothScrolling => self.smooth_scrolling(),
             Setting::CompactFolders => self.config.compact_folders != Some(false),
             Setting::PreviewOnClick => self.config.preview_on_click == Some(true),
             Setting::RemoteImages => self.config.markdown_remote_images != Some(false),
             Setting::MarkdownLineNumbers => self.config.markdown_line_numbers != Some(false),
+            Setting::MarkdownShortcuts => self.config.markdown_shortcuts != Some(false),
+            Setting::MarkdownFocus => self.config.markdown_focus == Some(true),
+            Setting::MarkdownTypewriter => self.config.markdown_typewriter == Some(true),
+            Setting::MarkdownSelectionToolbar => {
+                self.config.markdown_selection_toolbar != Some(false)
+            }
             Setting::CheckUpdates => self.config.update_auto_check != Some(false),
             Setting::SystemTitleBar => self.config.ui_native_title_bar == Some(true),
             Setting::GitModule => self.git_enabled(),
@@ -812,10 +819,15 @@ impl App {
             Setting::StatusBar => self.config.status_bar = Some(on),
             Setting::RestoreWindow => self.config.restore_window = Some(on),
             Setting::Animations => self.config.ui_animations = Some(on),
+            Setting::SmoothScrolling => self.config.smooth_scrolling = Some(on),
             Setting::CompactFolders => self.config.compact_folders = Some(on),
             Setting::PreviewOnClick => self.config.preview_on_click = Some(on),
             Setting::RemoteImages => self.config.markdown_remote_images = Some(on),
             Setting::MarkdownLineNumbers => self.config.markdown_line_numbers = Some(on),
+            Setting::MarkdownShortcuts => self.config.markdown_shortcuts = Some(on),
+            Setting::MarkdownFocus => self.config.markdown_focus = Some(on),
+            Setting::MarkdownTypewriter => self.config.markdown_typewriter = Some(on),
+            Setting::MarkdownSelectionToolbar => self.config.markdown_selection_toolbar = Some(on),
             Setting::CheckUpdates => self.config.update_auto_check = Some(on),
             Setting::SystemTitleBar => self.config.ui_native_title_bar = Some(on),
             Setting::GitModule => self.config.git_enabled = Some(on),
@@ -1437,18 +1449,24 @@ impl App {
             Ok(saved) => {
                 if let Some(backup) = saved.backup {
                     let path = backup.path.display().to_string();
-                    self.notify(if backup.comments {
-                        t!("settings-config-comments-backed-up", path = path)
-                    } else {
-                        t!("settings-config-backed-up", path = path)
-                    });
+                    self.notify(
+                        NoticeKind::Warning,
+                        if backup.comments {
+                            t!("settings-config-comments-backed-up", path = path)
+                        } else {
+                            t!("settings-config-backed-up", path = path)
+                        },
+                    );
                 }
                 self.store.saved_config = saved.config.clone();
                 if saved.config != self.config {
                     self.adopt_config(saved.config);
                 }
             }
-            Err(e) => self.notify(t!("settings-config-write-failed", error = e.to_string())),
+            Err(e) => self.notify(
+                NoticeKind::Error,
+                t!("settings-config-write-failed", error = e.to_string()),
+            ),
         }
     }
 }

@@ -86,12 +86,13 @@ impl SettingsPage {
         let plain = |items: Vec<Setting>| Section { title: None, items };
         match self {
             SettingsPage::Appearance => {
-                // 系统标题栏只在其他平台列出：macOS 上标题栏总是和内容融为一体。
-                let mut window = vec![
-                    Setting::StatusBar,
-                    Setting::Animations,
-                    Setting::RestoreWindow,
-                ];
+                // 系统标题栏只在其他平台列出：macOS 上标题栏总是和内容融为一体。平滑滚动只在
+                // macOS 上列出：其他平台上滚轮本来就一格一格立即滚动。
+                let mut window = vec![Setting::StatusBar, Setting::Animations];
+                if cfg!(target_os = "macos") {
+                    window.push(Setting::SmoothScrolling);
+                }
+                window.push(Setting::RestoreWindow);
                 if !cfg!(target_os = "macos") {
                     window.push(Setting::SystemTitleBar);
                 }
@@ -141,6 +142,10 @@ impl SettingsPage {
                     Setting::RemoteImages,
                     Setting::TextWidth,
                     Setting::MarkdownLineNumbers,
+                    Setting::MarkdownShortcuts,
+                    Setting::MarkdownFocus,
+                    Setting::MarkdownTypewriter,
+                    Setting::MarkdownSelectionToolbar,
                 ]),
                 plain(vec![
                     Setting::VimMode,
@@ -318,6 +323,8 @@ pub enum Setting {
     RestoreWindow,
     /// 播放界面的过渡动画。
     Animations,
+    /// 鼠标滚轮平滑滚动（`editor.smoothScrolling`）。
+    SmoothScrolling,
     /// 窗口的背景图片（`ui.backgroundImage`）。
     BackgroundImage,
     /// 背景图片的显示方式（`ui.backgroundFit`）。
@@ -334,6 +341,14 @@ pub enum Setting {
     TextWidth,
     /// Markdown 预览显示行号（`markdown.lineNumbers`）。
     MarkdownLineNumbers,
+    /// Markdown 文件的源代码也使用写作快捷键（`markdown.shortcuts`）。
+    MarkdownShortcuts,
+    /// 编辑 Markdown 时淡化光标所在段落以外的文字（`markdown.focusMode`）。
+    MarkdownFocus,
+    /// 编辑 Markdown 时光标所在的行停在中间（`markdown.typewriterMode`）。
+    MarkdownTypewriter,
+    /// 选中文字后显示格式工具栏（`markdown.selectionToolbar`）。
+    MarkdownSelectionToolbar,
     /// 定时检查更新。
     CheckUpdates,
     /// 联网的命令跟随系统的代理设置（`network.systemProxy`）。
@@ -476,6 +491,7 @@ impl Setting {
             | Setting::StatusBar
             | Setting::RestoreWindow
             | Setting::Animations
+            | Setting::SmoothScrolling
             | Setting::BackgroundImage
             | Setting::BackgroundFit
             | Setting::BackgroundOpacity => SettingsPage::Appearance,
@@ -502,7 +518,11 @@ impl Setting {
             | Setting::RenderWhitespace
             | Setting::RemoteImages
             | Setting::TextWidth
-            | Setting::MarkdownLineNumbers => SettingsPage::Editor,
+            | Setting::MarkdownLineNumbers
+            | Setting::MarkdownShortcuts
+            | Setting::MarkdownFocus
+            | Setting::MarkdownTypewriter
+            | Setting::MarkdownSelectionToolbar => SettingsPage::Editor,
             Setting::Version
             | Setting::Updates
             | Setting::CheckUpdates
@@ -580,6 +600,7 @@ impl Setting {
             Setting::StatusBar => t!("settings-status-bar"),
             Setting::RestoreWindow => t!("settings-restore-window"),
             Setting::Animations => t!("settings-animations"),
+            Setting::SmoothScrolling => t!("settings-smooth-scrolling"),
             Setting::BackgroundImage => t!("settings-background-image"),
             Setting::BackgroundFit => t!("settings-background-fit"),
             Setting::BackgroundOpacity => t!("settings-background-opacity"),
@@ -589,6 +610,10 @@ impl Setting {
             Setting::RemoteImages => t!("settings-remote-images"),
             Setting::TextWidth => t!("settings-text-width"),
             Setting::MarkdownLineNumbers => t!("settings-markdown-line-numbers"),
+            Setting::MarkdownShortcuts => t!("settings-markdown-shortcuts"),
+            Setting::MarkdownFocus => t!("settings-markdown-focus"),
+            Setting::MarkdownTypewriter => t!("settings-markdown-typewriter"),
+            Setting::MarkdownSelectionToolbar => t!("settings-markdown-selection-toolbar"),
             Setting::CheckUpdates => t!("settings-check-updates"),
             Setting::Version => t!("settings-version"),
             Setting::Website => t!("settings-website"),
@@ -667,12 +692,19 @@ impl Setting {
             Setting::StatusBar => Some(t!("settings-status-bar-desc")),
             Setting::RestoreWindow => Some(t!("settings-restore-window-desc")),
             Setting::Animations => Some(t!("settings-animations-desc")),
+            Setting::SmoothScrolling => Some(t!("settings-smooth-scrolling-desc")),
             Setting::BackgroundImage => Some(t!("settings-background-image-desc")),
             Setting::BackgroundFit => Some(t!("settings-background-fit-desc")),
             Setting::BackgroundOpacity => Some(t!("settings-background-opacity-desc")),
             Setting::RemoteImages => Some(t!("settings-remote-images-desc")),
             Setting::TextWidth => Some(t!("settings-text-width-desc")),
             Setting::MarkdownLineNumbers => Some(t!("settings-markdown-line-numbers-desc")),
+            Setting::MarkdownShortcuts => Some(t!("settings-markdown-shortcuts-desc")),
+            Setting::MarkdownFocus => Some(t!("settings-markdown-focus-desc")),
+            Setting::MarkdownTypewriter => Some(t!("settings-markdown-typewriter-desc")),
+            Setting::MarkdownSelectionToolbar => {
+                Some(t!("settings-markdown-selection-toolbar-desc"))
+            }
             Setting::CheckUpdates => Some(t!("settings-check-updates-desc")),
             // 绘制时换成当前的更新状态（`UpdateState`）。
             Setting::Updates => Some(t!("settings-updates-off")),
@@ -737,8 +769,13 @@ impl Setting {
             | Setting::StatusBar
             | Setting::RestoreWindow
             | Setting::Animations
+            | Setting::SmoothScrolling
             | Setting::RemoteImages
             | Setting::MarkdownLineNumbers
+            | Setting::MarkdownShortcuts
+            | Setting::MarkdownFocus
+            | Setting::MarkdownTypewriter
+            | Setting::MarkdownSelectionToolbar
             | Setting::CheckUpdates
             | Setting::FormatOnSave
             | Setting::FixOnSave
@@ -1189,7 +1226,7 @@ impl SettingsLayout {
             body.x + SETTINGS_PAD,
             (body.w - SETTINGS_PAD * 2.0).max(0.0),
         );
-        let mut y = body.y - scroll;
+        let mut y = body.y - super::drawn_scroll(scroll);
         let mut groups = Vec::new();
         let mut headings = Vec::new();
         let mut separators = Vec::new();

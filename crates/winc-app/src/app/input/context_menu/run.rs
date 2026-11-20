@@ -114,6 +114,13 @@ impl App {
                 MenuCommand::Table(op) => {
                     self.live_table_tool(op);
                 }
+                MenuCommand::ImageWidth(percent) => self.resize_image_to(percent),
+                MenuCommand::PastePlain => self.paste_plain(),
+                MenuCommand::OpenImage => {
+                    if let Some(path) = self.preview.markdown.menu_picture.take() {
+                        self.open_path(&path);
+                    }
+                }
                 _ => {}
             },
             MenuTarget::Terminal(block) => self.run_terminal_command(command, block),
@@ -467,7 +474,7 @@ impl App {
             _ => {}
         }
         match command {
-            MenuCommand::Copy => self.terminal_copy(),
+            MenuCommand::Copy => self.terminal_copy(false),
             MenuCommand::Paste => self.terminal_paste(),
             MenuCommand::SelectAll => self.terminal_select_all(),
             MenuCommand::TerminalFind => self.open_terminal_find(),
@@ -492,6 +499,9 @@ impl App {
             }
             MenuCommand::Cut => self.copy(true),
             MenuCommand::Copy => self.copy(false),
+            MenuCommand::HexCopyText => self.copy_hex(true),
+            MenuCommand::SelectAll if self.hex_active() => self.select_all_hex(),
+            MenuCommand::HexGoTo => self.open_goto(),
             MenuCommand::Paste => self.paste(),
             MenuCommand::Format => self.format_active(),
             MenuCommand::FormatSelection => self.format_selection(),
@@ -954,7 +964,10 @@ impl App {
                 Err(e) => {
                     let name = winc_editor::display_name(&path);
                     let error = e.to_string();
-                    self.notify(t!("common-trash-delete-failed", name = name, error = error));
+                    self.notify(
+                        NoticeKind::Error,
+                        t!("common-trash-delete-failed", name = name, error = error),
+                    );
                 }
             }
         }
