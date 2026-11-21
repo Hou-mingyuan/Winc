@@ -166,6 +166,7 @@ impl ApplicationHandler<UserEvent> for App {
                 &ui,
                 &terminal,
                 self.font_weight(),
+                self.terminal_font_weight(),
             ),
         };
         let renderer = match renderer {
@@ -464,6 +465,7 @@ impl App {
             | UserEvent::GitMergeSides
             | UserEvent::GitLog
             | UserEvent::GitBlame
+            | UserEvent::Latex
             | UserEvent::Reread
             | UserEvent::TreeScanned
             | UserEvent::Saved

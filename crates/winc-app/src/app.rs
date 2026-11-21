@@ -337,6 +337,8 @@ pub enum UserEvent {
     FolderDropped(PathBuf, Option<PathBuf>, bool, bool),
     /// 后台已计算完一个文档的逐行追溯。
     GitBlame,
+    /// 后台已编译完一个 LaTeX 文档。
+    Latex,
     /// 后台已检查或重读被其他程序修改的文件。
     Reread,
     /// 后台已重读文件树中被其他程序修改的目录。
@@ -382,6 +384,14 @@ impl PromptKind {
     /// 是否为 Vim 模式的命令行或查找：输入条显示在状态栏所在的一行。
     pub fn is_vim(&self) -> bool {
         matches!(self, Self::VimSearch { .. } | Self::VimCommand)
+    }
+
+    /// 是否输入一段文字（储藏说明、标签名、分支名）：输入条更宽。
+    pub fn takes_text(&self) -> bool {
+        matches!(
+            self,
+            Self::Stash | Self::StashFiles(_) | Self::NewTag { .. } | Self::RenameBranch { .. }
+        )
     }
 }
 
@@ -510,10 +520,12 @@ pub enum Hover {
     MarkdownToc(crate::app::preview::markdown::TocTarget),
     /// PDF 预览右下角工具栏上的按钮。
     PdfTool(crate::app::preview::pdf::PdfTool),
+    /// LaTeX 预览右上角的编译状态（有错误时）。
+    LatexStatus,
+    /// 行号栏里 LaTeX 编译出错的红点，参数是行（从 0 起）。
+    LatexProblem(usize),
     Search(SearchButton),
     TreeRow(usize),
-    /// 历史差异侧栏标题行中切换树形与列表的按钮。
-    LogDiffLayout,
     /// 标签序号，以及是否悬停在该标签的关闭按钮上。
     Tab(usize, bool),
     Splitter,
@@ -595,7 +607,6 @@ impl Hover {
                 | Hover::Status(StatusItem::Terminal | StatusItem::Remote | StatusItem::Settings)
                 | Hover::TreeMore
                 | Hover::SidebarButton
-                | Hover::LogDiffLayout
                 | Hover::Tab(..)
                 | Hover::TabList
                 | Hover::Preview(_)
@@ -625,6 +636,7 @@ impl Hover {
                         | git::log::LogTarget::Row(_)
                         | git::log::LogTarget::File(_)
                         | git::log::LogTarget::Line(..)
+                        | git::log::LogTarget::BranchRow(_)
                 )
                 | Hover::Blame(_)
                 | Hover::PickerPart(PickerPart::Pull | PickerPart::Push | PickerPart::Fetch)
@@ -644,19 +656,27 @@ impl Hover {
                         | CommitTarget::Check(_)
                         | CommitTarget::StageFile(..)
                         | CommitTarget::GroupStage(_)
+                        | CommitTarget::DirStage(..)
                 )
                 | Hover::Diff(
                     DiffTarget::Previous
                         | DiffTarget::Next
                         | DiffTarget::PreviousFile
                         | DiffTarget::NextFile
+                        | DiffTarget::OpenFile
+                        | DiffTarget::Blame(..)
                         | DiffTarget::Layout
                         | DiffTarget::Collapse
+                        | DiffTarget::FilesToggle
+                        | DiffTarget::FilesLayout
+                        | DiffTarget::File(_)
                         | DiffTarget::Revert(_)
                         | DiffTarget::Include(_)
                         | DiffTarget::IncludeLine(..)
                 )
                 | Hover::Merge(git::merge::MergeTarget::Previous | git::merge::MergeTarget::Next)
+                | Hover::LatexStatus
+                | Hover::LatexProblem(_)
         )
     }
 }
@@ -733,6 +753,16 @@ enum Drag {
     },
     /// 拖动日志标签中列表与详情之间的分隔线：按下时的横坐标、详情栏当时的宽度。
     LogDivider {
+        start_x: f32,
+        start_width: f32,
+    },
+    /// 拖动日志标签中分支面板的右边缘：按下时的横坐标、面板当时的宽度。
+    LogBranches {
+        start_x: f32,
+        start_width: f32,
+    },
+    /// 拖动差异左侧文件栏的右边缘：按下时的横坐标、文件栏当时的宽度。
+    DiffFiles {
         start_x: f32,
         start_width: f32,
     },
@@ -1079,6 +1109,7 @@ impl App {
             UserEvent::GitMergeSides => self.poll_merge_sides(),
             UserEvent::GitLog => self.poll_log(),
             UserEvent::GitBlame => self.poll_blame(),
+            UserEvent::Latex => self.poll_latex(),
             UserEvent::Reread => self.poll_rereads(),
             UserEvent::TreeScanned => self.poll_tree_scans(),
             UserEvent::Saved => self.poll_saves(),
@@ -1150,6 +1181,7 @@ impl App {
         }
         self.pointer.hover = hover;
         self.overlays.tooltip.since = hover.has_tooltip().then(Instant::now);
+        self.overlays.tooltip.pointer_x = self.mouse().0;
         self.overlays.tooltip.shown = false;
         self.request_redraw();
     }

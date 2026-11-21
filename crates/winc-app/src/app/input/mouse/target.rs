@@ -175,7 +175,9 @@ impl App {
                 | Target::SplitDivider
                 | Target::PaneDivider(_)
                 | Target::Log(crate::app::git::log::LogTarget::Divider)
+                | Target::Log(crate::app::git::log::LogTarget::BranchesEdge)
                 | Target::Log(crate::app::git::log::LogTarget::AuthorEdge)
+                | Target::Diff(crate::app::DiffTarget::FilesEdge)
         )
     }
 
@@ -237,6 +239,9 @@ impl App {
             Target::ImageHandle => Hover::ImageHandle,
             Target::MarkdownText(None) | Target::PdfThumb(_) | Target::Picture => Hover::None,
             Target::PdfTool(tool) => Hover::PdfTool(tool),
+            Target::LatexStatus => Hover::LatexStatus,
+            Target::LatexProblem(line) => Hover::LatexProblem(line),
+            Target::LatexSource => Hover::None,
             Target::Tab(index, on_close) => Hover::Tab(index, on_close),
             Target::RulerChange(hunk) => Hover::RulerChange(hunk),
             Target::Crumb(index) => Hover::Crumb(index),
@@ -485,6 +490,9 @@ impl App {
         if let Some(line) = hit(&self.hits.long_lines, x, y) {
             return Target::LongLine(line);
         }
+        if let Some(line) = self.latex_problem_at(x, y) {
+            return Target::LatexProblem(line);
+        }
         if let Some(line) = self.blame_at(x, y) {
             return Target::Blame(line);
         }
@@ -524,6 +532,17 @@ impl App {
         }
         if let Some(tool) = hit(&self.hits.pdf_tools, x, y) {
             return Target::PdfTool(tool);
+        }
+        if self.hits.latex_status.contains(x, y) {
+            return Target::LatexStatus;
+        }
+        let command = if cfg!(target_os = "macos") {
+            self.pointer.modifiers.super_key()
+        } else {
+            self.pointer.modifiers.control_key()
+        };
+        if command && self.preview.pdf.area.contains(x, y) && self.latex_pdf().is_some() {
+            return Target::LatexSource;
         }
         if self.preview.pdf.strip.contains(x, y) {
             let thumb = self
@@ -589,15 +608,8 @@ impl App {
                 return Some((Scrollbar::Outline, grab(y, thumb.y, thumb.h)));
             }
         }
-        // Git 侧栏里正在显示的改动列表，或历史提交的文件列表。
-        if self.log_diff_tree().is_some() {
-            let list = self.commit_parts().list;
-            if list.contains(x, y) && x >= list.right() - SCROLLBAR_HIT {
-                let content = self.log_list_max_scroll() + list.h;
-                let thumb = scrollbar_thumb(list, self.log_list().scroll, content)?;
-                return Some((Scrollbar::Commit, grab(y, thumb.y, thumb.h)));
-            }
-        } else if self.commit_shown() {
+        // Git 侧栏里正在显示的改动列表。
+        if self.commit_shown() {
             let list = self.commit_parts().list;
             if list.contains(x, y) && x >= list.right() - SCROLLBAR_HIT {
                 let content = self.commit_max_scroll() + list.h;
@@ -901,6 +913,8 @@ impl App {
             self.pointer.drag,
             Drag::Splitter { .. }
                 | Drag::LogDivider { .. }
+                | Drag::LogBranches { .. }
+                | Drag::DiffFiles { .. }
                 | Drag::LogColumn { .. }
                 | Drag::SplitDivider { .. }
         ) || matches!(
@@ -908,7 +922,9 @@ impl App {
             Hover::Splitter
                 | Hover::SplitDivider
                 | Hover::Log(crate::app::git::log::LogTarget::Divider)
+                | Hover::Log(crate::app::git::log::LogTarget::BranchesEdge)
                 | Hover::Log(crate::app::git::log::LogTarget::AuthorEdge)
+                | Hover::Diff(crate::app::DiffTarget::FilesEdge)
         ) {
             CursorIcon::ColResize
         } else if matches!(
@@ -972,6 +988,12 @@ pub(super) enum Target {
     PdfThumb(f32),
     /// PDF 预览右下角工具栏上的按钮。
     PdfTool(crate::app::preview::pdf::PdfTool),
+    /// LaTeX 预览右上角的编译状态：点击列出各处错误。
+    LatexStatus,
+    /// 行号栏里 LaTeX 编译出错的红点：悬停说明错误，点击把光标移到这一行。
+    LatexProblem(usize),
+    /// 按住 ⌘ 点击编译出的 PDF：回到源码。
+    LatexSource,
     /// 跳转条，或正在输入名称的行。
     Prompt,
     Search,

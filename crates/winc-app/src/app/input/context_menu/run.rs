@@ -31,6 +31,12 @@ impl App {
             MenuTarget::Tree(path) => self.run_tree_command(command, path),
             MenuTarget::Tab(id) => self.run_tab_command(command, id),
             MenuTarget::CommitFile(path) => self.run_commit_file_command(command, path),
+            // 提交上的分支子菜单：分支按弹出菜单时的列表解释。
+            MenuTarget::LogCommit(_) if let MenuCommand::GitBranch(op, i) = command => {
+                if let Some(branch) = menu.branches.get(i).cloned() {
+                    self.run_branch_op(op, branch);
+                }
+            }
             MenuTarget::LogCommit(oid) => self.run_log_commit_command(command, &oid),
             MenuTarget::LogFile(i, path) => self.run_log_file_command(command, i, path),
             MenuTarget::SearchResult(path, m) => self.run_search_result_command(command, path, m),
@@ -139,6 +145,12 @@ impl App {
                     _ => {}
                 }
             }
+            // 「逐行追溯」同时开关两侧。
+            MenuTarget::DiffGutter(id) => {
+                if self.editor.active().map(|d| d.id) == Some(id) {
+                    self.toggle_diff_blame();
+                }
+            }
             // 和快捷键走同一条路：光标在右侧时由右侧的文档执行，只读的一侧有选区时复制这一侧。
             MenuTarget::Diff(id, _) => {
                 if self.editor.active().map(|d| d.id) == Some(id)
@@ -225,6 +237,13 @@ impl App {
                     && let Some(&choice) = winc_config::WorktreeOpen::ALL.get(i)
                 {
                     self.set_open_worktree(choice);
+                }
+            }
+            MenuTarget::PullMode => {
+                if let MenuCommand::PullMode(i) = command
+                    && let Some(&choice) = winc_config::PullMode::ALL.get(i)
+                {
+                    self.set_pull_mode(choice);
                 }
             }
             MenuTarget::VimClipboard => {
@@ -375,6 +394,11 @@ impl App {
             MenuTarget::TabList => {
                 if let MenuCommand::ShowTab(i) = command {
                     self.activate_tab(i);
+                }
+            }
+            MenuTarget::LatexProblems => {
+                if let MenuCommand::LatexProblem(i) = command {
+                    self.show_latex_problem(i);
                 }
             }
             MenuTarget::RunConfigs => match command {

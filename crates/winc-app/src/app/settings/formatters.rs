@@ -307,6 +307,7 @@ impl App {
             | Setting::RenderWhitespace
             | Setting::VimClipboard
             | Setting::GitOpenWorktree
+            | Setting::GitPullMode
             | Setting::DropFolder
             | Setting::AutoSave
             | Setting::Zoom
@@ -324,6 +325,7 @@ impl App {
                     Setting::RenderWhitespace => MenuTarget::Whitespace,
                     Setting::VimClipboard => MenuTarget::VimClipboard,
                     Setting::GitOpenWorktree => MenuTarget::OpenWorktree,
+                    Setting::GitPullMode => MenuTarget::PullMode,
                     Setting::DropFolder => MenuTarget::DropFolder,
                     Setting::AutoSave => MenuTarget::AutoSave,
                     Setting::Zoom => MenuTarget::Zoom,
@@ -342,7 +344,7 @@ impl App {
             Setting::FormatCommand(id) => (MenuTarget::Tool(Task::Format, id), row.control),
             Setting::FixCommand(id) => (MenuTarget::Tool(Task::Fix, id), row.control),
             Setting::TerminalShell => (MenuTarget::DefaultShell, row.control),
-            Setting::GitPath => return self.settings_start_editing(setting),
+            Setting::GitPath | Setting::LatexPath => return self.settings_start_editing(setting),
             Setting::Updates => return self.settings_check_updates(),
             _ => return,
         };

@@ -550,7 +550,9 @@ pub fn parse(text: &str) -> Markdown {
         source: text,
         ..Builder::default()
     };
-    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+    // `\(…\)`、`\[…\]` 和公式环境换成等长的 `$$` 后解析，位置仍按原文。
+    let masked = delims::mask(text);
+    for (event, range) in Parser::new_ext(&masked, options).into_offset_iter() {
         // 顶层块开始的地方：不在任何容器、段落、代码块、HTML 块里。分隔线没有开始、结束两个
         // 事件，只有一个。
         if matches!(event, Event::Start(_) | Event::Rule)
@@ -607,7 +609,7 @@ struct Builder<'s> {
     start: usize,
     cursor: usize,
     end: usize,
-    /// 最近一个软换行在原文中的位置：换成的空格对应这里。
+    /// 最近一个软换行在原文中的位置：换成的换行或空格对应这里。
     soft_at: usize,
     /// 正在收集的代码块与原文的对照。
     code_map: SourceMap,
@@ -630,8 +632,8 @@ struct Builder<'s> {
     footnotes: Vec<(String, Vec<Block>, Range<usize>)>,
     /// 包着当前内容的 HTML 标签（`<p>`、`<div>`、`<center>`、`<h1>`……）各自的对齐，一层一层。
     aligns: Vec<Align>,
-    /// 刚才有一个软换行，还没决定要不要换成空格：两边都是中日韩文字时不加（中文段落里折行处
-    /// 不会多出一个空格），否则加一个空格。
+    /// 刚才有一个软换行，还没写入：段落里照原文换行；标题等处两边都是中日韩文字时不加，否则加
+    /// 一个空格。
     soft: bool,
     /// `<picture>` 里浅色、深色外观的 `<source>` 写的地址，留给后面的 `<img>`。
     sources: (Option<String>, Option<String>),
@@ -715,20 +717,24 @@ impl Builder<'_> {
         }
     }
 
-    /// 前面有软换行时，按下一个字 `next` 决定加不加空格（见 [`Builder::soft`]）。
+    /// 写入前面的软换行，`next` 是其后的第一个字（见 [`Builder::soft`]）。
     fn resolve_soft(&mut self, next: Option<char>) {
         if !std::mem::take(&mut self.soft) {
             return;
         }
         let style = self.style();
         let soft_at = self.soft_at;
+        let lines = matches!(self.inline, Some((Leaf::Paragraph | Leaf::Loose, _)));
         let inline = self.inline();
         let joined =
             inline.text.chars().next_back().is_some_and(is_cjk) && next.is_some_and(is_cjk);
-        if !joined {
-            inline.map.push(inline.text.len(), soft_at, 0);
-            inline.push(" ", style);
-        }
+        let text = match (lines, joined) {
+            (true, _) => "\n",
+            (false, true) => return,
+            (false, false) => " ",
+        };
+        inline.map.push(inline.text.len(), soft_at, 0);
+        inline.push(text, style);
     }
 
     /// 结束一个容器块（引用、列表、`<details>`）。
@@ -936,11 +942,16 @@ impl Builder<'_> {
             Event::Text(text) => self.text(&text, 0),
             Event::Code(text) => self.text(&text, Style::CODE),
             Event::InlineMath(text) => self.text(&text, Style::MATH),
-            // `$$…$$` 单独成一块居中显示；写在表格里的只能留在格子里。
-            Event::DisplayMath(text) if self.in_cell() => self.text(&text, Style::MATH),
+            // `$$…$$` 单独成一块居中显示；写在表格里的、写成 `\(…\)` 的留在行内。
             Event::DisplayMath(text) => {
-                self.finish_inline();
-                self.push_block(Block::Math(text.trim().to_owned(), self.start));
+                let source = self.source.get(self.start..self.end).unwrap_or_default();
+                let (inline, text) = delims::restore(source, &text);
+                if inline || self.in_cell() {
+                    self.text(&text, Style::MATH);
+                } else {
+                    self.finish_inline();
+                    self.push_block(Block::Math(text.trim().to_owned(), self.start));
+                }
             }
             Event::Html(html) | Event::InlineHtml(html) => match &mut self.html {
                 Some(block) => block.push_str(&html),
@@ -964,7 +975,9 @@ impl Builder<'_> {
                 self.soft = true;
                 self.soft_at = self.start;
             }
-            Event::SoftBreak => self.text(" ", 0),
+            Event::SoftBreak if self.image.is_some() => self.text(" ", 0),
+            // 段落被单独成行的公式分开后，后半段不以空格开头。
+            Event::SoftBreak => {}
             Event::HardBreak => self.text("\n", 0),
             Event::Rule => {
                 self.finish_inline();
@@ -1461,6 +1474,7 @@ fn align(align: Alignment) -> Align {
 
 mod autolink;
 pub mod cells;
+mod delims;
 mod emoji;
 pub mod enter;
 pub mod format;
