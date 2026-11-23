@@ -1,14 +1,14 @@
-//! 终端面板的绘制：标签栏、网格（看回滚时显示的是回滚缓冲中的行）、选区和查找的匹配、
-//! 光标、输入法组字、查找条；有 shell 集成时还有命令块：色带、时长和退出码、折起的输出、
-//! 吸顶的命令行。
+//! 终端面板的绘制：标签栏、网格（看回滚时显示的是回滚缓冲中的行）、选区和查找的匹配、光标、输入法组
+//! 字、查找条；有 shell 集成时还有命令块：色带、时长和退出码、折起的输出、吸顶的命令行。
 //!
-//! 网格按终端字体等宽排版（每格宽 `app.metrics.terminal_cell`、每行高 `terminal_line_height`，字形缓存
-//! 与编辑区共用）：一行先画所有样式段的底色，再画选区和查找的底色，最后画字和下划线，宽字符不会
-//! 被后一段的底色盖住；对比度不够时按 `terminal.minimumContrast` 调整文字的颜色，以颜色拼接
-//! 图形的字符（制表符、方块元素、Powerline 分隔符）除外。
+//! 网格按终端字体等宽排版（每格宽 `app.metrics.terminal_cell`、每行高 `terminal_line_height`，字形
+//! 缓存与编辑区共用）：一行先画所有样式段的底色，再画选区和查找的底色，最后画字和下划线，宽字符不会
+//! 被后一段的底色遮住；对比度不够时按 `terminal.minimumContrast` 调整文字的颜色，以颜色拼接图形的字
+//! 符（制表符、方块元素、Powerline 分隔符）除外。
 
 mod grid;
 mod list;
+mod powerline;
 mod tabs;
 
 use grid::*;
@@ -60,6 +60,10 @@ fn draw_panel(app: &mut App, frame: &mut Frame<'_>) {
     frame.rect(card, p.editor_bg);
     app.note_terminal_tabs();
     draw_header(app, frame, card);
+    if app.docked_search_shown() {
+        workspace::search_dialog::draw_dock(app, frame);
+        return;
+    }
     let opacity = app
         .terminal
         .strip
@@ -89,6 +93,14 @@ fn draw_content(app: &mut App, frame: &mut Frame<'_>, focused: bool) {
     if let Some(error) = &app.terminal.error {
         let row = Rect::new(grid.x, grid.y, grid.w, app.fonts.terminal_line_height);
         ui_text(frame, app, grid.x, row, error, p.error, grid);
+        return;
+    }
+    if app.terminal.tabs.is_empty()
+        && let Some(host) = app.terminal_awaited_host()
+    {
+        let row = Rect::new(grid.x, grid.y, grid.w, app.fonts.terminal_line_height);
+        let note = t!("terminal-preparing", host = host.as_str());
+        ui_text(frame, app, grid.x, row, &note, p.text_dim, grid);
         return;
     }
     // 滚动条：先取显示状态（同时记下滚动位置），滑块最后绘制，压在吸顶的命令行上面。
@@ -472,13 +484,18 @@ fn draw_header(app: &mut App, frame: &mut Frame<'_>, card: Rect) {
     let hide = Rect::new(end - BUTTONS_END - BUTTON, button_y, BUTTON, BUTTON);
     let position = Rect::new(hide.x - TAB_GAP - BUTTON, button_y, BUTTON, BUTTON);
     let maximize = Rect::new(position.x - TAB_GAP - BUTTON, button_y, BUTTON, BUTTON);
-    let run = run_buttons(app, frame, left, maximize.x - TAB_GAP, button_y);
+    // 显示「搜索」标签时，最大化左边是「在对话框中打开」。
+    let reopen = app
+        .docked_search_shown()
+        .then(|| Rect::new(maximize.x - TAB_GAP - BUTTON, button_y, BUTTON, BUTTON));
+    let tools_x = reopen.map_or(maximize.x, |r| r.x);
+    let run = run_buttons(app, frame, left, tools_x - TAB_GAP, button_y);
     let vertical = app.terminal_tab_list().is_some();
     // 标签和「+」放得下的宽度。
     let rest = if vertical {
-        maximize.x
+        tools_x
     } else {
-        run.map_or(maximize.x, |[menu, ..]| menu.x)
+        run.map_or(tools_x, |[menu, ..]| menu.x)
     } - TAB_GAP;
     // 能选的 shell 不止一个时，「+」右边是选 shell 的按钮。
     let shell_menu = app.terminal_shell_list().len() > 1;
@@ -515,6 +532,13 @@ fn draw_header(app: &mut App, frame: &mut Frame<'_>, card: Rect) {
             icons::chevron(frame, center(menu), 8.0, direction, p.text_muted, header);
             hits.push((menu, HeaderHit::ShellMenu));
         }
+    }
+
+    if let Some(reopen) = reopen {
+        let on = app.pointer.hover == Hover::TerminalHeader(HeaderHit::SearchDialog);
+        draw_button(frame, p, reopen, header, on, false);
+        icons::external(frame, center(reopen), p.text_muted, header);
+        hits.push((reopen, HeaderHit::SearchDialog));
     }
 
     // 右端：最大化或还原面板，图标绘制的是点下去以后的样子。
@@ -582,8 +606,9 @@ fn run_menu_space(name: f32, room: f32, title: f32) -> Option<f32> {
 
 /// 运行配置的按钮在标签栏上的位置（配置名，运行，停止）。
 ///
-/// 还没有配置时只有运行按钮，点击后生成配置文件；没有打开目录、目录在远端主机上或太窄时没有
-/// 按钮。停止按钮只在运行时出现。竖向模式靠左排列，配置名和运行按钮位置固定；横向模式靠右排列，停止按钮出现时向左让位。
+/// 还没有配置时只有运行按钮，点击后生成配置文件；没有打开目录、目录在远端主机上或太窄时没有按钮。
+/// 停止按钮只在运行时出现。竖向模式靠左排列，配置名和运行按钮位置固定；横向模式靠右排列，
+/// 停止按钮出现时向左让位。
 fn run_buttons(app: &App, frame: &mut Frame<'_>, left: f32, end: f32, y: f32) -> Option<[Rect; 3]> {
     app.editor
         .root()
@@ -722,7 +747,7 @@ fn draw_terminal_tab(
             .map(|caret| caret.intersect(clip))
             .filter(|caret| caret.w > 0.0 && caret.h > 0.0);
     }
-    let active = i == app.terminal.active;
+    let active = i == app.terminal.active && !app.docked_search_shown();
     let hovered = matches!(app.pointer.hover, Hover::TerminalHeader(HeaderHit::Tab(j) | HeaderHit::Close(j)) if j == i);
     // 字色和编辑区的标签一样：正在看的用正文色，不管焦点在不在面板上。
     let color = match (active, tab.ended.is_some()) {
@@ -802,7 +827,7 @@ fn draw_end_notice(app: &mut App, frame: &mut Frame<'_>, row: Rect, clip: Rect) 
     let Some((note, color)) = end_note(app) else {
         return;
     };
-    // 屏幕写满时写在最后一行上，盖住那一行。
+    // 屏幕写满时写在最后一行上，遮住那一行。
     frame.rect_clipped(row, p.editor_bg, 0.0, clip);
     ui_text(frame, app, row.x, row, &note, color, clip);
     // 运行配置的标签再次运行的是配置，不是打开 shell。

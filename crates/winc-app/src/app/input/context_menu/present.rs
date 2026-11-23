@@ -63,7 +63,8 @@ pub(crate) enum MenuIcon {
     Folders,
     /// 标签列表的第几项：标签上的图标（文件类型图标，日志标签为 Git 图标）。
     Tab(usize),
-    /// 目录菜单中的文件：文件类型的记号和它在深色、浅色配色下的颜色（同文件树）。
+    /// 目录菜单中的文件、语言菜单中的语言：文件类型的记号和它在深色、浅色配色下的颜色（同
+    /// 文件树）。
     File(icons::FileGlyph, [u32; 2]),
 }
 
@@ -82,15 +83,6 @@ pub(super) fn submenu_lead(items: &[MenuEntry]) -> Option<MenuCommand> {
     match items.first() {
         Some(&MenuEntry::Item(command @ MenuCommand::OpenGroup(_), _)) => Some(command),
         _ => None,
-    }
-}
-
-/// 命令 `command` 的菜单项图标的逻辑尺寸（宽，高）。
-#[cfg(target_os = "macos")]
-fn menu_icon_size(command: MenuCommand) -> (f32, f32) {
-    match command {
-        MenuCommand::ShowTab(_) => (TAB_LIST_ICON, TAB_LIST_ICON),
-        _ => MENU_ICON,
     }
 }
 
@@ -361,17 +353,24 @@ impl App {
             MenuTarget::PullMode => (0..winc_config::PullMode::ALL.len())
                 .map(|i| MenuEntry::Item(MenuCommand::PullMode(i), true))
                 .collect(),
+            MenuTarget::SearchStyle => (0..winc_config::SearchStyle::ALL.len())
+                .map(|i| MenuEntry::Item(MenuCommand::SearchStyle(i), true))
+                .collect(),
             MenuTarget::DropFolder => (0..winc_config::FolderDrop::ALL.len())
                 .map(|i| MenuEntry::Item(MenuCommand::DropFolder(i), true))
                 .collect(),
             MenuTarget::AutoSave => (0..winc_config::AutoSave::ALL.len())
                 .map(|i| MenuEntry::Item(MenuCommand::AutoSave(i), true))
                 .collect(),
+            MenuTarget::SmoothCaret => (0..winc_config::SmoothCaret::ALL.len())
+                .map(|i| MenuEntry::Item(MenuCommand::SmoothCaret(i), true))
+                .collect(),
             MenuTarget::DefaultShell => default_shell_menu(self.terminal.shells.len()),
             MenuTarget::Zoom => zoom_menu(),
             MenuTarget::BackgroundImage => background_menu(),
             MenuTarget::BackgroundFit => background_fit_menu(),
             MenuTarget::TextWidth => text_width_menu(),
+            MenuTarget::DefaultLanguage => document_language_menu(false, &[]),
             MenuTarget::TerminalPosition => terminal_position_menu(),
             MenuTarget::TerminalTabPosition => terminal_tab_position_menu(),
             MenuTarget::OptionAsMeta => option_as_meta_menu(),
@@ -425,6 +424,17 @@ impl App {
                 if kind.is_none() {
                     menu.extend(self.folder_items(folder));
                 }
+                // 脚本文件：「在终端中打开」之后加「在终端中运行」。
+                let opens = |entry: &MenuEntry| {
+                    matches!(entry, MenuEntry::Item(MenuCommand::OpenInTerminal, _))
+                };
+                if let Some(path) = path.as_deref()
+                    && kind == Some(EntryKind::File)
+                    && self.can_run_script(path)
+                    && let Some(at) = menu.iter().position(opens)
+                {
+                    menu.insert(at + 1, MenuEntry::Item(MenuCommand::RunScript, true));
+                }
                 // Git 模块开着、文件在仓库里：最后加「显示文件历史」，有更改的文件再加暂存与回滚。
                 if let Some(path) = path.as_deref()
                     && kind == Some(EntryKind::File)
@@ -454,6 +464,10 @@ impl App {
                     !doc.selection.is_empty(),
                     bookmarked,
                 );
+                // 光标在链接上时第一项是「打开链接」。
+                if self.link_at_caret().is_some() {
+                    menu.insert(0, MenuEntry::Item(MenuCommand::OpenLink, true));
+                }
                 // Git 模块开着、文件在仓库里：最后是所选代码的历史和「逐行追溯」开关。
                 if doc.path.as_deref().is_some_and(|p| self.in_repo(p)) {
                     let history = Action::GitSelectionHistory;
@@ -641,12 +655,16 @@ impl App {
                 let large = doc.is_large()
                     || (doc.hex.as_deref()).is_some_and(|v| v.size() > winc_editor::LARGE_FILE);
                 let utf8_only = doc.hex.is_some() && large;
+                // 「Unicode 转义」只用于 `.properties` 文件。
+                let properties = (doc.path.as_deref())
+                    .and_then(std::path::Path::extension)
+                    .is_some_and(|e| e.eq_ignore_ascii_case("properties"));
                 let reopen = |encoding| {
                     doc.path.is_some()
                         && (!large || utf8_only && encoding == winc_editor::Encoding::Utf8)
                 };
                 let hex = doc.path.is_some() && doc.hex.is_none();
-                encoding_menu(reopen, hex, |encoding| {
+                encoding_menu(properties, reopen, hex, |encoding| {
                     doc.hex.is_none() && doc.encoding.writable() && doc.can_save_with(encoding)
                 })
             }
@@ -654,7 +672,7 @@ impl App {
                 let Some(doc) = self.editor.document(*id) else {
                     return;
                 };
-                document_language_menu(doc.path.is_some())
+                document_language_menu(doc.path.is_some(), &self.state.recent_languages)
             }
             MenuTarget::ReadOnly(id) => {
                 let own = self.editor.document(*id).is_some_and(|doc| doc.is_locked());
@@ -707,9 +725,16 @@ impl App {
             MenuTarget::TabList => (0..self.editor.tab_count())
                 .map(|i| MenuEntry::Item(MenuCommand::ShowTab(i), true))
                 .collect(),
-            MenuTarget::LatexProblems => (0..self.latex_problem_count())
-                .map(|i| MenuEntry::Item(MenuCommand::LatexProblem(i), true))
-                .collect(),
+            MenuTarget::LatexProblems => {
+                let rc = [
+                    MenuEntry::Separator,
+                    MenuEntry::Item(MenuCommand::LatexRunRc, true),
+                ];
+                (0..self.latex_problem_count())
+                    .map(|i| MenuEntry::Item(MenuCommand::LatexProblem(i), true))
+                    .chain(rc.into_iter().filter(|_| self.latex_rc_skipped()))
+                    .collect()
+            }
             MenuTarget::RunConfigs => (0..self.run.list.len())
                 .map(|i| MenuEntry::Item(MenuCommand::RunSelect(i), true))
                 .chain([
@@ -823,11 +848,14 @@ impl App {
                 | MenuTarget::OpenWorktree
                 | MenuTarget::PullMode
                 | MenuTarget::DropFolder
+                | MenuTarget::SearchStyle
                 | MenuTarget::AutoSave
+                | MenuTarget::SmoothCaret
                 | MenuTarget::Zoom
                 | MenuTarget::BackgroundImage
                 | MenuTarget::BackgroundFit
                 | MenuTarget::TextWidth
+                | MenuTarget::DefaultLanguage
                 | MenuTarget::TerminalPosition
                 | MenuTarget::TerminalTabPosition
                 | MenuTarget::OptionAsMeta
@@ -841,11 +869,14 @@ impl App {
             MenuTarget::OpenWorktree => Some(Setting::GitOpenWorktree),
             MenuTarget::PullMode => Some(Setting::GitPullMode),
             MenuTarget::DropFolder => Some(Setting::DropFolder),
+            MenuTarget::SearchStyle => Some(Setting::FindInFiles),
             MenuTarget::AutoSave => Some(Setting::AutoSave),
+            MenuTarget::SmoothCaret => Some(Setting::SmoothCaret),
             MenuTarget::Zoom => Some(Setting::Zoom),
             MenuTarget::BackgroundImage => Some(Setting::BackgroundImage),
             MenuTarget::BackgroundFit => Some(Setting::BackgroundFit),
             MenuTarget::TextWidth => Some(Setting::TextWidth),
+            MenuTarget::DefaultLanguage => Some(Setting::DefaultLanguage),
             MenuTarget::TerminalPosition => Some(Setting::TerminalPosition),
             MenuTarget::TerminalTabPosition => Some(Setting::TerminalTabPosition),
             MenuTarget::OptionAsMeta => Some(Setting::TerminalOptionAsMeta),
@@ -944,7 +975,7 @@ impl App {
                             .and_then(key_equivalent)
                             .unwrap_or_default(),
                         icon: self.menu_icon(*command),
-                        icon_size: menu_icon_size(*command),
+                        icon_size: self.menu_icon_size(*command),
                         enabled: *enabled,
                         checked: self.menu_checked(*command),
                         alternate: matches!(entry, MenuEntry::Alternate(..)),
@@ -955,7 +986,7 @@ impl App {
                     label: MenuLabel::plain(title),
                     key: Default::default(),
                     icon: submenu_lead(items).and_then(|c| self.menu_icon(c)),
-                    icon_size: submenu_lead(items).map_or(MENU_ICON, menu_icon_size),
+                    icon_size: submenu_lead(items).map_or(MENU_ICON, |c| self.menu_icon_size(c)),
                     enabled: true,
                     checked: false,
                     alternate: false,
@@ -972,6 +1003,18 @@ impl App {
     /// 状态栏缩进、行尾、编码菜单中当前使用的那一项打勾；「排除的语言」菜单中已被排除的语言打勾；
     /// 格式化工具菜单中当前使用的那一项打勾。
     pub(in crate::app) fn menu_checked(&self, command: MenuCommand) -> bool {
+        // 设置中的默认语言：当前的设置打勾。
+        let target = self.overlays.context_menu.as_ref().map(|menu| &menu.target);
+        if let Some(MenuTarget::DefaultLanguage) = target {
+            let chosen = self.default_language().map(|language| language.id);
+            return match command {
+                MenuCommand::UsePlainText => chosen.is_none(),
+                MenuCommand::UseLanguage(i) => {
+                    chosen.is_some() && winc_syntax::languages().get(i).map(|l| l.id) == chosen
+                }
+                _ => false,
+            };
+        }
         if let MenuCommand::ShowTab(i) = command {
             return self.editor.active == Some(i);
         }
@@ -1073,7 +1116,10 @@ impl App {
                 MenuCommand::IndentSize(n) => doc.indent_size(tab_width) == n,
                 MenuCommand::LineEnding(eol) => doc.line_ending == eol,
                 MenuCommand::ReopenEncoding(i) | MenuCommand::SaveEncoding(i) => {
-                    doc.hex.is_none() && CHOICES.get(i).is_some_and(|(e, _)| *e == doc.encoding)
+                    doc.hex.is_none()
+                        && CHOICES
+                            .get(i)
+                            .is_some_and(|(e, _)| *e == doc.encoding.choice())
                 }
                 MenuCommand::ReopenHex => doc.hex.is_some(),
                 MenuCommand::UseLanguage(i) => (winc_syntax::languages().get(i))
@@ -1122,6 +1168,9 @@ impl App {
             MenuCommand::PullMode(i) => {
                 winc_config::PullMode::ALL.get(i) == Some(&self.config.git_pull.unwrap_or_default())
             }
+            MenuCommand::SearchStyle(i) => {
+                winc_config::SearchStyle::ALL.get(i) == Some(&self.search_style())
+            }
             MenuCommand::DropFolder(i) => {
                 winc_config::FolderDrop::ALL.get(i)
                     == Some(&self.config.drop_folder.unwrap_or_default())
@@ -1129,6 +1178,10 @@ impl App {
             MenuCommand::AutoSave(i) => {
                 winc_config::AutoSave::ALL.get(i)
                     == Some(&self.config.auto_save.unwrap_or_default())
+            }
+            MenuCommand::SmoothCaret(i) => {
+                winc_config::SmoothCaret::ALL.get(i)
+                    == Some(&self.config.smooth_caret_movement.unwrap_or_default())
             }
             MenuCommand::DefaultShell(i) => {
                 let configured = self.configured_shell().map(|shell| shell.command);
@@ -1189,8 +1242,8 @@ impl App {
         }
     }
 
-    /// 返回菜单项左边的图标：最近的目录用目录图标，工作树用分支图标，标签列表用标签上的图标；
-    /// 其他命令没有图标。
+    /// 返回菜单项左边的图标：最近的目录用目录图标，工作树用分支图标，标签列表用标签上的图标，
+    /// 语言用这种语言的文件的图标；其他命令没有图标。
     pub(in crate::app) fn menu_icon_kind(&self, command: MenuCommand) -> Option<MenuIcon> {
         match command {
             MenuCommand::OpenRecent(i) | MenuCommand::OpenRecentInNewWindow(i) => {
@@ -1205,6 +1258,14 @@ impl App {
             MenuCommand::OpenGroup(_) => Some(MenuIcon::Folders),
             MenuCommand::GroupFolder(..) => Some(MenuIcon::Folder),
             MenuCommand::ShowTab(i) => self.editor.documents.get(i).map(|_| MenuIcon::Tab(i)),
+            MenuCommand::UseLanguage(_) | MenuCommand::UsePlainText => {
+                let language = match command {
+                    MenuCommand::UseLanguage(i) => winc_syntax::languages().get(i).copied()?,
+                    _ => winc_syntax::detect(""),
+                };
+                let (glyph, colors) = crate::theme::language_kind(language);
+                Some(MenuIcon::File(glyph, colors))
+            }
             _ => None,
         }
     }
@@ -1250,6 +1311,12 @@ impl App {
                 }
             }
         }
+    }
+
+    /// 返回菜单项 `command` 的图标的逻辑尺寸（宽，高）；没有图标时为 [`MENU_ICON`]。
+    #[cfg(any(target_os = "macos", test))]
+    pub(in crate::app) fn menu_icon_size(&self, command: MenuCommand) -> (f32, f32) {
+        (self.menu_icon_kind(command)).map_or(MENU_ICON, MenuIcon::size)
     }
 
     /// 把菜单项 `command` 的图标画成图片，交给系统菜单；没有图标或没有渲染器时为 `None`。

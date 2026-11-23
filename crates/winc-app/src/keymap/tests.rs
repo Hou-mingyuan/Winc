@@ -166,7 +166,7 @@ fn no_two_bindings_fight_over_a_key() {
                 );
             }
             // 组合键的第一段不能同时对应一个命令，否则永远等不到第二段。终端里自己的单键
-            // （⌘K 清屏）例外：在终端里本来就不等第二段，单键优先（`lookup`）。
+            // （⌘K 清屏）例外：在终端里原本就不等第二段，单键优先（`lookup`）。
             if a.second.is_some() {
                 assert!(
                     !table.iter().any(|b| b.first == a.first
@@ -312,7 +312,7 @@ fn vscode_key_labels_per_system() {
         }
     }
 
-    // ⌘J（其他系统上 Ctrl+J）显示或隐藏面板，焦点在终端里也生效，与 VS Code 相同。
+    // ⌘J（其他系统上 Ctrl+J）显示或隐藏面板，焦点在终端里也生效。
     for context in [Context::Editor, Context::Terminal] {
         assert_eq!(
             runs(Os::Mac, Mods::META, KeyCode::Char('j'), context),
@@ -541,6 +541,12 @@ fn edits_in_diff_matches_the_diff_command_list() {
         ToggleComment,
         DeleteLine,
         DeleteAllLeft,
+        CursorLineStart,
+        CursorLineEnd,
+        DeleteAllRight,
+        CutToLineEnd,
+        TransposeLetters,
+        InsertLineBreak,
         IndentLines,
         OutdentLines,
         MoveLinesUp,
@@ -571,6 +577,8 @@ fn edits_in_diff_matches_the_diff_command_list() {
         SortLinesAscending,
         SortLinesDescending,
         TrimTrailingWhitespace,
+        UnescapeUnicode,
+        EscapeUnicode,
         Format,
         FormatSelection,
         Fix,
@@ -749,7 +757,7 @@ fn idea_key_labels_per_system() {
         Some(Action::NewTerminal)
     );
     assert_eq!(first(Mods::META, t, Context::Editor), Some(Action::GitPull));
-    // 连按两下 Shift 是两段组合键，第一下单按不执行命令。
+    // 连按两次 Shift 是两段组合键，第一次单按不执行命令。
     let tap = Stroke {
         key: KeyCode::Tap,
         mods: Mods::SHIFT,
@@ -850,4 +858,67 @@ fn custom_keys_replace_the_preset_and_take_the_key() {
         assert_eq!(Action::from_id(&action.id()), Some(*action));
         assert!(!ACTIONS[i + 1..].iter().any(|a| a.id() == action.id()));
     }
+}
+
+/// macOS 上两套方案按各自编辑器的默认键位绑定 `⌃` 字母键：IDEA 占作其他功能的键不绑定，查找条
+/// 等输入框里不生效，其他系统不绑定。
+#[test]
+fn control_letters_follow_each_editor_on_macos() {
+    use Action::*;
+    use Preset::{Idea, VsCode};
+    let run = |preset: Preset, mods: Mods, c: char, context: Context| {
+        let stroke = Stroke {
+            key: KeyCode::Char(c),
+            mods,
+        };
+        match lookup(&preset.bindings(Os::Mac), stroke, None, context) {
+            Lookup::Run(actions) => actions.first().copied(),
+            _ => None,
+        }
+    };
+    let ctrl = Mods::CTRL;
+    for (c, vscode, idea) in [
+        ('a', Some(CursorLineStart), Some(CursorHome)),
+        ('e', Some(CursorLineEnd), Some(CursorEnd)),
+        ('f', Some(CursorRight), Some(CursorRight)),
+        ('b', Some(CursorLeft), Some(CursorLeft)),
+        ('n', Some(CursorDown), Some(CursorDown)),
+        ('p', Some(CursorUp), Some(CursorUp)),
+        ('d', Some(DeleteRight), None),
+        ('h', Some(DeleteLeft), None),
+        ('k', Some(DeleteAllRight), Some(CutToLineEnd)),
+        ('t', Some(TransposeLetters), None),
+        ('o', Some(InsertLineBreak), None),
+        ('l', None, Some(ScrollToCenter)),
+    ] {
+        assert_eq!(
+            run(VsCode, ctrl, c, Context::Editor),
+            vscode,
+            "VS Code ⌃{c}"
+        );
+        assert_eq!(run(Idea, ctrl, c, Context::Editor), idea, "IDEA ⌃{c}");
+        assert_eq!(
+            run(VsCode, ctrl, c, Context::Markdown),
+            vscode,
+            "Markdown ⌃{c}"
+        );
+        assert_eq!(run(VsCode, ctrl, c, Context::Find), None, "查找条 ⌃{c}");
+    }
+    assert_eq!(
+        run(VsCode, ctrl | Mods::SHIFT, 'a', Context::Editor),
+        Some(CursorLineStart)
+    );
+    let windows = Stroke {
+        key: KeyCode::Char('a'),
+        mods: ctrl,
+    };
+    assert_eq!(
+        lookup(
+            &VsCode.bindings(Os::Windows),
+            windows,
+            None,
+            Context::Editor
+        ),
+        Lookup::Run(vec![SelectAll])
+    );
 }

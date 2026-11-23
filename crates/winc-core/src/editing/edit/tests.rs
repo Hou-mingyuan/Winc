@@ -312,6 +312,16 @@ fn delete_lines_and_to_line_start() {
     assert_eq!((out.as_str(), sel), ("abcd", Selection::point(2)));
     let (out, _, _) = run("ab\ncd", Selection::new(1, 4), delete_to_line_start);
     assert_eq!(out, "ad");
+
+    // `⌃K`：删到行尾；已在行尾时删除换行符，与下一行相接；最后一行行尾无事可做；有选区时
+    // 删除选区。
+    let (out, sel, _) = run("ab  cd\nef", Selection::point(2), delete_to_line_end);
+    assert_eq!((out.as_str(), sel), ("ab\nef", Selection::point(2)));
+    let (out, sel, _) = run("ab\ncd", Selection::point(2), delete_to_line_end);
+    assert_eq!((out.as_str(), sel), ("abcd", Selection::point(2)));
+    assert!(delete_to_line_end(&Rope::from_str("ab\ncd"), Selection::point(5)).is_none());
+    let (out, _, _) = run("ab\ncd", Selection::new(1, 4), delete_to_line_end);
+    assert_eq!(out, "ad");
 }
 
 #[test]
@@ -356,7 +366,7 @@ fn pasted_blocks_move_to_the_caret_indent() {
     // Tab 缩进：按字符比较，不换算成空格。
     assert_eq!(paste_at("\t", 1, "\t\ta\n\t\t\tb"), "\ta\n\t\tb");
 
-    // 缩进本来就相同：不重复增加第一行的缩进。
+    // 缩进已经相同：不重复增加第一行的缩进。
     assert_eq!(paste_at("    ", 4, "    a\n    b"), "    a\n    b");
     // 不调整：第一行不带缩进（从行中间开始复制）、光标之前有非空白字符、只有一行。
     assert_eq!(

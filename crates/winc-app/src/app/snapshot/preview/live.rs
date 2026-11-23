@@ -131,6 +131,48 @@ fn the_full_preview_edits_the_document() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 回归：只看预览时文件被其他程序改写，整个重新读入之后预览仍可直接编辑，左侧仍写原文行号。
+#[test]
+fn the_full_preview_stays_editable_after_the_file_changes_on_disk() {
+    let (mut app, dir) = live_doc("md-live-reload", "# 标题\n\n第一段\n");
+    assert!(app.markdown_live());
+
+    // 改的不只是末尾，整个重新读入；文件变长了，修改时间相同也能检测到变化。
+    let changed = "# 标题\n\n改过的第一段\n\n第二段\n";
+    std::fs::write(dir.join("LIVE.md"), changed).unwrap();
+    app.sync_documents(|_| true);
+    settle(&mut app);
+    assert_eq!(doc_text(&app), changed);
+    assert!(app.markdown_live());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 只看预览的 Markdown 关掉后再打开：光标回到原来的那一段，预览滚到那里。
+#[test]
+fn the_full_preview_reopens_at_the_caret() {
+    let text: String = (0..80).map(|i| format!("第 {i} 段\n\n")).collect();
+    let (mut app, dir) = live_doc("md-live-place", &text);
+    app.go_to(120, 2, 0);
+    settle(&mut app);
+    let scroll = app.preview.markdown.scroll();
+    assert!(scroll > 0.0);
+    app.remember_session();
+
+    let mut next = blank_app(false);
+    next.state = app.state.clone();
+    next.open_path(&dir.join("LIVE.md"));
+    paint(&mut next);
+    next.set_preview_mode(PreviewMode::Preview);
+    settle(&mut next);
+    assert!(next.markdown_live());
+    let doc = next.editor.active().unwrap();
+    assert_eq!(doc.text().pos_to_line_col(doc.selection.head), (120, 2));
+    let reopened = next.preview.markdown.scroll();
+    assert!(reopened > 0.0, "预览停在开头");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_caret_paragraph_keeps_its_look() {
     use crate::app::preview::markdown::laid::full_text;
@@ -487,7 +529,7 @@ fn clicking_inline_math_puts_the_caret_in_its_source() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 回车续出的空项：光标停在新项的记号之后，不归到下一项；下一项照常按排版显示。
+/// 回车续出的空项：光标停在新项的记号之后，不归到下一项；下一项仍然按排版显示。
 #[test]
 fn enter_in_a_list_puts_the_caret_in_the_new_empty_item() {
     use winit::keyboard::{Key, NamedKey};
@@ -508,7 +550,7 @@ fn enter_in_a_list_puts_the_caret_in_the_new_empty_item() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 输入多字节的字之后、重新解析之前，光标所在项之后的项照常显示：页面高度不变，下方内容不
+/// 输入多字节的字之后、重新解析之前，光标所在项之后的项仍然显示：页面高度不变，下方内容不
 /// 上下跳动。
 #[test]
 fn typing_wide_characters_keeps_the_following_blocks_in_place() {

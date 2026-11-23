@@ -44,7 +44,6 @@ mod terminal;
 mod tooltip;
 mod workspace;
 
-use editor::draw_editor;
 pub(crate) use editor::{LineTokens, MinimapRows, RulerCache};
 use fields::*;
 use overlays::{
@@ -69,6 +68,17 @@ pub(crate) fn base(app: &App) -> [(Rect, Color); 3] {
         // 拆分后编辑区只是前台窗格的那一块：底色铺满整个卡片。
         (app.panes.card.unwrap_or(l.editor), p.editor_bg),
     ]
+}
+
+/// 绘制编辑区；差异和日志的点击区域裁剪在编辑区内，包括终端最大化后的零宽、零高区域。
+fn draw_editor(app: &mut App, frame: &mut Frame<'_>) {
+    editor::draw_editor(app, frame);
+    for (rect, _) in &mut app.hits.diff {
+        *rect = rect.intersect(app.layout.editor);
+    }
+    for (rect, _) in &mut app.hits.log {
+        *rect = rect.intersect(app.layout.editor);
+    }
 }
 
 /// 绘制一个窗格：标签栏和编辑区，以及分栏预览、合并的两侧等随标签变化的部分。`front` 为假
@@ -177,6 +187,7 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     if layout.search.h > 0.0 {
         draw_search(app, frame);
     }
+    workspace::search_dialog::draw(app, frame);
 
     // 位置浮窗显示在名称旁边，有独立的动画（滑出、淡出）。
     let bar_open = app.bars.goto_input.is_some() && !app.bars.prompt_kind.is_vim();
@@ -201,25 +212,7 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
 
     editor::hint::draw_name_hint(app, frame);
 
-    app.hits.conflict_card = draw_conflict(app, frame);
-    // 合并冲突的卡片排在磁盘冲突卡片下面。
-    let top = match &app.hits.conflict_card {
-        Some((card, _)) => card.bottom(),
-        None => app.overlay_top(),
-    } + 8.0;
-    let mut hits = std::mem::take(&mut app.hits.merge);
-    app.hits.merge_card = git::merge::draw_merge_card(app, frame, top, &mut hits);
-    app.hits.merge = hits;
-    (app.hits.notice_card, app.hits.notice_button) = match app.notice.text.as_deref() {
-        Some(message) => {
-            let (card, button) = draw_live_notice(app, frame, message);
-            (Some(card), button)
-        }
-        None => (None, None),
-    };
-    if let Some(ghost) = &app.notice.leaving {
-        draw_notice_ghost(app, frame, ghost);
-    }
+    draw_notices(app, frame);
 
     suggest::draw_suggest(app, frame);
     draw_tree_drag(app, frame);
@@ -235,7 +228,7 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
         return;
     }
 
-    // 设置浮层盖住整个窗口（侧栏、编辑区、状态栏）；绘制后直接返回，不再绘制主界面的悬停提示。
+    // 设置浮层遮住整个窗口（侧栏、编辑区、状态栏）；绘制后直接返回，不再绘制主界面的悬停提示。
     // 关闭后淡出期间仍继续绘制（`SettingsState::motion`）。
     if app.settings.open {
         settings::draw(app, frame);
@@ -255,6 +248,46 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     }
     // 鼠标在其他窗格上时，提示按那个窗格的标签和按钮写。
     app.in_hovered_pane(|app| tooltip::draw_tooltip(app, frame));
+}
+
+/// 提示和冲突卡片留在所属区域内，终端最大化时随区域移到终端内容上。
+fn draw_notices(app: &mut App, frame: &mut Frame<'_>) {
+    let area = app.overlay_area();
+    let merge_start = app.hits.merge.len();
+    frame.within(area, |frame| {
+        app.hits.conflict_card = draw_conflict(app, frame);
+        // 合并冲突的卡片排在磁盘冲突卡片下面。
+        let top = match &app.hits.conflict_card {
+            Some((card, _)) => card.bottom(),
+            None => app.overlay_top(),
+        } + 8.0;
+        let mut hits = std::mem::take(&mut app.hits.merge);
+        app.hits.merge_card = git::merge::draw_merge_card(app, frame, top, &mut hits);
+        app.hits.merge = hits;
+        (app.hits.notice_card, app.hits.notice_button) = match app.notice.text.as_deref() {
+            Some(message) => {
+                let (card, button) = draw_live_notice(app, frame, message);
+                (Some(card), button)
+            }
+            None => (None, None),
+        };
+        if let Some(ghost) = &app.notice.leaving {
+            draw_notice_ghost(app, frame, ghost);
+        }
+    });
+    // 被裁掉的按钮和卡片不再遮挡侧栏或相邻窗格；冲突标记行已有的按钮保持各自范围。
+    for (rect, _) in &mut app.hits.merge[merge_start..] {
+        *rect = rect.intersect(area);
+    }
+    if let Some((card, buttons)) = &mut app.hits.conflict_card {
+        *card = card.intersect(area);
+        for (rect, _) in buttons {
+            *rect = rect.intersect(area);
+        }
+    }
+    app.hits.merge_card = app.hits.merge_card.map(|r| r.intersect(area));
+    app.hits.notice_card = app.hits.notice_card.map(|r| r.intersect(area));
+    app.hits.notice_button = app.hits.notice_button.map(|r| r.intersect(area));
 }
 
 /// 绘制已打开的窗口内菜单和提示框；提示框覆盖在菜单之上。
@@ -472,13 +505,9 @@ fn marked_label(
 
 /// 绘制输入框的外框：平时没有边框，只在底色 `base` 上铺一层略深的中性色。
 ///
-/// 有焦点时改为编辑区底色并加一圈强调色外环，出错时外环为错误色。侧栏的搜索框、提交信息框和
-/// 日志标签的筛选框共用该函数。输入框不加边框：接近白色的侧栏上叠加多个浅色边框时层次混乱，
-/// 只保留一层底色时层次更清楚。
-///
-/// 外环宽度为整数个物理像素（缩放倍数四舍五入，至少为 1）：输入框四边先对齐到物理像素，再向外
-/// 扩出外环。缩放倍数不是整数（系统缩放 125%、界面缩放 110% 等）时，若按逻辑像素外扩 1，四边
-/// 各自取整后宽度在 0 到 2 个物理像素之间，宽度不一致。
+/// 有焦点时改为编辑区底色并加一圈强调色外环，出错时外环为错误色。侧栏的搜索框、提交信息框和日志标签
+/// 的筛选框共用该函数。外环宽度为整数个物理像素（缩放倍数四舍五入，至少为 1）：输入框四边先对齐到
+/// 物理像素，再向外扩出外环，缩放倍数不是整数时四边的宽度才一致。
 fn field_box(
     app: &App,
     frame: &mut Frame<'_>,
@@ -517,12 +546,11 @@ fn sidebar_span(app: &App) -> Rect {
 
 /// 绘制列表为空时（没有结果、没有更改、尚无提交）的说明文字。
 ///
-/// 标题一行使用正文字号和次要色，下方可附一行淡色小字作补充，放不下时按宽度折行。整块在
-/// `span`（纵向范围）内上下居中，中线位于 `span` 高度的 45% 处，列表很矮时顶部至少留
-/// 16 逻辑像素。
+/// 标题一行使用正文字号和次要色，下方可附一行淡色小字作补充，放不下时按宽度折行。整块在 `span`（纵
+/// 向范围）内上下居中，中线位于 `span` 高度的 45% 处，列表很矮时顶部至少留 16 逻辑像素。
 ///
-/// 居中参照 `span` 而非各自的列表：各视图的列表起始高度不同，按列表居中会使切换视图时说明
-/// 文字上下跳动。返回最后一行的下沿，供调用方在说明下方继续排列按钮。
+/// 居中参照 `span` 而非各自的列表：各视图的列表起始高度不同，按列表居中会使切换视图时说明文字上下跳
+/// 动。返回最后一行的下沿，供调用方在说明下方继续排列按钮。
 fn draw_empty_state(
     app: &App,
     frame: &mut Frame<'_>,
@@ -563,11 +591,8 @@ fn draw_empty_state(
 /// 在 `rect` 内垂直居中绘制一段字号为 `size`、没有小写字母的界面文本，返回文本末尾的 x 坐标。
 ///
 /// 用于独自放在小框里的快捷键（⌘⇧F）、项目首字母、数字：按大写字母的高度居中（数字与大写字母
-/// 等高）。[`label`] 的视觉中心计入了小写字母的中心，此类文本按其居中会偏高约半个像素。
-/// 在一行内与普通文字并列的文本（状态栏、查找条的计数）仍用 [`label`]，与普通文字共用基线。
-///
-/// 含中日韩文字的文本（「双击」、姓名首字）按 [`label`] 的视觉中心居中：这些字的中心低于大写
-/// 字母的中心，按大写字母高度居中会偏低约 1 像素。
+/// 等高）。在一行内与普通文字并列的文本（状态栏、查找条的计数）以及含中日韩文字的文本（「双击」、
+/// 姓名首字）仍用 [`label`]，按其视觉中心居中。
 fn caps_label(
     frame: &mut Frame<'_>,
     app: &App,
@@ -817,12 +842,14 @@ fn draw_card_frame(frame: &mut Frame<'_>, p: &Palette, rect: Rect, radius: f32) 
 /// 绘制浮在预览内容上的工具栏或卡片 `rect`（含细边框）：阴影、细边框和底色，裁剪到 `clip`；
 /// 细边框画在卡片底色上，不透出下方的内容。
 fn draw_floating_bar(frame: &mut Frame<'_>, p: &Palette, rect: Rect, clip: Rect) {
-    let covered = frame.covered(rect, RADIUS_POPUP);
-    frame.shadow(rect, RADIUS_POPUP, 12.0, 4.0, p.shadow, Some(covered));
-    frame.rect_clipped(rect, p.popup_bg, RADIUS_POPUP, clip);
-    frame.rect_clipped(rect, p.popup_border, RADIUS_POPUP, clip);
-    let inner = rect.inset(1.0, 1.0);
-    frame.rect_clipped(inner, p.popup_bg, RADIUS_POPUP - 1.0, clip);
+    frame.within(clip, |frame| {
+        let covered = frame.covered(rect, RADIUS_POPUP);
+        frame.shadow(rect, RADIUS_POPUP, 12.0, 4.0, p.shadow, Some(covered));
+        frame.rect_clipped(rect, p.popup_bg, RADIUS_POPUP, clip);
+        frame.rect_clipped(rect, p.popup_border, RADIUS_POPUP, clip);
+        let inner = rect.inset(1.0, 1.0);
+        frame.rect_clipped(inner, p.popup_bg, RADIUS_POPUP - 1.0, clip);
+    });
 }
 
 /// 卡片阴影超出卡片矩形的范围（逻辑像素）。

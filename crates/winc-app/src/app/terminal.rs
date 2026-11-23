@@ -57,11 +57,11 @@ pub(crate) const DEFAULT_HEIGHT: f32 = 242.0;
 pub(crate) const MIN_HEIGHT: f32 = 96.0;
 /// 在下面拖高面板时给编辑区至少留的高度（逻辑像素）。
 pub(crate) const EDITOR_MIN: f32 = 120.0;
-/// 面板在编辑区右边时的默认宽度（逻辑像素，经验值）。
+/// 面板在编辑区右边时的默认宽度（逻辑像素，取自调参）。
 pub(crate) const DEFAULT_WIDTH: f32 = 480.0;
-/// 面板在编辑区右边时的最窄宽度（逻辑像素，经验值）：再窄时一行放不下几个字。
+/// 面板在编辑区右边时的最窄宽度（逻辑像素）：再窄时一行放不下几个字。
 pub(crate) const MIN_WIDTH: f32 = 280.0;
-/// 面板在右边时至少给编辑区留的宽度（逻辑像素，经验值）。
+/// 面板在右边时至少给编辑区留的宽度（逻辑像素，取自调参）。
 pub(crate) const EDITOR_MIN_WIDTH: f32 = 360.0;
 /// 面板在下面时标签栏的高度（逻辑像素）：`TAB_HEIGHT` 上下各留 5。
 const HEADER: f32 = crate::theme::TAB_HEIGHT + 10.0;
@@ -71,7 +71,7 @@ pub(crate) const PAD: f32 = 8.0;
 pub(crate) const GUTTER: f32 = 14.0;
 /// 色带离面板左边的距离（逻辑像素）。
 pub(crate) const BAND_X: f32 = 5.0;
-/// 发出新的尺寸后等待该尺寸一帧的最长时间（100 ms，经验值）。
+/// 发出新的尺寸后等待该尺寸一帧的最长时间（100 ms，取自调参）。
 ///
 /// 超过这个时间不再等待，新的尺寸仍然会发：程序开着同步输出时，辅助进程会先不发帧。
 const RESIZE_WAIT: Duration = Duration::from_millis(100);
@@ -116,6 +116,12 @@ pub(crate) enum HeaderHit {
     Hide,
     /// 「+」右边选 shell 的按钮。
     ShellMenu,
+    /// 「搜索」标签（在文件中查找的结果）。
+    SearchTab,
+    /// 「搜索」标签的关闭按钮。
+    SearchClose,
+    /// 显示「搜索」标签时的「在对话框中打开」。
+    SearchDialog,
     /// 把面板挪到编辑区右边，或者挪回下面。
     Position,
     /// 最大化面板，或者还原（⌘⇧↩）。
@@ -448,6 +454,7 @@ impl App {
         } else if in_terminal {
             self.set_terminal_open(false);
         } else {
+            self.search_dialog.in_panel = false;
             self.focus = Focus::Terminal;
         }
         self.reset_blink();
@@ -457,6 +464,7 @@ impl App {
 
     /// 打开面板、焦点放进去；还没有标签时开一个。
     fn open_terminal_panel(&mut self) {
+        self.search_dialog.in_panel = false;
         self.set_terminal_open(true);
         let t = &mut self.terminal;
         if t.height <= 0.0 {
@@ -474,7 +482,7 @@ impl App {
     /// 没有标签时 `None`。
     pub(super) fn terminal_session(&self) -> Option<TerminalSession> {
         let t = &self.terminal;
-        // 还没建出来的（面板收着时恢复的）也算。
+        // 还没建出来的（面板保存时恢复的）也算。
         // 运行配置的标签不恢复；拆分出的终端各记成一个标签。
         let shells =
             || (t.tabs.iter().flat_map(|tab| tab.split_order())).filter(|tab| tab.run.is_none());
@@ -504,7 +512,7 @@ impl App {
 
     /// 打开目录时按现场重开上次的终端标签，各在原来的目录里（程序不恢复）。
     ///
-    /// 终端里已经有标签了不动；面板上次收着时等打开面板再建。
+    /// 终端里已经有标签了不动；面板上次保存时等打开面板再建。
     pub(super) fn restore_terminal(&mut self, session: &TerminalSession) {
         let root = self.editor.root().map(PathBuf::from);
         let t = &mut self.terminal;
@@ -553,10 +561,7 @@ impl App {
         if self.frame.bench.silent() {
             return;
         }
-        let session = self
-            .editor
-            .root()
-            .and_then(|root| self.state.session_for(root));
+        let session = self.current_session();
         if let Some(terminal) = session.and_then(|session| session.terminal.clone()) {
             self.restore_terminal(&terminal);
             self.terminal.motion = None;
@@ -594,7 +599,7 @@ impl App {
     }
 
     /// 换到新目录后的终端：按新目录的现场重开它的标签；新目录没有记下终端、面板开着时在
-    /// 新目录里开一个标签；面板开着而新目录上次是收着的，收起面板。
+    /// 新目录里开一个标签；面板开着而新目录上次是保存的，收起面板。
     pub(super) fn switch_terminal(&mut self, session: Option<&TerminalSession>) {
         match session {
             Some(session) => {
@@ -721,7 +726,7 @@ impl App {
         if !open {
             self.finish_terminal_rename(true);
         }
-        if !open && self.focus.in_terminal() {
+        if !open && (self.focus.in_terminal() || self.focus_in_docked_search()) {
             self.focus = Focus::Editor;
         }
         self.terminal.motion = self
@@ -733,7 +738,7 @@ impl App {
             });
     }
 
-    /// 状态栏上的终端按钮、标签栏右端的收起按钮和 ⌘J：面板开着就收起，收着就打开（没有标签时
+    /// 状态栏上的终端按钮、标签栏右端的收起按钮和 ⌘J：面板开着就收起，保存就打开（没有标签时
     /// 开一个）。与焦点位置无关，收起时焦点在面板外的留在原处。
     pub(super) fn click_terminal_button(&mut self) {
         if self.terminal.open {
@@ -767,7 +772,7 @@ impl App {
 
     /// 最大化或还原面板（⌘⇧↩）。
     ///
-    /// 大小逐渐变化，shell 逐帧重排，与拖动分隔条时相同；面板收着时打开并直接最大化。最大化后
+    /// 大小逐渐变化，shell 逐帧重排，与拖动分隔条时相同；面板保存时打开并直接最大化。最大化后
     /// 编辑区看不见，焦点放进面板。
     pub(super) fn toggle_terminal_maximized(&mut self) {
         if !self.terminal.open {
@@ -838,7 +843,7 @@ impl App {
         }
         if !self.terminal.open {
             // 打开面板时没有标签、也没有恢复的标签要建，会先放一个默认的：换成这个默认标签。
-            // 恢复的那些标签（面板收着时退出的）留着，这个默认标签加在后面。
+            // 恢复的那些标签（面板保存时退出的）留着，这个默认标签加在后面。
             let empty = self.terminal.tabs.is_empty() && self.terminal.want.is_empty();
             self.open_terminal_panel();
             if empty {

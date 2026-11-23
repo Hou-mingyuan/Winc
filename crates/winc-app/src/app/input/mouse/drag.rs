@@ -98,15 +98,27 @@ impl App {
         if self.terminal.link.is_some() || self.layout.terminal.contains(x, y) {
             self.update_terminal_link();
         }
+        self.update_text_link();
         self.update_cursor_icon();
 
         match self.pointer.drag {
+            Drag::SearchDialog { grab } => self.move_search_dialog(x, y, grab),
+            Drag::SearchDialogEdge { edge, from, rect } => {
+                self.resize_search_dialog((x, y), edge, (from, rect));
+            }
             Drag::Picture { at } => self.drag_picture(x, y, at),
             Drag::TerminalSelect | Drag::TerminalMouse(_) => self.terminal_mouse_drag(x, y),
             Drag::None if self.layout.terminal.contains(x, y) => self.terminal_mouse_hover(x, y),
             Drag::Select { by_word, origin } => self.drag_select(x, y, by_word, origin),
             Drag::SelectLine { line } => self.drag_select_line(x, y, line),
             Drag::Columns { anchor } => self.drag_columns(x, y, anchor),
+            Drag::ColumnClick { origin, anchor } => {
+                let slop = self.repeat_slop();
+                if (x - origin.0).abs() >= slop || (y - origin.1).abs() >= slop {
+                    self.pointer.drag = Drag::Columns { anchor };
+                    self.drag_columns(x, y, anchor);
+                }
+            }
             Drag::AddSelect { origin } => self.drag_add_selection(x, y, origin),
             Drag::DiffSelect { unit, origin, add } => {
                 self.drag_diff_select(x, y, unit, origin, add);
@@ -145,7 +157,7 @@ impl App {
             Drag::TerminalDivider { start, size } => {
                 // 向上（面板在右侧时向左）拖动使面板变大；按排版允许的范围限制后再记录，
                 // 使记录的尺寸等于绘制的尺寸。拖过编辑区最小尺寸的一半时吸附为最大化，往回拖
-                // 又松开吸附，从最大的平常尺寸接着拖。
+                // 又松开吸附，从最大的平常尺寸继续拖。
                 let right = self.terminal_right();
                 let wanted = if right {
                     size - (x - start)
@@ -177,7 +189,7 @@ impl App {
                 } else {
                     self.terminal.height = drawn;
                 }
-                // 吸附、松开吸附时和 ⌘⇧↩ 一样过渡；状态不变时接着原来的过渡。
+                // 吸附、松开吸附时和 ⌘⇧↩ 一样过渡；状态不变时继续原来的过渡。
                 let snap = drawn > 0.0 && wanted - drawn > keep / 2.0;
                 self.terminal.maximized = snap;
                 self.terminal.grow = grow;
@@ -546,6 +558,7 @@ impl App {
             Drag::Select { .. }
                 | Drag::SelectLine { .. }
                 | Drag::Columns { .. }
+                | Drag::ColumnClick { .. }
                 | Drag::AddSelect { .. }
         );
         let (t, (x, y)) = (self.layout.text, self.pointer.mouse);

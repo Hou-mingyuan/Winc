@@ -40,7 +40,7 @@ impl App {
         // 鼠标侧面的两个键：后退、前进。
         if matches!(button, MouseButton::Back | MouseButton::Forward) {
             if !self.settings.open && self.overlays.form_dialog.is_none() {
-                self.navigate(button == MouseButton::Forward);
+                self.navigate_history(button == MouseButton::Forward);
             }
             return;
         }
@@ -190,6 +190,8 @@ impl App {
             Target::Picker => {
                 self.click_picker(x, y);
             }
+            Target::SearchDialog(part) => self.press_search_dialog(part, x, y),
+            Target::SearchDock(part) => self.press_docked_search(part, x, y),
             _ if self.overlays.picker.open => self.close_picker(),
             Target::Scrollbar(
                 bar @ (Scrollbar::Panel
@@ -310,7 +312,8 @@ impl App {
                     };
                 }
             }
-            // 分支面板里的分支：单击筛选，双击签出（第一下已经按它筛选了），再连着点不做别的。
+            // 分支面板里的分支：单击筛选，双击签出（第一次点击已经按它筛选了），
+            // 再连续点击不做别的。
             Target::Log(target @ crate::app::git::log::LogTarget::BranchRow(i)) => {
                 match self.click_count(x, y) {
                     1 => self.press_log(target),
@@ -391,8 +394,14 @@ impl App {
             }
             Target::TerminalHeader(hit) => {
                 use crate::app::terminal::HeaderHit;
+                if matches!(hit, HeaderHit::Tab(_) | HeaderHit::New) {
+                    self.search_dialog.in_panel = false;
+                }
                 self.focus = Focus::Terminal;
                 match hit {
+                    HeaderHit::SearchTab => self.show_docked_search(),
+                    HeaderHit::SearchClose => self.close_docked_search(),
+                    HeaderHit::SearchDialog => self.open_search_dialog_with(None),
                     // 双击标签重命名。
                     HeaderHit::Tab(i) if self.click_count(x, y) == 2 => {
                         self.activate_terminal_tab(i);
@@ -492,7 +501,7 @@ impl App {
     ///
     /// 当前点击由触摸点按产生时取 [`touch::TAP_SLOP`]，容纳两次落指之间的位置偏差；
     /// 鼠标点击取 4 逻辑像素，容纳按下与松开之间指针的轻微移动。
-    fn repeat_slop(&self) -> f32 {
+    pub(super) fn repeat_slop(&self) -> f32 {
         if self.touch.tapping {
             touch::TAP_SLOP
         } else {

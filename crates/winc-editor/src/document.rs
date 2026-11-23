@@ -412,6 +412,12 @@ pub(crate) const OPEN_LIMIT: u64 = 4 << 30;
 /// 超过该大小的文件按大文件打开：原文留在磁盘上按需读取，内存里只记录改动。下限取自调参：按大文件
 /// 打开后每次滚动都要读磁盘，只有当整个文件读入内存的占用和耗时不可忽略时，这一代价才值得承担。
 pub const LARGE_FILE: u64 = 16 << 20;
+
+/// 本机上的文件 `path` 是否超过 [`LARGE_FILE`]、按大文件打开；远端的文件不查询，返回 `false`。
+pub fn opens_as_large(path: &Path) -> bool {
+    !winc_backend::is_remote(path)
+        && winc_backend::fs::metadata(path).is_ok_and(|m| m.len > LARGE_FILE)
+}
 /// 一次复制的最大字节数（字节，64 MiB）。
 ///
 /// 大文件全选后复制会把整个文件读进内存，因此需要限制。
@@ -580,6 +586,8 @@ pub struct Document {
     /// 用户通过「通过编码重新打开」选的编码：之后从磁盘重新读取时按它解码，不再识别编码，也不
     /// 再判断是否二进制。
     chosen: Option<Encoding>,
+    /// 按 Unicode 转义读入时各行原来的写法：保存时未修改的行按它写回。
+    escape_origin: Option<std::sync::Arc<charset::EscapeOrigin>>,
 }
 
 /// 从磁盘读出的内容。
@@ -593,6 +601,8 @@ struct Loaded {
     mtime: Option<Stamp>,
     /// 读取时文件的大小（字节）。
     len: u64,
+    /// 按 Unicode 转义读入时各行原来的写法，见 [`charset::EscapeOrigin`]。
+    origin: Option<std::sync::Arc<charset::EscapeOrigin>>,
 }
 
 impl Document {
@@ -662,6 +672,7 @@ impl Document {
             pending_as_text: false,
             pending_hex: false,
             chosen: None,
+            escape_origin: None,
         }
     }
 
@@ -1010,6 +1021,7 @@ impl Document {
         // 作用于整个文件的命令需要读取并改写整个文件，大文件不支持。
         let whole_file = match command {
             Command::TrimTrailingWhitespace => true,
+            &Command::UnescapeUnicode { whole } | &Command::EscapeUnicode { whole } => whole,
             Command::SortLines { .. } => {
                 winc_core::transform::sorts_whole_file(&self.text, self.selection)
             }
@@ -1162,6 +1174,7 @@ impl Document {
         // 扩展名（`a.txt` → `a.csv`）时文本不变，因此递增 `revision` 使缓存失效。
         self.revision += 1;
         self.columns = None;
+        self.follow_unicode_escapes();
     }
 
     /// 标签上显示的名字：输出标签用 `title`，否则用文件名，没有文件名时是 `untitled`。

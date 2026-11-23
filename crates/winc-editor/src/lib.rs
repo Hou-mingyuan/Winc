@@ -34,7 +34,8 @@ pub use document::large::LargeText;
 pub use document::progress::ReadProgress;
 pub use document::{
     COPY_LIMIT, DiskChange, Document, DocumentId, EDIT_LIMIT, LARGE_FILE, OpenError, PictureState,
-    PreviewKind, PreviewMode, Reading, TableState, TableView, Unsupported, looks_binary, size_text,
+    PreviewKind, PreviewMode, Reading, TableState, TableView, Unsupported, looks_binary,
+    opens_as_large, size_text,
 };
 pub use document::{editorconfig, encoding};
 pub use editing::command::Command;
@@ -45,7 +46,7 @@ pub use editing::modal::ModalPattern;
 pub use editing::search::{MAX_MATCHES, Search, TextSearch};
 pub use editing::{paste, scopes};
 pub use navigation::bookmarks::{BookmarkMap, Bookmarks};
-pub use navigation::{bookmarks, definition, keypath, symbols, usages};
+pub use navigation::{bookmarks, definition, keypath, links, symbols, usages};
 pub use tools::{format, host, latex, remote_env, shell, wsl};
 pub use workspace::copying::Copying;
 pub use workspace::picker::{FileIndex, IndexedFile, MAX_RESULTS as PICKER_MAX_RESULTS};
@@ -54,8 +55,8 @@ pub use workspace::project_search::{
     ReplacePreview, replace_in_document, replace_in_file,
 };
 pub use workspace::tree::{
-    DirEntry, DirListing, DirScan, EXPAND_DIRS, Entry, EntryKind, Workspace, copy_entry, create_at,
-    list_dir, move_at, natural_cmp, rename_at, segment_name,
+    DirEntry, DirFetch, DirFetched, DirListing, DirScan, EXPAND_DIRS, Entry, EntryKind, Expansion,
+    Workspace, copy_entry, create_at, list_dir, move_at, natural_cmp, rename_at, segment_name,
 };
 pub use workspace::watch::{Changes, Watcher};
 
@@ -647,6 +648,19 @@ impl Editor {
     /// 目录不存在或没有读权限时返回 `std::io::Error`。
     pub fn open_folder(&mut self, path: &Path) -> std::io::Result<()> {
         self.workspace = Some(Workspace::open(path)?);
+        self.bookmarks.clear();
+        self.folds.clear();
+        Ok(())
+    }
+
+    /// 同 [`Editor::open_folder`]，但不在调用的线程上读目录（见 [`Workspace::open_later`]）：
+    /// 文件树先是空的，由调用方把待读的目录交给后台。
+    ///
+    /// # Errors
+    ///
+    /// 目录不存在时返回 `std::io::Error`。
+    pub fn open_folder_later(&mut self, path: &Path) -> std::io::Result<()> {
+        self.workspace = Some(Workspace::open_later(path)?);
         self.bookmarks.clear();
         self.folds.clear();
         Ok(())

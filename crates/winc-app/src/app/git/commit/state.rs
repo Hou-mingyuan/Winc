@@ -8,9 +8,8 @@ use super::*;
 impl CommitState {
     /// 返回当前按下「提交」不会提交的原因；可以提交（或正在提交）时为 `None`。
     ///
-    /// 检查项与 [`App::git_commit`] 相同。提交按钮据此置灰，悬停提示显示原因。
-    /// 冲突标记按状态中读取的结果判断：编辑器中刚移除、尚未保存时按钮仍置灰，
-    /// 按下后先保存再重新检查。
+    /// 检查项与 [`App::git_commit`] 相同。提交按钮据此置灰，悬停提示显示原因。冲突标记按状态中读取
+    /// 的结果判断：编辑器中刚移除、尚未保存时按钮仍置灰，按下后先保存再重新检查。
     ///
     /// `others` 是其他仓库里随之提交的文件数：勾选式下勾上的（见 [`App::other_checked_count`]），
     /// 暂存区视图中暂存的（见 [`App::other_staged_count`]）；不为 0 时当前仓库没有内容也可以提交。
@@ -265,7 +264,7 @@ impl CommitState {
     }
 
     /// 按 [`CommitState::sort`] 排 `files`（各项在状态中的下标和相对仓库根的路径）。
-    fn sort_files(&self, status: &Status, files: &mut [(usize, &Path)]) {
+    pub(super) fn sort_files(&self, status: &Status, files: &mut [(usize, &Path)]) {
         let letter = |index: usize| status.entries.get(index).map(|e| e.shown().letter());
         files.sort_by(|a, b| match self.sort {
             CommitSort::Path => natural_path_cmp(a.1, b.1),
@@ -284,6 +283,7 @@ impl CommitState {
         self.collapsed = [collapse; CommitGroup::COUNT];
         if !collapse {
             self.forget_dirs();
+            self.other_collapsed_dirs.clear();
         }
         self.layout += 1;
     }
@@ -427,9 +427,9 @@ type HunkIds = Vec<(u64, Range<usize>)>;
 /// 提交按钮按下时提交的范围。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitScope {
-    /// 暂存区中这么多个文件的内容。
+    /// 暂存区中 `n` 个文件的内容。
     Staged(usize),
-    /// 没有暂存任何内容：全部已跟踪文件的改动，共这么多个文件。
+    /// 没有暂存任何内容：全部已跟踪文件的改动，共 `n` 个文件。
     All(usize),
     /// 没有可以提交的内容。
     Nothing,

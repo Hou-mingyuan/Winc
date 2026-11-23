@@ -166,6 +166,8 @@ impl App {
                 MenuCommand::OpenFolder => self.pick(Pick::OpenFolder),
                 MenuCommand::AddFolder => self.ask_add_folder(),
                 MenuCommand::RenameGroup => self.ask_rename_group(),
+                MenuCommand::SaveProjectAs | MenuCommand::SaveProject => self.ask_save_project(),
+                MenuCommand::OpenProject => self.pick(Pick::OpenProject),
                 MenuCommand::OpenGroup(i) => self.open_group(i),
                 MenuCommand::GroupFolder(i, j) => self.open_group_folder(i, j),
                 MenuCommand::OpenWslFolder(i) => {
@@ -180,7 +182,7 @@ impl App {
                         self.browse_remote_host(host);
                     }
                 }
-                MenuCommand::CloseFolder => self.close_folder(),
+                MenuCommand::CloseFolder | MenuCommand::CloseProject => self.close_folder(),
                 _ => {}
             },
             MenuTarget::AddLanguage(task) => {
@@ -218,6 +220,15 @@ impl App {
                     self.set_render_whitespace(choice);
                 }
             }
+            MenuTarget::SearchStyle => {
+                if let MenuCommand::SearchStyle(i) = command
+                    && let Some(&choice) = winc_config::SearchStyle::ALL.get(i)
+                {
+                    self.config.find_in_files = Some(choice);
+                    self.save_config();
+                    self.request_redraw();
+                }
+            }
             MenuTarget::DropFolder => {
                 if let MenuCommand::DropFolder(i) = command
                     && let Some(&choice) = winc_config::FolderDrop::ALL.get(i)
@@ -230,6 +241,13 @@ impl App {
                     && let Some(&choice) = winc_config::AutoSave::ALL.get(i)
                 {
                     self.set_auto_save(choice);
+                }
+            }
+            MenuTarget::SmoothCaret => {
+                if let MenuCommand::SmoothCaret(i) = command
+                    && let Some(&choice) = winc_config::SmoothCaret::ALL.get(i)
+                {
+                    self.set_smooth_caret(choice);
                 }
             }
             MenuTarget::OpenWorktree => {
@@ -265,6 +283,15 @@ impl App {
                 }
                 _ => {}
             },
+            MenuTarget::DefaultLanguage => {
+                let language = match command {
+                    MenuCommand::UseLanguage(i) => winc_syntax::languages().get(i).copied(),
+                    _ => None,
+                };
+                self.config.default_language = language.map(|language| language.id.to_owned());
+                self.save_config();
+                self.request_redraw();
+            }
             MenuTarget::TextWidth => {
                 if let MenuCommand::TextWidth(i) = command
                     && let Some(&width) = winc_config::TextWidth::ALL.get(i)
@@ -396,11 +423,11 @@ impl App {
                     self.activate_tab(i);
                 }
             }
-            MenuTarget::LatexProblems => {
-                if let MenuCommand::LatexProblem(i) = command {
-                    self.show_latex_problem(i);
-                }
-            }
+            MenuTarget::LatexProblems => match command {
+                MenuCommand::LatexProblem(i) => self.show_latex_problem(i),
+                MenuCommand::LatexRunRc => self.ask_skipped_latex_rc(),
+                _ => {}
+            },
             MenuTarget::RunConfigs => match command {
                 MenuCommand::RunSelect(i) => self.select_run_config(i),
                 MenuCommand::RunEdit => self.edit_run_configs(),
@@ -476,6 +503,7 @@ impl App {
             MenuCommand::RemoveFolder => self.remove_folder(&target),
             MenuCommand::Reveal => self.reveal_in_file_manager(&target),
             MenuCommand::OpenInTerminal => self.open_in_terminal(Some(&target)),
+            MenuCommand::RunScript => self.run_script(&target),
             MenuCommand::FindInFolder => self.find_in_folder(&target),
             MenuCommand::CopyPath => self.copy_path(&target, false),
             MenuCommand::CopyRelativePath => self.copy_path(&target, true),
@@ -531,6 +559,7 @@ impl App {
             MenuCommand::FormatSelection => self.format_selection(),
             MenuCommand::Fix => self.fix_active(),
             MenuCommand::GoToDefinition => self.go_to_definition(),
+            MenuCommand::OpenLink => self.open_caret_link(),
             MenuCommand::FindReferences => self.find_references(),
             MenuCommand::AddBookmark => self.set_bookmark(true),
             MenuCommand::RemoveBookmark => self.set_bookmark(false),
@@ -1014,15 +1043,19 @@ impl App {
         self.close_documents(&ids);
 
         // 选中原位置上的下一行，便于继续用 `⌘⌫` 连续删除。
-        if let Some(ws) = &mut self.editor.workspace {
+        if let Some(ws) = &self.editor.workspace {
             let was = ws.rows().iter().position(|e| {
                 deleted.contains(&e.path) || e.chain().iter().any(|p| deleted.contains(p))
             });
-            ws.refresh();
-            let count = ws.rows().len();
-            ws.select(was.filter(|_| count > 0).map(|i| i.min(count - 1)));
-            self.panels.tree.motion = None;
-            self.clamp_tree_scroll();
+            self.rescan_tree(move |app| {
+                if let Some(ws) = &mut app.editor.workspace {
+                    let count = ws.rows().len();
+                    ws.select(was.filter(|_| count > 0).map(|i| i.min(count - 1)));
+                }
+                app.panels.tree.motion = None;
+                app.clamp_tree_scroll();
+                app.request_redraw();
+            });
         }
 
         let message = match deleted.as_slice() {
