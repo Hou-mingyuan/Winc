@@ -9,9 +9,11 @@ mod formatters;
 pub(super) mod shortcuts;
 mod stepper;
 mod switches;
+mod transfer;
 mod values;
 
 use stepper::step;
+pub(in crate::app) use transfer::{EXPORTED_SETTINGS, SETTINGS_EXTENSIONS};
 
 use winc_editor::format::{
     Auto, FormatError, PRESETS, Plan, Program, Task, knows_how_to_install, presets,
@@ -23,7 +25,7 @@ use super::editor::format::{task_commands, task_commands_mut};
 use super::input::context_menu::{MenuTarget, menu_below, tool_setting as tool_setting_of};
 use super::*;
 use crate::keymap::{self, Os, Stroke};
-use crate::layout::{KeyRows, KeysLayout, SettingsView, ToolLanguages};
+use crate::layout::{KeyRows, KeysLayout, Listed, SettingsView};
 
 /// 设置浮层的状态。
 #[derive(Debug, Default)]
@@ -54,16 +56,22 @@ pub struct SettingsState {
     pub(crate) integration: crate::shell_integration::Integration,
     /// 取值与默认不同的设置项：名称后面有「恢复默认」。打开设置和配置变化时重新算。
     pub changed: Vec<Setting>,
-    /// 格式化页列出的语言。
+    /// 随状态列出的行。
     ///
-    /// 打开设置时确定，打开期间只会增加，不会减少，已列出的语言也不换位置。
-    pub languages: ToolLanguages,
+    /// 格式化页的语言在打开设置后、后台第一次算出工具选择时按语言表的顺序排列，此后只会增加，
+    /// 不会减少，已列出的语言也不换位置；Vim 的冲突键随 Vim 模式和键位表的变化重新算。
+    pub listed: Listed,
     /// 格式化页每一行（格式化工具、修复工具）上显示的内容。
     pub tool_rows: Vec<(Setting, FormatRow)>,
+    /// 格式化页各行所用的工具选择，在后台计算。
+    pub tool_plans: formatters::ToolPlans,
     /// 正在后台查询 WSL 发行版中装了哪些工具，查完后重新计算各行。
     pub probing: bool,
     /// 分类栏顶部的搜索框：按设置项的名称和说明搜索，不为空白时正文换成搜索结果。
     pub search: TextField,
+    /// 搜索开始前选中的设置项，以及搜索时自动选中的第一条结果：清空搜索框时仍选中后者（没有另选
+    /// 结果）则回到前者。进入结果或换页后为 `None`。
+    pub before_search: Option<(Setting, Setting)>,
     /// 「关于」页顶部的产品图标：渲染时的边长（物理像素）和 RGBA 像素；关闭浮层时释放。
     ///
     /// 渲染失败时像素为空，不再重试，图标不显示。
@@ -138,7 +146,7 @@ pub struct FormatRow {
     pub removable: bool,
 }
 
-impl ToolLanguages {
+impl Listed {
     /// 返回 `task`（格式化或修复）那一组列出的语言。
     fn of(&mut self, task: Task) -> &mut Vec<&'static str> {
         match task {
@@ -208,12 +216,15 @@ impl App {
         self.settings.selected = Setting::default();
         self.settings.logo_played = false;
         self.settings.search.set_text("");
+        self.settings.before_search = None;
         self.settings.error = self.broken_font(self.settings.selected.page());
         self.settings.keyboard = false;
         self.settings.hover = None;
-        self.settings.languages = ToolLanguages::default();
-        // 每次打开设置重新查询发行版中的工具：其间新安装的能列出来。
+        self.settings.listed = Listed::default();
+        self.refresh_vim_key_rows();
+        // 每次打开设置重新检查项目中的文件和发行版中的工具，其间新增的配置、新安装的工具随之列出。
         self.format.formatter.forget_wsl();
+        self.settings.tool_plans.restart(self.format_dir());
         self.refresh_format_rows(true);
         self.settings.integration = crate::shell_integration::read();
         self.refresh_changed_settings();
@@ -412,7 +423,7 @@ impl App {
         let view = SettingsView {
             page: self.settings.selected.page(),
             query: self.settings.search.text(),
-            languages: &self.settings.languages,
+            listed: &self.settings.listed,
             terminal: self
                 .motion
                 .module_fx
@@ -441,11 +452,11 @@ impl App {
 
     /// 返回键盘上下移动经过的设置项：搜索时为搜索结果，否则为各页的全部设置项。
     fn settings_items(&self) -> Vec<Setting> {
-        let (languages, modules) = (&self.settings.languages, self.settings_modules());
+        let (listed, modules) = (&self.settings.listed, self.settings_modules());
         if self.settings_searching() {
-            Setting::found(self.settings.search.text(), languages, modules)
+            Setting::found(self.settings.search.text(), listed, modules)
         } else {
-            Setting::all(languages, modules)
+            Setting::all(listed, modules)
         }
     }
 
@@ -459,23 +470,36 @@ impl App {
         self.request_redraw();
     }
 
-    /// 搜索框的内容变化后：结果从顶部显示，选中第一条结果；清空后回到选中项所在的页。
+    /// 搜索框的内容变化后：结果从顶部显示，选中第一条结果；清空后回到搜索之前选中的项。
     pub(in crate::app) fn settings_search_changed(&mut self) {
         self.settings.scroll = 0.0;
         self.settings.keyboard = false;
-        if let Some(&first) = self.settings_items().first()
-            && self.settings_searching()
+        if self.settings_searching() {
+            if let Some(&first) = self.settings_items().first() {
+                let before = (self.settings.before_search).map_or(self.settings.selected, |b| b.0);
+                self.settings.selected = first;
+                self.settings.before_search = Some((before, first));
+            }
+        } else if let Some((before, first)) = self.settings.before_search.take()
+            && self.settings.selected == first
         {
-            self.settings.selected = first;
+            self.settings.selected = before;
         }
         self.request_redraw();
     }
 
-    /// 从搜索框进入结果列表：键盘焦点回到浮层，选中第一条结果；没有结果时不处理。
+    /// 从搜索框进入结果列表：键盘焦点回到浮层，选中第一条结果；没有结果时不处理。搜索框为空时
+    /// 回到当前页。
     pub(super) fn settings_enter_results(&mut self) {
+        if !self.settings_searching() {
+            self.settings_show_page(self.settings.selected.page());
+            self.settings.keyboard = true;
+            return;
+        }
         let Some(&first) = self.settings_items().first() else {
             return;
         };
+        self.settings.before_search = None;
         self.settings.selected = first;
         self.settings.keyboard = true;
         self.focus = Focus::Settings;
@@ -493,6 +517,7 @@ impl App {
             return;
         }
         self.settings_leave_field();
+        self.settings.before_search = None;
         // 换页即离开搜索结果；选中的结果在该页时仍选中它。
         if self.settings_searching() {
             self.settings.search.set_text("");
@@ -623,6 +648,16 @@ impl App {
         self.request_redraw();
     }
 
+    /// 打开设置，切到 `setting` 所在的页，选中并滚动到这一项；选中的一行铺上底色，便于找到。
+    pub(in crate::app) fn show_setting(&mut self, setting: Setting) {
+        self.open_settings();
+        self.settings_show_page(setting.page());
+        self.settings.selected = setting;
+        self.settings.keyboard = true;
+        self.settings_scroll_into_view();
+        self.request_redraw();
+    }
+
     /// 滚动设置页，使选中的设置项进入可见范围。
     fn settings_scroll_into_view(&mut self) {
         let layout = self.settings_layout();
@@ -729,12 +764,29 @@ impl App {
         )
     }
 
-    /// 将值 `setting`（版本号）复制到剪贴板，并在状态栏提示。
+    /// 把版本信息（[`crate::system::info::report`]：版本、架构和系统）复制到剪贴板，供问题反馈
+    /// 使用，并在状态栏提示；`setting` 是「关于」页的版本号一行。
     pub(in crate::app) fn settings_copy_value(&mut self, setting: Setting) {
         self.settings.selected = setting;
-        let version = crate::layout::version_label();
-        self.set_clipboard(version.clone(), false);
-        self.flash(t!("settings-version-copied", version = version));
+        let report = crate::system::info::report(self.display_protocol());
+        self.set_clipboard(report, false);
+        self.flash(t!("settings-version-info-copied"));
+    }
+
+    /// 窗口所用的显示协议：Linux 上为 `Wayland` 或 `X11`，其他平台和没有窗口时为 `None`。
+    fn display_protocol(&self) -> Option<&'static str> {
+        #[cfg(target_os = "linux")]
+        {
+            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+            let window = self.window.handle.as_ref()?;
+            match window.display_handle().ok()?.as_raw() {
+                RawDisplayHandle::Wayland(_) => Some("Wayland"),
+                RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_) => Some("X11"),
+                _ => None,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
     }
 
     /// 处理 `↩` 或空格：输入框进入编辑，开关切换，格式化命令、「添加语言…」「排除的语言」弹出菜单，
@@ -774,9 +826,15 @@ impl App {
             None if setting == Setting::TerminalShell => self.config.terminal_shell.clone(),
             None if setting == Setting::GitPath => self.config.git_path.clone(),
             None if setting == Setting::LatexPath => self.config.latex_path.clone(),
+            None if setting == Setting::EditorRulers => rulers_text(&self.config.editor_rulers),
+            None if setting.is_ai_text() => ai_text(&mut self.config, setting).clone(),
             None => self.font_setting(setting).clone(),
         };
-        let mut field = TextField::default();
+        // 输入密钥时同样以圆点代替明文。
+        let mut field = match setting {
+            Setting::AiApiKey => TextField::masked(),
+            _ => TextField::default(),
+        };
         field.set_text(current.as_deref().unwrap_or(""));
         field.select_all();
 
@@ -909,8 +967,43 @@ impl App {
                 self.focus = Focus::Settings;
                 self.set_latex_path(value);
             }
+            None if setting == Setting::EditorRulers => self.settings_commit_rulers(value),
+            None if setting.is_ai_text() => {
+                self.settings.editing = None;
+                self.settings.editing_original = None;
+                self.settings.error = None;
+                self.focus = Focus::Settings;
+                let field = ai_text(&mut self.config, setting);
+                if *field != value {
+                    *field = value;
+                    self.save_config();
+                }
+                self.request_redraw();
+            }
             None => self.settings_commit_font(setting, value),
         }
+    }
+
+    /// 提交长行参考线的列号并写回配置；清空表示不显示。
+    ///
+    /// 无法识别时留在输入框中并说明原因，配置不变。
+    fn settings_commit_rulers(&mut self, value: Option<String>) {
+        let Some(columns) = parse_rulers(value.as_deref().unwrap_or("")) else {
+            let max = *Config::RULER_RANGE.end();
+            let message = t!("settings-editor-rulers-invalid", max = max);
+            self.settings.error = Some((Setting::EditorRulers, message));
+            self.request_redraw();
+            return;
+        };
+        self.settings.editing = None;
+        self.settings.editing_original = None;
+        self.settings.error = None;
+        self.focus = Focus::Settings;
+        if self.config.editor_rulers != columns {
+            self.config.editor_rulers = columns;
+            self.save_config();
+        }
+        self.request_redraw();
     }
 
     /// 提交格式化（修复）命令并写回配置；`command` 为 `None`（清空）表示自动选择。
@@ -1159,9 +1252,24 @@ impl App {
         self.request_redraw();
     }
 
+    /// 设置日志和文件历史显示的位置，已打开的日志随之移过去。
+    pub(in crate::app) fn set_log_placement(&mut self, choice: winc_config::LogPlacement) {
+        self.config.git_log_placement = Some(choice);
+        self.save_config();
+        self.apply_log_placement(true);
+        self.request_redraw();
+    }
+
     /// 设置拉取、同步时合并还是变基。
     pub(in crate::app) fn set_pull_mode(&mut self, choice: winc_config::PullMode) {
         self.config.git_pull = Some(choice);
+        self.save_config();
+        self.request_redraw();
+    }
+
+    /// 设置调用模型的接口协议。
+    pub(in crate::app) fn set_ai_protocol(&mut self, choice: winc_config::AiProtocol) {
+        self.config.ai_protocol = Some(choice);
         self.save_config();
         self.request_redraw();
     }
@@ -1287,6 +1395,39 @@ pub(crate) struct Store {
     pub(crate) state_requests: u64,
     /// 配置的版本号：本窗口每写入一次配置文件加 1，应用层据此把新配置发给其他窗口。
     pub(crate) config_rev: u64,
+}
+
+/// 返回调用模型的一项文本设置（接口地址、模型名或密钥）在配置中的值；`setting` 须满足
+/// [`Setting::is_ai_text`]。
+fn ai_text(config: &mut Config, setting: Setting) -> &mut Option<String> {
+    match setting {
+        Setting::AiBaseUrl => &mut config.ai_base_url,
+        Setting::AiModel => &mut config.ai_model,
+        _ => &mut config.ai_api_key,
+    }
+}
+
+/// 返回设置中显示的长行参考线的列号，例如「80, 120」；未设置参考线时返回 `None`。
+pub(crate) fn rulers_text(columns: &[usize]) -> Option<String> {
+    let text: Vec<String> = columns.iter().map(usize::to_string).collect();
+    (!text.is_empty()).then(|| text.join(", "))
+}
+
+/// 解析设置中输入的长行参考线列号，按从小到大排列并去掉重复的列。
+///
+/// 各项以逗号、顿号或空白分隔；任一项不是 [`Config::RULER_RANGE`] 内的整数时返回 `None`。
+fn parse_rulers(text: &str) -> Option<Vec<usize>> {
+    let separator = |c: char| matches!(c, ',' | '，' | '、') || c.is_whitespace();
+    let mut columns = (text.split(separator).filter(|part| !part.is_empty()))
+        .map(|part| {
+            part.parse()
+                .ok()
+                .filter(|c| Config::RULER_RANGE.contains(c))
+        })
+        .collect::<Option<Vec<usize>>>()?;
+    columns.sort_unstable();
+    columns.dedup();
+    Some(columns)
 }
 
 #[cfg(test)]

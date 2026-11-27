@@ -11,14 +11,16 @@ fn search(app: &mut App, query: &str) {
     });
 }
 
-/// 返回当前列出的设置项和各组标题。
+/// 返回当前列出的设置项和各组标题，不含「快捷键」组（见
+/// [`search_reaches_the_keymap_and_command_shortcuts`]）。
 fn listed(app: &App) -> (Vec<Setting>, Vec<String>) {
     let layout = app.settings_layout();
-    let rows = layout.rows.iter().map(|r| r.setting).collect();
+    let keys = |s: &Setting| s.page() == SettingsPage::Keys;
+    let rows = (layout.rows.iter()).map(|r| r.setting).filter(|s| !keys(s));
     let titles = (layout.headings.iter())
         .map(|(_, title)| title.to_string())
-        .collect();
-    (rows, titles)
+        .filter(|title| title != SettingsPage::Keys.title());
+    (rows.collect(), titles.collect())
 }
 
 #[test]
@@ -53,12 +55,13 @@ fn search_finds_settings_on_every_page() {
     assert!(rows.contains(&Setting::LightTheme) && rows.contains(&Setting::DarkTheme));
     assert_eq!(titles, ["外观"]);
 
-    // 组标题也参与匹配：按「Vim」一次搜到这一组的全部设置项。
+    // 组标题也参与匹配：按「Vim」一次搜到这一组的全部设置项，以及说明中提到 Vim 的光标样式。
     search(&mut app, "vim");
     let (rows, titles) = listed(&app);
     assert_eq!(
         rows,
         [
+            Setting::CursorStyle,
             Setting::VimMode,
             Setting::VimClipboard,
             Setting::VimRelativeNumber,
@@ -105,9 +108,11 @@ fn keyboard_and_clicks_move_in_and_out_of_search() {
     app.settings_enter_results();
     assert_eq!(app.focus, Focus::Settings);
     assert!(app.settings.keyboard);
-    for _ in 0..4 {
+    for _ in 0..5 {
         app.settings_move(true);
     }
+    assert_eq!(app.settings.selected, Setting::KeyMatches);
+    app.settings_move(false);
     assert_eq!(app.settings.selected, Setting::TerminalSize);
     // 结果就是该设置项本身，可以直接调整。
     app.settings_step(true);
@@ -186,6 +191,20 @@ fn rows_of_a_group_are_all_described_or_none() {
     }
 }
 
+/// 一组固定列出的设置项不超过 `GROUP_MAX` 项：组太长时按用途拆开，一眼看得出每组管什么。
+/// 格式化工具等按语言列出、随用户添加增多的组不计。
+#[test]
+fn fixed_groups_stay_short() {
+    /// 一组最多的项数，取自调参：八项左右时整组仍在一屏内，用途一目了然。
+    const GROUP_MAX: usize = 8;
+    for page in SettingsPage::ALL {
+        for section in page.sections(&Default::default()) {
+            let len = section.items.len();
+            assert!(len <= GROUP_MAX, "{page:?} {:?} 有 {len} 项", section.title);
+        }
+    }
+}
+
 /// 每个开关在配置文件中的名字与它读写的是同一项：打开或关闭后，这个名字在配置里有值。
 #[test]
 fn every_switch_is_named_after_the_config_entry_it_writes() {
@@ -200,5 +219,81 @@ fn every_switch_is_named_after_the_config_entry_it_writes() {
             app.settings_toggle(setting);
             assert!(app.config.is_set(key), "{setting:?} 写的不是 {key}");
         }
+    }
+}
+
+/// 回归：搜索设置不列出快捷键。搜「快捷键」列出键位方案，搜命令名列出相符的命令，点击后在
+/// 「快捷键」页中查看，该页的搜索框换成同一段文字。
+#[test]
+fn search_reaches_the_keymap_and_command_shortcuts() {
+    crate::keymap::install(
+        crate::keymap::Preset::Idea,
+        &crate::keymap::Custom::default(),
+    );
+    let mut app = blank_app(false);
+    app.open_settings();
+
+    let rows = |app: &App| -> Vec<Setting> {
+        let layout = app.settings_layout();
+        layout.rows.iter().map(|r| r.setting).collect()
+    };
+    search(&mut app, "快捷键");
+    assert!(rows(&app).contains(&Setting::Keymap), "{:?}", rows(&app));
+    let layout = app.settings_layout();
+    assert!(layout.headings.iter().any(|(_, t)| *t == "快捷键"));
+
+    search(&mut app, "转到行");
+    assert_eq!(rows(&app), [Setting::KeyMatches]);
+    assert!(crate::keymap::count_matches("转到行") > 0);
+    app.settings_open_menu(Setting::KeyMatches);
+    assert!(!app.settings_searching());
+    assert_eq!(app.settings_layout().page, SettingsPage::Keys);
+    assert_eq!(app.settings.keys_query.text(), "转到行");
+    assert_eq!(app.focus, Focus::KeySearch);
+}
+
+/// 回归：只是输入关键字预览结果，清空搜索框后回到原来的页；搜索框为空时按 `↓` 留在当前页，
+/// 不跳到第一页的第一项。
+#[test]
+fn clearing_a_search_returns_to_the_page_it_started_from() {
+    let mut app = blank_app(false);
+    app.open_settings();
+    app.settings_show_page(SettingsPage::Editor);
+    let start = app.settings.selected;
+
+    search(&mut app, "字号");
+    assert_eq!(app.settings.selected, Setting::UiSize);
+    search(&mut app, "");
+    assert_eq!(app.settings.selected, start);
+    assert_eq!(app.settings_layout().page, SettingsPage::Editor);
+
+    app.focus_settings_search();
+    app.settings_enter_results();
+    assert_eq!(app.settings_layout().page, SettingsPage::Editor);
+    assert_eq!(app.focus, Focus::Settings);
+
+    // 进入结果后再清空：停在选中的结果所在的页。
+    search(&mut app, "字号");
+    app.settings_enter_results();
+    search(&mut app, "");
+    assert_eq!(app.settings_layout().page, SettingsPage::Appearance);
+}
+
+/// 搜索结果中「快捷键」组的截图：`cargo test -p winc-app shoot_search_shortcuts -- --ignored`。
+#[test]
+#[ignore = "截图，手动运行"]
+fn shoot_search_shortcuts() {
+    crate::keymap::install(
+        crate::keymap::Preset::Idea,
+        &crate::keymap::Custom::default(),
+    );
+    let mut app = blank_app(false);
+    app.open_settings();
+    for (query, name) in [
+        ("保存", "settings-search-save"),
+        ("快捷键", "settings-search-keys"),
+    ] {
+        search(&mut app, query);
+        shoot(&mut app, name);
     }
 }

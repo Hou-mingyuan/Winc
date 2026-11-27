@@ -211,6 +211,7 @@ impl Cx<'_, '_> {
             }
             let code = style.has(Style::CODE);
             let pad = st.size * 0.4;
+            let lead = atoms.len();
             if code {
                 atoms.push(Atom {
                     kind: AtomKind::Pad,
@@ -223,7 +224,10 @@ impl Cx<'_, '_> {
             }
             let start = range.start;
             for (i, c) in inline.text[range].char_indices() {
-                let source = source_of(inline, start + i);
+                // 不对应原文的生成文字（脚注末尾的 ↩）没有原文位置，排出时与正文分为两段。
+                let source = inline
+                    .char_source_of(start + i)
+                    .and_then(|s| u32::try_from(s).ok());
                 if c == IMAGE_MARK {
                     let Some(image) = images.next() else { continue };
                     match self.image(image, room) {
@@ -263,6 +267,10 @@ impl Cx<'_, '_> {
                 self.push_char(&mut atoms, c, run, st, source);
             }
             if code {
+                // 开头的留白和第一个字之间不换行：否则留白留在上一行的行尾，画成一块空的底色。
+                if let Some(first) = atoms.get_mut(lead + 1) {
+                    first.brk = false;
+                }
                 atoms.push(Atom {
                     kind: AtomKind::Pad,
                     width: pad,
@@ -485,6 +493,9 @@ impl Cx<'_, '_> {
                 let atom = &atoms[j];
                 match &atom.kind {
                     AtomKind::Char(c) => {
+                        if !text.text.is_empty() && text.source.is_some() != atom.source.is_some() {
+                            flush_text(out, &mut text, at, st);
+                        }
                         if text.text.is_empty() {
                             text.x = *pen;
                             text.start = self.chars;
@@ -696,11 +707,22 @@ fn break_lines(atoms: &[Atom], width: f32) -> Vec<std::ops::Range<usize>> {
         // 保留 0.01 逻辑像素的余量：测得的宽度加上边距再减去（表格的列宽）会产生浮点误差，
         // 恰好放得下的最后一个字符不应折到下一行。
         if x + atom.width > width + 0.01 && i > start && !atom.space {
-            // 没有可断处、只能在字与字之间强制断行时，若下一行将以不能出现在行首的标点开头，
-            // 断点向前移一个字，使该标点与前一个字一起换行。
+            // 没有可断处、只能在字与字之间强制断行时，若下一行将以不能出现在行首的标点或行内代码
+            // 结尾的留白开头，断点向前移一个字，使它与前一个字一起换行；行内代码开头的留白不留在
+            // 行尾。
             let forced = |mut at: usize| {
                 while at > start + 1
-                    && matches!(atoms[at].kind, AtomKind::Char(c) if no_break_before(c))
+                    && match atoms[at].kind {
+                        AtomKind::Char(c) => no_break_before(c),
+                        AtomKind::Pad => !atoms[at].brk,
+                        _ => false,
+                    }
+                {
+                    at -= 1;
+                }
+                if at > start + 1
+                    && matches!(atoms[at - 1].kind, AtomKind::Pad)
+                    && atoms[at - 1].brk
                 {
                     at -= 1;
                 }

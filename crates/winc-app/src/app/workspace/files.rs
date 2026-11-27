@@ -9,6 +9,7 @@ use winc_config::AutoSave;
 use winc_i18n::t;
 
 use super::*;
+use crate::app::settings::{EXPORTED_SETTINGS, SETTINGS_EXTENSIONS};
 use crate::system;
 
 /// 「停止输入后」自动保存时，最后一次修改之后等待的时间。
@@ -50,6 +51,10 @@ pub enum Pick {
     SaveProject,
     /// 「打开项目…」：只能选项目文件（见 [`winc_config::PROJECT_EXTENSIONS`]）。
     OpenProject,
+    /// 「导出设置…」：选导出文件的保存位置。
+    ExportSettings,
+    /// 「导入设置…」：只能选 JSON 文件。
+    ImportSettings,
 }
 
 /// 无法打开的文件在编辑区中给出的操作。
@@ -141,6 +146,8 @@ pub struct TabGhost {
     pub icon: String,
     /// 是日志标签（画 Git 的图标）。
     pub log: bool,
+    /// 是终端标签（画终端图标）。
+    pub terminal: bool,
     /// 关掉时是当前标签（凸起的底色跟着淡出）。
     pub active: bool,
     /// 内容淡出的时钟。
@@ -176,13 +183,19 @@ impl App {
     /// 不把它所在的目录当作项目打开（那可能是「下载」或主目录）。目录见 [`Self::open_folder`]。
     /// 文件在预览标签中时，该标签成为普通标签。
     pub(in crate::app) fn open_path(&mut self, path: &Path) {
-        self.open_file(path, false);
+        self.open_file(path, false, false);
+    }
+
+    /// 打开命令行给出的文件或目录 `path`，同 [`Self::open_path`]；文件不存在时打开对应该路径的
+    /// 新文件，保存时才写入磁盘（见 [`winc_editor::Editor::open_tab_or_new`]）。
+    pub(in crate::app) fn open_path_or_new(&mut self, path: &Path) {
+        self.open_file(path, false, true);
     }
 
     /// 从窗口外打开了文件 `path`（命令行、文件管理器、程序坞、拖入、「打开」面板）：记入最近
     /// 打开的文件；目录不记。
     pub(in crate::app) fn note_opened_file(&mut self, path: &Path) {
-        let path = winc_config::files::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = self.editor.document_path(path);
         if self.is_folder(&path) || !self.may_be_file(&path) {
             return;
         }
@@ -193,7 +206,7 @@ impl App {
     ///
     /// 文件已打开时切换到其标签；否则替换现有的预览标签，没有预览标签时新建一个。
     pub(in crate::app) fn preview_path(&mut self, path: &Path) {
-        self.open_file(path, true);
+        self.open_file(path, true, false);
     }
 
     /// 设置中是否启用了预览标签（`tree.previewOnClick`）。
@@ -291,8 +304,9 @@ impl App {
         self.known_folder(path).is_some() || numbered && inside()
     }
 
-    /// 打开文件或目录 `path`；`preview` 为真时在预览标签中打开文件（见 [`Self::preview_path`]）。
-    fn open_file(&mut self, path: &Path, preview: bool) {
+    /// 打开文件或目录 `path`；`preview` 为真时在预览标签中打开文件（见 [`Self::preview_path`]），
+    /// `new` 为真时文件不存在则打开新文件（见 [`Self::open_path_or_new`]）。
+    fn open_file(&mut self, path: &Path, preview: bool, new: bool) {
         if self.is_folder(path) {
             self.open_folder(path);
             return;
@@ -305,7 +319,10 @@ impl App {
         let startup = self.startup_file_index();
         self.auto_save_active();
         let count = self.editor.tab_count();
-        let index = self.editor.open_tab(path);
+        let index = match new {
+            true => self.editor.open_tab_or_new(path),
+            false => self.editor.open_tab(path),
+        };
         let id = self.editor.documents[index].id;
         let added = self.editor.tab_count() > count;
         if let Some(old) = startup.filter(|_| added) {
@@ -328,7 +345,7 @@ impl App {
         self.focus = Focus::Editor;
         self.note_recent_file();
         self.relayout();
-        self.reveal_active();
+        self.auto_reveal_active();
         self.announce_readonly();
         self.ensure_caret_visible();
         self.reset_blink();
@@ -433,9 +450,22 @@ impl App {
         }
     }
 
+    /// 当前文档是命令行打开的新文件（[`winc_editor::Document::is_new_file`]）时，在状态栏说明
+    /// 保存后才写入磁盘：路径写错时可以及时发现。
+    pub(crate) fn announce_new_file(&mut self) {
+        if self
+            .editor
+            .active()
+            .is_some_and(winc_editor::Document::is_new_file)
+        {
+            self.flash(t!("editor-new-file"));
+        }
+    }
+
     /// 当前标签的编辑区是否显示文本（不是图片、无法打开的文件或 SVG、Markdown 的预览）。
     pub(in crate::app) fn active_shows_text(&self) -> bool {
-        self.editor.active().is_some_and(|d| d.shows_text())
+        // 「未提交的更改」下面是一个空文档，显示的是各段的差异，不是它的文字。
+        self.editor.active().is_some_and(|d| d.shows_text()) && !self.combined_active()
     }
 
     /// 执行无法打开的文件在编辑区中的按钮操作 `action`。
@@ -563,6 +593,19 @@ impl App {
         }
     }
 
+    /// 点击标签栏的「+」：编辑区有终端时在按钮下方弹出新建文件、新建终端的菜单，否则直接新建
+    /// 文件。
+    pub(in crate::app) fn press_new_tab(&mut self) {
+        use crate::app::input::context_menu::{MenuButton, MenuTarget, menu_below};
+        let terminals = self.editor.documents.iter().any(|doc| doc.terminal);
+        if !(terminals && self.terminal_enabled()) {
+            return self.new_file();
+        }
+        let button = self.tabs.new_tab;
+        let (_, y) = menu_below(button);
+        self.open_button_menu(MenuButton::NewTab, MenuTarget::NewTab, (button.x, y));
+    }
+
     /// 在标签栏最右端的「⌄」下方弹出标签列表，菜单右端与按钮对齐；选择一项即切换到该标签。
     pub(in crate::app) fn open_tab_list_menu(&mut self) {
         use crate::app::input::context_menu::{MenuButton, MenuTarget, menu_below};
@@ -579,6 +622,8 @@ impl App {
         if index >= self.editor.documents.len() {
             return;
         }
+        self.finish_terminal_rename(true);
+        self.leave_editor_terminal();
         let index = self.editor.bring(index);
 
         if self.editor.active != Some(index) {
@@ -588,21 +633,22 @@ impl App {
         self.load_active_in_background();
         self.make_room_for_editor();
         self.focus = Focus::Editor;
+        self.activate_editor_terminal();
         self.note_recent_file();
         self.relayout();
-        self.reveal_active();
+        self.auto_reveal_active();
         self.request_redraw();
     }
 
-    /// 返回选中的标签，按标签顺序排列：多选时是 `TabBar::marked` 中仍然打开的标签，否则只含当前
-    /// 标签；没有标签时为空。
+    /// 返回选中的标签，按标签顺序排列：多选时是 `TabBar::marked` 中仍是前台窗格标签的，否则只含
+    /// 当前标签；没有标签时为空。
     pub(crate) fn tab_selection(&self) -> Vec<DocumentId> {
         let active = self.editor.active().map(|d| d.id);
         let marked = &self.tabs.marked;
         if marked.len() > 1 && active.is_some_and(|a| marked.contains(&a)) {
             return self
                 .editor
-                .documents
+                .tabs()
                 .iter()
                 .map(|d| d.id)
                 .filter(|id| marked.contains(id))
@@ -621,7 +667,7 @@ impl App {
     ///
     /// 只剩一个时不移出。
     pub(in crate::app) fn toggle_tab_selected(&mut self, index: usize) {
-        let Some(id) = self.editor.documents.get(index).map(|d| d.id) else {
+        let Some(id) = self.editor.tabs().get(index).map(|d| d.id) else {
             return;
         };
         let mut marked = self.tab_selection();
@@ -650,7 +696,7 @@ impl App {
     /// 选中从扩展选区的起点（没有时是当前标签）到第 `index` 个之间的标签（`⇧` 单击），切到第
     /// `index` 个。
     pub(in crate::app) fn select_tab_range(&mut self, index: usize) {
-        let docs = &self.editor.documents;
+        let docs = self.editor.tabs();
         if index >= docs.len() {
             return;
         }
@@ -658,6 +704,7 @@ impl App {
             .tabs
             .anchor
             .and_then(|a| self.editor.index_of(a))
+            .filter(|&i| i < docs.len())
             .or(self.editor.active)
             .unwrap_or(index);
         self.tabs.anchor = Some(docs[from].id);
@@ -675,7 +722,7 @@ impl App {
             return "untitled.txt".to_owned();
         };
         let name = doc.name();
-        if doc.path.is_some() || doc.title.is_some() {
+        if doc.path.is_some() {
             return name.into_owned();
         }
         let language = doc.highlighter.language();
@@ -741,16 +788,26 @@ impl App {
         }
     }
 
+    /// 切到当前窗格的第 `index` 个标签页（从 0 起）；没有这个标签页时不做处理。
+    pub(in crate::app) fn focus_tab_number(&mut self, index: usize) {
+        if index < self.editor.tab_count() {
+            self.activate_tab(index);
+        }
+    }
+
     /// 保存当前文档（`⌘S`）。
     ///
-    /// 未命名的文档弹出「另存为」面板；开启了「保存时格式化」时先格式化再保存。
+    /// 未命名的文档和仍在读取的标准输入标签弹出「另存为」面板；开启了「保存时格式化」时先格式化
+    /// 再保存。
     pub(in crate::app) fn save_active(&mut self) {
         let Some(doc) = self.editor.active() else {
             return;
         };
         let id = doc.id;
 
-        if doc.title.is_some() {
+        if self.reading_stdin(id) {
+            self.pick(Pick::SaveAs(id));
+        } else if doc.title.is_some() {
             // 格式化工具的输出标签只用于查看，不可保存。
             if let Some(reason) = doc.unwritable_reason() {
                 self.flash(reason);
@@ -922,7 +979,7 @@ impl App {
         // 另存为到已在其他标签中打开的文件时，两个标签对应同一个文件，但内容各自独立，
         // 先保存哪一个都会覆盖另一个的内容。因此对方有未保存的修改时不保存；对方没有修改时
         // 关闭对方的标签，内容以本次保存的为准。
-        let to = to.map(|path| winc_editor::canonical_path(&path));
+        let to = to.map(|path| self.editor.document_path(&path));
         let other = to.as_ref().and_then(|path| {
             self.editor
                 .documents
@@ -1065,6 +1122,7 @@ impl App {
             }
             Pick::KeyFile => (String::new(), crate::app::remote::key_dir()),
             Pick::SaveProject => self.project_save_place(),
+            Pick::ExportSettings => (EXPORTED_SETTINGS.to_owned(), None),
             Pick::Open
             | Pick::OpenFolder
             | Pick::WslFolder(_)
@@ -1072,6 +1130,7 @@ impl App {
             | Pick::AddFolder
             | Pick::BackgroundImage
             | Pick::OpenProject
+            | Pick::ImportSettings
             | Pick::Download(_) => (String::new(), None),
         };
 
@@ -1093,6 +1152,11 @@ impl App {
                     dir: None,
                     types: winc_config::PROJECT_EXTENSIONS,
                 },
+                Pick::ImportSettings => Panel::Open {
+                    files: true,
+                    dir: None,
+                    types: SETTINGS_EXTENSIONS,
+                },
                 Pick::OpenFolder
                 | Pick::WslFolder(_)
                 | Pick::WorktreeFolder
@@ -1102,7 +1166,7 @@ impl App {
                     dir: None,
                     types: &[],
                 },
-                Pick::SaveAs(_) | Pick::SaveProject => Panel::Save {
+                Pick::SaveAs(_) | Pick::SaveProject | Pick::ExportSettings => Panel::Save {
                     name: &name,
                     dir: dir.as_deref(),
                 },
@@ -1142,6 +1206,14 @@ impl App {
                     };
                     (choose, t!("cmd-open-project"))
                 }
+                Pick::ImportSettings => {
+                    let choose = Choose::Open {
+                        directory: false,
+                        dir: None,
+                        types: Some((t!("settings-files"), SETTINGS_EXTENSIONS)),
+                    };
+                    (choose, t!("cmd-import-settings"))
+                }
                 Pick::KeyFile => {
                     let choose = Choose::Open {
                         directory: false,
@@ -1180,6 +1252,13 @@ impl App {
                     },
                     t!("cmd-save-project-as"),
                 ),
+                Pick::ExportSettings => (
+                    Choose::Save {
+                        name: &name,
+                        dir: dir.as_deref(),
+                    },
+                    t!("cmd-export-settings"),
+                ),
             };
             // 面板的标题不带省略号。
             let title = title.trim_end_matches('…');
@@ -1204,19 +1283,22 @@ impl App {
                 Pick::WslFolder(_) => t!("cmd-open-wsl-folder"),
                 Pick::SaveAs(_) => t!("cmd-save-as"),
                 Pick::SaveProject => t!("cmd-save-project-as"),
+                Pick::ExportSettings => t!("cmd-export-settings"),
+                Pick::ImportSettings => t!("cmd-import-settings"),
                 Pick::Download(_) => t!("menu-download"),
             };
-            // 对话框的标题不带省略号；挂在窗口上，打开期间窗口不响应。
+            // 对话框的标题不带省略号；打开期间窗口不响应（`DialogOwner`）。
             let mut dialog = rfd::FileDialog::new().set_title(title.trim_end_matches('…'));
-            if let Some(window) = &self.window.handle {
-                dialog = dialog.set_parent(&**window);
-            }
+            let main = (self.window.handle.as_deref()).and_then(crate::windows::MainWindow::of);
             if let Some(dir) = &dir {
                 dialog = dialog.set_directory(dir);
             }
             if matches!(kind, Pick::OpenProject) {
                 let name = t!("workspace-project-files");
                 dialog = dialog.add_filter(name, winc_config::PROJECT_EXTENSIONS);
+            }
+            if matches!(kind, Pick::ImportSettings) {
+                dialog = dialog.add_filter(t!("settings-files"), SETTINGS_EXTENSIONS);
             }
             // 对话框有自己的消息循环，在后台线程上等待关闭，事件循环正常运行。
             std::thread::spawn(move || {
@@ -1227,17 +1309,26 @@ impl App {
                     let home = winc_editor::wsl::home_dir(&root);
                     dialog = dialog.set_directory(home.unwrap_or(root));
                 }
+                let owner = main.and_then(crate::windows::DialogOwner::new);
+                if let Some(owner) = &owner {
+                    dialog = dialog.set_parent(owner);
+                }
                 let path = match &kind {
-                    Pick::Open | Pick::BackgroundImage | Pick::KeyFile | Pick::OpenProject => {
-                        dialog.pick_file()
-                    }
+                    Pick::Open
+                    | Pick::BackgroundImage
+                    | Pick::KeyFile
+                    | Pick::OpenProject
+                    | Pick::ImportSettings => dialog.pick_file(),
                     Pick::OpenFolder
                     | Pick::WslFolder(_)
                     | Pick::WorktreeFolder
                     | Pick::AddFolder
                     | Pick::Download(_) => dialog.pick_folder(),
-                    Pick::SaveAs(_) | Pick::SaveProject => dialog.set_file_name(&name).save_file(),
+                    Pick::SaveAs(_) | Pick::SaveProject | Pick::ExportSettings => {
+                        dialog.set_file_name(&name).save_file()
+                    }
                 };
+                drop(owner);
                 let _ = proxy.send_event(UserEvent::Picked(kind, path));
             });
         }
@@ -1277,7 +1368,9 @@ impl App {
             | Pick::KeyFile
             | Pick::Download(_)
             | Pick::SaveProject
-            | Pick::OpenProject => None,
+            | Pick::OpenProject
+            | Pick::ExportSettings
+            | Pick::ImportSettings => None,
         };
 
         let Some(path) = path else { return };
@@ -1292,8 +1385,10 @@ impl App {
             Pick::Download(paths) => self.download(paths, path),
             Pick::SaveProject => self.save_project_as(path),
             Pick::OpenProject => self.open_from_outside(&path),
+            Pick::ExportSettings => self.export_settings(&path),
+            Pick::ImportSettings => self.import_settings(&path),
             Pick::SaveAs(id) => {
-                if self.save_document(id, Some(path))
+                if self.save_picked(id, path)
                     && let Some(prompt) = continuation
                 {
                     self.save_then_close(prompt);

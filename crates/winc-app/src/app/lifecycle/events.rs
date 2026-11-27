@@ -165,8 +165,7 @@ impl ApplicationHandler<UserEvent> for App {
                 &mono,
                 &ui,
                 &terminal,
-                self.font_weight(),
-                self.terminal_font_weight(),
+                self.font_weights(),
             )
             .map(|mut renderer| {
                 let prose = super::appearance::configured_fonts(&self.config.markdown_font);
@@ -219,6 +218,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.install_system_hooks();
         // 启动时恢复的目录在事件循环创建之前打开，此时才能开始监视、读取运行配置和恢复终端、侧栏。
         self.watch_folder();
+        self.watch_extra_folders();
         self.load_run_configs_for_window();
         self.restore_terminal_for_window();
         self.restore_sidebar_for_window();
@@ -295,6 +295,17 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    ..
+                }
+        ) {
+            self.notice_focus_from_input();
+        }
         match event {
             WindowEvent::CloseRequested => self.request_close_window(),
             WindowEvent::RedrawRequested => self.redraw(),
@@ -308,6 +319,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.cancel_touch();
                 self.window_frame_changed();
+                // 最小化时尺寸为 0：保留此前的排版，还原时按实际尺寸重新排版。
+                if self.note_minimized() {
+                    return;
+                }
                 if let Some(renderer) = &mut self.frame.renderer {
                     renderer.resize();
                 }
@@ -324,28 +339,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ThemeChanged(theme) => self.system_theme_changed(theme),
             WindowEvent::Focused(focused) => {
-                self.window.focused = focused;
-                self.update_foreground(focused);
-                // 离开窗口时停止录制按键，菜单项的快捷键随之恢复，不影响别的窗口和应用。
-                if !focused {
-                    self.cancel_touch();
-                    self.set_recording(false);
+                // 窗口在文件对话框打开期间被激活（任务栏、Alt+Tab）：对话框回到前台。
+                #[cfg(windows)]
+                if focused && let Some(window) = &self.window.handle {
+                    crate::windows::raise_file_dialog(window);
                 }
-
-                if focused {
-                    self.check_disk();
-                    self.reset_blink();
-                    self.terminal_window_focused();
-                    // 其他 winc 窗口可能修改了最近列表，重新读取后开始页和项目菜单显示最新内容。
-                    self.reload_state();
-                } else {
-                    self.cancel_chord();
-                    let ids: Vec<DocumentId> = self.editor.documents.iter().map(|d| d.id).collect();
-                    self.auto_save(&ids);
-                    self.drop_drags();
-                }
-
-                self.request_redraw();
+                // winit 0.30 在 macOS 上可能先送达 `Focused(true)`，再送达创建窗口时排队的
+                // `Focused(false)`，此后直到再次切换应用才有 `Focused(true)`：以窗口当前是否为
+                // 键盘窗口为准。
+                #[cfg(target_os = "macos")]
+                let focused = self
+                    .window
+                    .handle
+                    .as_ref()
+                    .map_or(focused, |w| w.has_focus());
+                self.focus_changed(focused);
             }
             // 窗口被完全遮挡、最小化或移到其他桌面时同样视为后台，恢复时按焦点状态处理。
             // 完全不可见时不绘制，并将呈现缓冲标记为可清除（打开多个窗口时只有可见窗口占用缓冲）；
@@ -364,10 +372,15 @@ impl ApplicationHandler<UserEvent> for App {
                     modifiers.lalt_state() == pressed,
                     modifiers.ralt_state() == pressed,
                 );
-                if self.terminal.open {
+                if self.terminal.open || self.terminal_in_editor() {
                     self.update_terminal_link();
                 }
                 self.update_text_link();
+                self.tab_switch_modifiers();
+                // 拖动文字时按下、松开复制键，指针在移动与复制之间切换。
+                if self.text_drop().is_some() {
+                    self.update_cursor_icon();
+                }
                 // 按住 `⌥` 时分支选择器中的「拉取」变为「拉取并变基」，提交按钮变为「提交并推送」。
                 if (self.overlays.picker.open && self.picker_has_actions()) || self.commit_shown() {
                     self.request_redraw();
@@ -434,6 +447,45 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
+    /// 窗口获得或失去焦点时的处理：光标闪烁、检查磁盘上的改动、自动保存等。
+    pub(in crate::app) fn focus_changed(&mut self, focused: bool) {
+        self.window.focused = focused;
+        self.update_foreground(focused);
+        // 离开窗口时停止录制按键，菜单项的快捷键随之恢复，不影响别的窗口和应用。
+        if !focused {
+            self.cancel_touch();
+            self.set_recording(false);
+        }
+
+        if focused {
+            self.check_disk();
+            self.reset_blink();
+            self.terminal_window_focused();
+            // 其他 winc 窗口可能修改了最近列表，重新读取后开始页和项目菜单显示最新内容。
+            self.reload_state();
+        } else {
+            self.cancel_chord();
+            self.close_tab_switch();
+            let ids: Vec<DocumentId> = self.editor.documents.iter().map(|d| d.id).collect();
+            self.auto_save(&ids);
+            self.drop_drags();
+        }
+
+        self.request_redraw();
+    }
+
+    /// 收到按键、输入法或鼠标按下时调用：记为失去焦点而系统窗口其实持有焦点时，按获得焦点
+    /// 处理。
+    ///
+    /// 这些输入只发给持有焦点的窗口。系统的焦点事件缺失或顺序颠倒时（见 `Focused` 的处理），
+    /// 窗口会一直按失去焦点处理，编辑区不显示光标。没有系统窗口时按持有焦点处理。
+    pub(in crate::app) fn notice_focus_from_input(&mut self) {
+        let key = self.window.handle.as_ref().is_none_or(|w| w.has_focus());
+        if !self.window.focused && key {
+            self.focus_changed(true);
+        }
+    }
+
     /// 处理送回事件循环的事件 `event`。
     ///
     /// 提示框由窗口自行绘制时，选中按钮的事件同样直接交给此处。
@@ -457,6 +509,7 @@ impl App {
             UserEvent::ReleaseNotes(notes) => self.show_release_notes(notes),
             done @ (UserEvent::GitStatus
             | UserEvent::GitContent
+            | UserEvent::GitCombined
             | UserEvent::GitCommit
             | UserEvent::GitBase
             | UserEvent::GitOperated
@@ -465,6 +518,7 @@ impl App {
             | UserEvent::FolderListed
             | UserEvent::WatcherStarted
             | UserEvent::FormatPlanned
+            | UserEvent::ToolsPlanned
             | UserEvent::FileWorked
             | UserEvent::GitMergeSides
             | UserEvent::GitLog
@@ -479,7 +533,8 @@ impl App {
             | UserEvent::Counted
             | UserEvent::BackedUp
             | UserEvent::Replaced
-            | UserEvent::Wrapped) => self.finished(done),
+            | UserEvent::Wrapped
+            | UserEvent::Compared) => self.finished(done),
             UserEvent::Rediffed => self.poll_rediffs(),
             UserEvent::Outline => self.poll_outline(),
             UserEvent::GitRollback(paths, to) => self.git_rollback(paths, to),
@@ -512,6 +567,7 @@ impl App {
             }
             UserEvent::TerminalPaste(id, text) => self.confirmed_terminal_paste(id, text),
             UserEvent::TerminalUploaded(id, result) => self.terminal_uploaded(id, result),
+            UserEvent::TerminalImageSaved(id, result) => self.terminal_image_saved(id, result),
             UserEvent::TerminalQuit(ok) => {
                 if let Some(request) = self.closing.confirming.take()
                     && ok
@@ -564,6 +620,7 @@ impl App {
                 let canceled = self.copy_finished(&copying);
                 self.downloaded(outcome, canceled);
             }
+            UserEvent::PromptCopied(prompt) => self.prompt_copied(prompt),
             UserEvent::Copied(copies, failures, copying) => {
                 self.copy_finished(&copying);
                 self.copied_into_tree(copies, failures);
@@ -579,6 +636,8 @@ impl App {
             #[cfg(not(target_os = "macos"))]
             UserEvent::OfferMoveToApplications | UserEvent::MoveToApplications(..) => {}
             UserEvent::TrafficLightsMoved => {
+                #[cfg(target_os = "macos")]
+                self.finish_hiding();
                 self.relayout();
                 self.request_redraw();
             }
@@ -606,6 +665,7 @@ impl App {
             }
             UserEvent::Delete(paths, permanent) => self.delete_entries(&paths, permanent),
             UserEvent::Formatted => self.poll_formatting(),
+            UserEvent::HttpDone => self.poll_http(),
             UserEvent::ToolChoice(answer) => self.answer_tool_choice(*answer),
             UserEvent::GitTrust(root, fingerprint, trusted) => {
                 self.answer_git_trust(&root, fingerprint, trusted);
